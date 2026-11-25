@@ -1,23 +1,21 @@
-//! Argo CD, read from the cluster it runs in (the hub), which is often not one of the
-//! clusters open: which contexts serve Applications, the Application that deployed an object
-//! (its tracking id), and the ones that deploy into a namespace.
+//! Argo CD, read only through its API (`api`): what an Application is (`Summary`), where it
+//! deploys among the kubeconfig's contexts, the Application that deployed an object (its
+//! tracking id), the ones that deploy into a namespace, and every Application of the
+//! servers (`from_api`).
 //!
-//! Everything here reads. Refresh goes through `argo_refresh`, and a sync, a rollback or a
-//! terminate through `argo_operation` (built by `ops`), with the hub's UI client, so the
-//! write gate applies to them like to any write.
+//! Everything here reads. The actions go through `api::act` (the window's) and
+//! `api::act_for_agent`.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
-use futures::StreamExt as _;
-use kube::Client;
 use kube::discovery::ApiResource;
 use serde_json::Value;
 
-use super::{ContextTarget, Kind, ObjectRef};
+use super::{ContextTarget, Kind};
 use crate::status::Tone;
 
 pub mod api;
@@ -44,15 +42,8 @@ const INSTANCE_LABEL: &str = "app.kubernetes.io/instance";
 const IN_CLUSTER: &str = "https://kubernetes.default.svc";
 /// Where Argo CD keeps its Applications by default (a tracking id without `<ns>_`).
 pub const DEFAULT_NAMESPACE: &str = "argocd";
-/// A context that did not answer is left alone this long before it is tried again.
-pub(crate) const RETRY: Duration = Duration::from_secs(300);
 /// The longest wait for a context to connect, then to answer whether it serves Applications.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-/// A hub's Applications are listed at most this often, however many pages ask.
-const LIST_TTL: Duration = Duration::from_secs(30);
-/// Contexts probed at the same time.
-const PROBES_AT_ONCE: usize = 8;
-
 /// Argo CD's Application kind.
 pub fn application_kind() -> Kind {
     Kind {
@@ -537,33 +528,7 @@ pub fn attention(app: &Summary) -> Tone {
     }
 }
 
-// MARK: Hubs
-
-/// A context that serves Argo CD's Application API, with a client for it.
-#[derive(Clone)]
-pub struct Hub {
-    pub context: String,
-    pub client: Client,
-}
-
-/// The hubs found, the contexts that could not be checked with why, and (when none was
-/// found on its own) the contexts left out because their login may prompt.
-#[derive(Clone, Default)]
-pub struct Hubs {
-    pub found: Vec<Hub>,
-    pub failed: Vec<(String, String)>,
-    pub not_asked: Vec<String>,
-}
-
-#[derive(Clone)]
-enum Probe {
-    Serves(Client),
-    No,
-    Failed(String, Instant),
-}
-
-/// What each context answered, for the session.
-static PROBES: LazyLock<Mutex<HashMap<String, Probe>>> = LazyLock::new(Default::default);
+// MARK: Contexts
 
 /// What the kubeconfig's contexts point to, read again only when the files change.
 pub(crate) fn targets() -> Arc<Vec<ContextTarget>> {
@@ -589,191 +554,7 @@ pub(crate) fn target(targets: &[ContextTarget], context: &str) -> ContextTarget 
         .unwrap_or_else(|| ContextTarget { name: context.to_string(), ..Default::default() })
 }
 
-/// The contexts not connected that may be asked without asking anything of the user (no exec
-/// plugin, or the same one as a connected context, whose login is done), and those left out
-/// because asking them may run a login of their own. One context per cluster, none for a
-/// cluster connected or asked quietly; the left-out ones likeliest hub first (`hub_likeness`).
-fn candidates(targets: &[ContextTarget], connected: &[String]) -> (Vec<String>, Vec<String>) {
-    let open: Vec<&ContextTarget> = targets.iter().filter(|t| connected.contains(&t.name)).collect();
-    let mut seen: Vec<String> = open.iter().filter_map(|t| t.server.as_deref().map(server_key)).collect();
-    let (mut quiet, mut loud) = (Vec::new(), Vec::new());
-    let others: Vec<&ContextTarget> = targets.iter().filter(|t| !connected.contains(&t.name)).collect();
-    let is_quiet =
-        |t: &ContextTarget| t.exec.as_ref().is_none_or(|cmd| open.iter().any(|o| o.exec.as_ref() == Some(cmd)));
-    for t in others.iter().filter(|t| is_quiet(t)) {
-        let Some(server) = t.server.as_deref().map(server_key) else { continue };
-        if !seen.contains(&server) {
-            seen.push(server);
-            quiet.push(t.name.clone());
-        }
-    }
-    for t in others.iter().filter(|t| !is_quiet(t)) {
-        let Some(server) = t.server.as_deref().map(server_key) else { continue };
-        if !seen.contains(&server) {
-            seen.push(server);
-            loud.push(t.name.clone());
-        }
-    }
-    loud.sort_by_key(|n| (std::cmp::Reverse(hub_likeness(n)), n.clone()));
-    (quiet, loud)
-}
-
-/// How much a context's name looks like Argo CD's cluster: `argo` in it most, then the words
-/// a management cluster is often named with. Only an order to offer them in: none is asked
-/// for it.
-pub fn hub_likeness(name: &str) -> u8 {
-    const HUB_WORDS: [&str; 10] =
-        ["hub", "meta", "mgmt", "management", "platform", "ops", "infra", "tools", "shared", "control"];
-    let name = name.to_lowercase();
-    if name.contains("argo") {
-        2
-    } else if name.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| HUB_WORDS.contains(&w)) {
-        1
-    } else {
-        0
-    }
-}
-
-/// Whether the context serves Applications: one discovery request, bounded in time.
-async fn probe(context: String, client: Option<Client>) -> (String, Probe) {
-    let failed = |why: String| Probe::Failed(why, Instant::now());
-    let client = match client {
-        Some(c) => c,
-        None => match tokio::time::timeout(PROBE_TIMEOUT, super::connect(context.clone())).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => return (context, failed(super::short_error(&e))),
-            Err(_) => return (context, failed("did not answer".into())),
-        },
-    };
-    let request = http::Request::get("/apis/argoproj.io/v1alpha1").body(Vec::new());
-    let answer = match request {
-        Ok(r) => tokio::time::timeout(PROBE_TIMEOUT, client.request::<Value>(r)).await,
-        Err(e) => return (context, failed(e.to_string())),
-    };
-    let probe = match answer {
-        Ok(Ok(v)) => {
-            let serves = v["resources"].as_array().into_iter().flatten().any(|r| r["name"] == "applications");
-            if serves { Probe::Serves(client) } else { Probe::No }
-        }
-        Ok(Err(e)) => {
-            let e = anyhow::Error::from(e);
-            if super::is_not_found(&e) { Probe::No } else { failed(super::lists::load_error(&e)) }
-        }
-        Err(_) => failed("did not answer".into()),
-    };
-    (context, probe)
-}
-
-/// Probe the contexts not answered yet (or that failed a while ago); what each answered.
-async fn probe_all(contexts: Vec<String>, clients: &[(String, Client)]) -> Vec<(String, Probe)> {
-    let known: HashMap<String, Probe> = PROBES.lock().unwrap_or_else(PoisonError::into_inner).clone();
-    let mut out = Vec::new();
-    let mut ask = Vec::new();
-    for c in contexts {
-        match known.get(&c) {
-            Some(Probe::Failed(_, at)) if at.elapsed() >= RETRY => ask.push(c),
-            Some(p) => out.push((c, p.clone())),
-            None => ask.push(c),
-        }
-    }
-    let answers: Vec<(String, Probe)> = futures::stream::iter(ask)
-        .map(|c| {
-            let client = clients.iter().find(|(n, _)| *n == c).map(|(_, cl)| cl.clone());
-            probe(c, client)
-        })
-        .buffer_unordered(PROBES_AT_ONCE)
-        .collect()
-        .await;
-    PROBES.lock().unwrap_or_else(PoisonError::into_inner).extend(answers.iter().cloned());
-    out.extend(answers);
-    out
-}
-
-fn hubs_of(probes: Vec<(String, Probe)>, clients: &[(String, Client)]) -> Hubs {
-    let mut hubs = Hubs::default();
-    for (context, p) in probes {
-        match p {
-            // A connected cluster's own client, as the rest of the app uses.
-            Probe::Serves(client) => {
-                let client = clients.iter().find(|(n, _)| *n == context).map_or(client, |(_, c)| c.clone());
-                hubs.found.push(Hub { context, client });
-            }
-            Probe::Failed(why, _) => hubs.failed.push((context, why)),
-            Probe::No => {}
-        }
-    }
-    hubs.found.sort_by(|a, b| a.context.cmp(&b.context));
-    hubs
-}
-
-/// The contexts that serve Applications: those set in Settings, else the connected clusters
-/// that do, else the other contexts of the kubeconfig that can be asked quietly. What each
-/// context answered is kept for the session; one that did not answer is asked again later.
-pub async fn hubs(connected: Vec<(String, Client)>) -> Hubs {
-    // One search at a time: pages opened together wait for the first one's answers.
-    static SEARCH: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
-    super::run(async move {
-        let _one = SEARCH.lock().await;
-        let names: Vec<String> = connected.iter().map(|(n, _)| n.clone()).collect();
-        let open = hubs_of(probe_all(names.clone(), &connected).await, &connected);
-        if !open.found.is_empty() {
-            return Ok(open);
-        }
-        let (quiet, loud) = candidates(&targets(), &names);
-        let mut hubs = hubs_of(probe_all(quiet, &connected).await, &connected);
-        hubs.failed.extend(open.failed);
-        if hubs.found.is_empty() {
-            // Those asked by hand already and found without Argo CD are not offered again.
-            let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
-            hubs.not_asked = loud.into_iter().filter(|c| !matches!(probes.get(c), Some(Probe::No))).collect();
-        }
-        Ok(hubs)
-    })
-    .await
-    .unwrap_or_default()
-}
-
-// MARK: Reading Applications
-
-type Lists = HashMap<String, (Instant, Arc<Vec<Value>>)>;
-
-/// Each hub's Applications, with when they were listed.
-static LISTS: LazyLock<Mutex<Lists>> = LazyLock::new(Default::default);
-
-/// Drop a hub's list of Applications kept for a while: the next page asking lists them anew.
-pub fn forget_list(hub: &str) {
-    LISTS.lock().unwrap_or_else(PoisonError::into_inner).remove(hub);
-}
-
-/// Every Application on a hub, shared by the pages that ask within `LIST_TTL`.
-pub async fn applications(hub: &Hub) -> Result<Arc<Vec<Value>>> {
-    static LISTING: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
-    let cached = || {
-        let lists = LISTS.lock().unwrap_or_else(PoisonError::into_inner);
-        lists.get(&hub.context).filter(|(at, _)| at.elapsed() < LIST_TTL).map(|(_, l)| l.clone())
-    };
-    let lock = LISTING.lock().unwrap_or_else(PoisonError::into_inner).entry(hub.context.clone()).or_default().clone();
-    // Pages asking together wait for one list.
-    let _one = lock.lock().await;
-    if let Some(list) = cached() {
-        return Ok(list);
-    }
-    let mut list = super::list_values(hub.client.clone(), application_kind().ar, None, None).await?;
-    for app in &mut list {
-        if let Some(meta) = app.get_mut("metadata").and_then(Value::as_object_mut) {
-            meta.remove("managedFields");
-        }
-    }
-    let list = Arc::new(list);
-    LISTS.lock().unwrap_or_else(PoisonError::into_inner).insert(hub.context.clone(), (Instant::now(), list.clone()));
-    Ok(list)
-}
-
 // MARK: For the Problems scan
-
-/// A hub's Applications are listed for the Problems scans at most this often, however many
-/// clusters are scanned.
-const LEAN_TTL: Duration = Duration::from_secs(60);
 
 /// What the Problems scan reads of an Application: the rest of each one is skipped while the
 /// list is parsed, never held.
@@ -869,125 +650,11 @@ impl LeanApp {
     }
 }
 
-/// What a failed list is kept as: the API's status code, if it answered one (so a refusal
-/// still reads "forbidden"), and the message.
-type LeanFailure = (Option<u16>, String);
-
-type LeanLists = HashMap<String, (Instant, Result<Arc<Vec<LeanApp>>, LeanFailure>)>;
-
-/// Each hub's Applications as the Problems scans read them, or why they could not be, with
-/// when they were listed.
-static LEAN_LISTS: LazyLock<Mutex<LeanLists>> = LazyLock::new(Default::default);
-
-/// How long the Problems scans wait for a hub's Applications. A hub that went dark would
-/// otherwise hold every cluster's scan for the connect deadline and the paged retry after it.
-const LEAN_DEADLINE: Duration = Duration::from_secs(20);
-
-fn lean_failure(e: &anyhow::Error) -> LeanFailure {
-    (super::api_status(e), super::short_error(e))
-}
-
-/// A kept failure as an error the problem scans can name ("forbidden", "failed: ...").
-fn lean_error((code, message): &LeanFailure) -> anyhow::Error {
-    match code {
-        Some(code) => kube::Error::Api(kube::core::Status::failure(message, "").with_code(*code).boxed()).into(),
-        None => anyhow::anyhow!("{message}"),
-    }
-}
-
-/// Every Application on a hub as the Problems scans read them: lean, from the API server's
-/// cache (`resourceVersion=0`, no read of etcd), within `LEAN_DEADLINE`, shared by the scans
-/// of every cluster within `LEAN_TTL`. A failure is kept as long, so the scans of the other
-/// clusters don't each wait for the hub again.
-pub async fn lean_applications(hub: &Hub) -> Result<Arc<Vec<LeanApp>>> {
-    let client = hub.client.clone();
-    let list = super::run_abortable(async move {
-        let list = super::lists::list_lean_cached(client, application_kind().ar, None);
-        match tokio::time::timeout(LEAN_DEADLINE, list).await {
-            Ok(list) => list,
-            Err(_) => anyhow::bail!("Argo CD's cluster did not answer within {}s", LEAN_DEADLINE.as_secs()),
-        }
-    });
-    lean_or_kept(&hub.context, list).await
-}
-
-/// The hub's list kept within `LEAN_TTL`, failed or not; else `list`'s answer, kept. Scans
-/// asking together wait for one list.
-async fn lean_or_kept(hub: &str, list: impl Future<Output = Result<Vec<LeanApp>>>) -> Result<Arc<Vec<LeanApp>>> {
-    static LISTING: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
-    let kept = || {
-        let lists = LEAN_LISTS.lock().unwrap_or_else(PoisonError::into_inner);
-        lists.get(hub).filter(|(at, _)| at.elapsed() < LEAN_TTL).map(|(_, l)| l.clone())
-    };
-    let lock = LISTING.lock().unwrap_or_else(PoisonError::into_inner).entry(hub.to_string()).or_default().clone();
-    let _one = lock.lock().await;
-    if let Some(answer) = kept() {
-        return answer.map_err(|f| lean_error(&f));
-    }
-    let answer = list.await.map(Arc::new).map_err(|e| lean_failure(&e));
-    LEAN_LISTS.lock().unwrap_or_else(PoisonError::into_inner).insert(hub.to_string(), (Instant::now(), answer.clone()));
-    answer.map_err(|f| lean_error(&f))
-}
-
-/// The client a hub was found with this session (see `hubs`), if any.
-pub fn known_client(context: &str) -> Option<Client> {
-    let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(Probe::Serves(client)) = probes.get(context) { Some(client.clone()) } else { None }
-}
-
-/// The hubs the Problems scan of `context` reads: those found this session (by the Argo CD
-/// page or an object's Argo CD section), and `context` itself when it `serves` Applications,
-/// read with its own `client`. Only those set in Settings, when some are. No other context is
-/// asked: a scan in the background never starts a login for a context not logged in this
-/// session, nor reaches a cluster nobody opened.
-/// One context per Argo CD, so an Application is never counted twice.
-pub fn problem_hubs(context: &str, client: &Client, serves: bool) -> Vec<Hub> {
-    let mut found: Vec<Hub> = {
-        let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
-        (probes.iter())
-            .filter(|(c, _)| c.as_str() != context)
-            .filter_map(|(c, p)| {
-                if let Probe::Serves(client) = p {
-                    Some(Hub { context: c.clone(), client: client.clone() })
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
-    if serves || known_client(context).is_some() {
-        found.push(Hub { context: context.to_string(), client: client.clone() });
-    }
-    if found.is_empty() {
-        return found;
-    }
-    // The cluster scanned first, with its own client.
-    found.sort_by_cached_key(|h| (h.context != context, h.context.clone()));
-    let targets = targets();
-    let mut clusters = Vec::<ContextTarget>::new();
-    found.retain(|h| {
-        let t = target(&targets, &h.context);
-        let new = !clusters.iter().any(|c| same_cluster(c, &t));
-        clusters.push(t);
-        new
-    });
-    found
-}
-
-async fn get_application(hub: &Hub, ns: &str, name: &str) -> Result<Value> {
-    let obj = ObjectRef {
-        kind: application_kind(),
-        name: name.to_string(),
-        namespace: Some(ns.to_string()),
-        uid: String::new(),
-    };
-    super::get_object(hub.client.clone(), obj).await
-}
-
-/// An Application found, with where it was read: Argo CD's API, or a hub.
+/// An Application found, with the Argo CD server it was read from.
 #[derive(Clone)]
 pub struct Found {
-    pub source: Source,
+    /// The Argo CD API server it was read from.
+    pub server: Arc<api::Endpoint>,
     pub app: Summary,
 }
 
@@ -1002,37 +669,29 @@ pub struct Lookup {
     pub own: Option<Result<Arc<api::Endpoint>, String>>,
 }
 
-fn failed_note(hubs: &Hubs) -> String {
-    let why: Vec<String> = hubs.failed.iter().map(|(c, e)| format!("{c}: {e}")).collect();
-    if why.is_empty() { String::new() } else { format!(" ({})", why.join("; ")) }
-}
-
 /// The Application that deployed this object (on the page of context `here`): by its
 /// tracking id, else by the instance label when an Application tracks the object under
 /// that name. Nothing is asked of any cluster for an object with neither.
-pub async fn for_object(
-    connected: Vec<(String, Client)>,
-    here: String,
-    group: String,
-    kind: String,
-    obj: Value,
-) -> Lookup {
-    // Off the UI thread: a hub's Applications can be many and big.
+/// Found in what Argo CD's API feeds hold; with no server connected, a tracking id says so.
+pub async fn for_object(here: String, group: String, kind: String, obj: Value) -> Lookup {
+    // Off the UI thread: the servers' config is read, and their feeds may start.
     let read = async move {
         let Some(by) = tracked_by(&group, &kind, &obj) else { return Ok(Lookup::default()) };
-        let api = api_object_lookup(&here, &by, &group, &kind, &obj).await;
-        if let Some(found) = api.as_ref().filter(|l| !l.apps.is_empty()) {
-            return Ok(found.clone());
+        if let Some(found) = api_object_lookup(&here, &by, &group, &kind, &obj).await {
+            return Ok(found);
         }
-        // Hubs stay a second source until the Argo CD page reads only Argo CD's API (#1054).
-        let hub = object_lookup(connected, here, group, kind, obj).await;
-        Ok(match api {
-            Some(api) if hub.apps.is_empty() => api,
-            _ => hub,
-        })
+        let note = match &by {
+            TrackedBy::Id(t) => Some(format!("Deployed by Argo CD Application {}. {NO_SERVER_READ}", t.app)),
+            TrackedBy::Label(_) => None,
+        };
+        Ok(Lookup { note, ..Lookup::default() })
     };
     super::run(read).await.unwrap_or_default()
 }
+
+/// Said when an object names an Application but no Argo CD server is set or logged in to.
+const NO_SERVER_READ: &str =
+    "No Argo CD server is connected to read it: connect one (Settings → Argo CD, or Connect to Argo CD…)";
 
 /// The Argo CD server holding the Application whose `metadata.uid` is `uid` (one opened as a
 /// Kubernetes object), from what the servers' feeds hold (a feed is started when none runs),
@@ -1198,7 +857,7 @@ async fn api_object_lookup(here: &str, by: &TrackedBy, group: &str, kind: &str, 
         if s.namespace.is_empty() {
             s.namespace = DEFAULT_NAMESPACE.into();
         }
-        Found { source: Source::Api(c.endpoint.clone()), app: s }
+        Found { server: c.endpoint.clone(), app: s }
     };
     let mut apps: Vec<Found> = found.iter().filter(|c| fits(by, c.here, c.tracks)).map(summary).collect();
     // The only one of that name, whose destination can't be told: it can only be it.
@@ -1215,115 +874,10 @@ async fn api_object_lookup(here: &str, by: &TrackedBy, group: &str, kind: &str, 
     Some(Lookup { apps, note, own: None })
 }
 
-async fn object_lookup(
-    connected: Vec<(String, Client)>,
-    here: String,
-    group: String,
-    kind: String,
-    obj: Value,
-) -> Lookup {
-    let (tracking, label) = match tracked_by(&group, &kind, &obj) {
-        Some(TrackedBy::Id(t)) => (Some(t), None),
-        Some(TrackedBy::Label(l)) => (None, Some(l)),
-        None => return Lookup::default(),
-    };
-    let ns = obj.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or_default().to_string();
-    let name = obj.pointer("/metadata/name").and_then(Value::as_str).unwrap_or_default().to_string();
-    let hubs = hubs(connected).await;
-    if hubs.found.is_empty() {
-        let note = tracking.map(|t| {
-            format!(
-                "Deployed by Argo CD Application {}, but no context in your kubeconfig serves Argo CD{}",
-                t.app,
-                failed_note(&hubs)
-            )
-        });
-        return Lookup { apps: Vec::new(), note, own: None };
-    }
-    let targets = targets();
-    let here = target(&targets, &here);
-    let own = |s: Summary, app: &Value| s.with_own(app, &group, &kind, &ns, &name);
-    let mut errors = Vec::new();
-    // Read on each hub; one whose destination is this cluster wins over one that may not be.
-    let mut found: Vec<(bool, Found)> = Vec::new();
-    for hub in &hubs.found {
-        let hub_target = target(&targets, &hub.context);
-        let apps: Vec<Value> = if let Some(t) = &tracking {
-            let app_ns = t.app_ns.as_deref().unwrap_or(DEFAULT_NAMESPACE);
-            match get_application(hub, app_ns, &t.app).await {
-                Ok(app) => vec![app],
-                // Argo CD may keep its Applications in another namespace than the default one.
-                Err(e) if t.app_ns.is_none() && matches!(super::api_status(&e), Some(403 | 404)) => {
-                    match applications(hub).await {
-                        Ok(list) => list
-                            .iter()
-                            .filter(|a| a.pointer("/metadata/name").and_then(Value::as_str) == Some(t.app.as_str()))
-                            .cloned()
-                            .collect(),
-                        Err(e) => {
-                            errors.push(format!("{}: {}", hub.context, super::lists::load_error(&e)));
-                            Vec::new()
-                        }
-                    }
-                }
-                Err(e) if super::is_not_found(&e) => Vec::new(),
-                Err(e) => {
-                    errors.push(format!("{}: {}", hub.context, super::lists::load_error(&e)));
-                    Vec::new()
-                }
-            }
-        } else {
-            let label = label.as_deref().unwrap_or_default();
-            match applications(hub).await {
-                Ok(list) => list
-                    .iter()
-                    .filter(|a| a.pointer("/metadata/name").and_then(Value::as_str) == Some(label))
-                    .filter(|a| {
-                        targets_cluster(a, &hub_target, &here) && resource_of(a, &group, &kind, &ns, &name).is_some()
-                    })
-                    .cloned()
-                    .collect(),
-                // A label is only a hint: a hub that can't be listed says nothing about this object.
-                Err(_) => Vec::new(),
-            }
-        };
-        for app in apps {
-            let here_too = targets_cluster(&app, &hub_target, &here);
-            found.push((here_too, Found { source: Source::Hub(hub.clone()), app: own(Summary::of(&app), &app) }));
-        }
-    }
-    // Several hubs may hold an Application of that name: keep those deploying here, else
-    // one that can only be it.
-    let mut apps: Vec<Found> = found.iter().filter(|(h, _)| *h).map(|(_, f)| f.clone()).collect();
-    if apps.is_empty() && found.len() == 1 {
-        apps = found.into_iter().map(|(_, f)| f).collect();
-    }
-    let note = match (&tracking, apps.is_empty(), errors.is_empty()) {
-        (_, _, false) => Some(format!("Argo CD could not be read: {}", errors.join("; "))),
-        (Some(t), true, true) => {
-            let on: Vec<&str> = hubs.found.iter().map(|h| h.context.as_str()).collect();
-            Some(format!("Deployed by Argo CD Application {}, which is not on {}", t.app, on.join(", ")))
-        }
-        _ => None,
-    };
-    Lookup { apps, note, own: None }
-}
-
-/// The Applications that deploy into this namespace of the context `here`. Quiet when no
-/// context serves Argo CD.
-pub async fn for_namespace(connected: Vec<(String, Client)>, here: String, ns: String) -> Lookup {
-    let read = async move {
-        let api = api_namespace_lookup(&here, &ns).await;
-        if let Some(found) = api.as_ref().filter(|l| !l.apps.is_empty()) {
-            return Ok(found.clone());
-        }
-        // Hubs stay a second source until the Argo CD page reads only Argo CD's API (#1054).
-        let hub = namespace_lookup(connected, here, ns).await;
-        Ok(match api {
-            Some(api) if hub.apps.is_empty() => api,
-            _ => hub,
-        })
-    };
+/// The Applications that deploy into this namespace of the context `here`, from what Argo
+/// CD's API feeds hold. Quiet when no Argo CD server is connected.
+pub async fn for_namespace(here: String, ns: String) -> Lookup {
+    let read = async move { Ok(api_namespace_lookup(&here, &ns).await.unwrap_or_default()) };
     super::run(read).await.unwrap_or_default()
 }
 
@@ -1346,41 +900,17 @@ async fn api_namespace_lookup(here: &str, ns: &str) -> Option<Lookup> {
     let mut errors = Vec::new();
     for h in held {
         match h.apps {
-            Ok(apps) => lookup
-                .apps
-                .extend(apps.iter().map(|a| Found { source: Source::Api(h.endpoint.clone()), app: a.summary.clone() })),
+            Ok(apps) => {
+                lookup.apps.extend(apps.iter().map(|a| Found { server: h.endpoint.clone(), app: a.summary.clone() }))
+            }
             Err(e) => errors.push(format!("{}: {e}", h.endpoint.name())),
         }
     }
-    lookup.apps.sort_by(|a, b| (&a.app.name, a.source.label()).cmp(&(&b.app.name, b.source.label())));
+    lookup.apps.sort_by_cached_key(|a| (a.app.name.clone(), a.server.name()));
     if !errors.is_empty() {
         lookup.note = Some(format!("Argo CD could not be read: {}", errors.join("; ")));
     }
     Some(lookup)
-}
-
-async fn namespace_lookup(connected: Vec<(String, Client)>, here: String, ns: String) -> Lookup {
-    let hubs = hubs(connected).await;
-    let targets = targets();
-    let here = target(&targets, &here);
-    let mut lookup = Lookup::default();
-    let mut errors = Vec::new();
-    for hub in &hubs.found {
-        let hub_target = target(&targets, &hub.context);
-        match applications(hub).await {
-            Ok(list) => lookup.apps.extend(
-                list.iter()
-                    .filter(|a| targets_cluster(a, &hub_target, &here) && targets_namespace(a, &ns))
-                    .map(|a| Found { source: Source::Hub(hub.clone()), app: Summary::of(a) }),
-            ),
-            Err(e) => errors.push(format!("{}: {}", hub.context, super::lists::load_error(&e))),
-        }
-    }
-    lookup.apps.sort_by(|a, b| (&a.app.name, a.source.label()).cmp(&(&b.app.name, b.source.label())));
-    if !errors.is_empty() {
-        lookup.note = Some(format!("Argo CD could not be read: {}", errors.join("; ")));
-    }
-    lookup
 }
 
 // MARK: Every Application
@@ -1475,24 +1005,6 @@ pub fn parents<V: Borrow<Value>>(apps: &[V]) -> Vec<Option<usize>> {
             tracked.or_else(|| listed.get(&key).copied()).or_else(label).filter(|p| *p != i)
         })
         .collect()
-}
-
-/// Where an object's Application was read (`Found`): on a hub's Kubernetes API, or Argo CD's
-/// own. The Applications page reads only the API (`FleetApp::server`).
-#[derive(Clone)]
-pub enum Source {
-    Hub(Hub),
-    Api(Arc<api::Endpoint>),
-}
-
-impl Source {
-    /// The hub context, or the API server's name.
-    pub fn label(&self) -> String {
-        match self {
-            Self::Hub(h) => h.context.clone(),
-            Self::Api(e) => e.name(),
-        }
-    }
 }
 
 /// Each project's sync windows, by project name.
@@ -1669,39 +1181,6 @@ pub fn from_api(reads: Vec<ApiRead>, targets: &[ContextTarget], connected: &[Str
 mod tests {
     use super::*;
     use serde_json::json;
-
-    /// A hub that failed is answered from the kept failure within `LEAN_TTL`, without asking
-    /// it again, and a refusal still reads "forbidden". After the TTL it is asked again.
-    #[test]
-    fn a_failed_hub_list_is_kept() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let asked = AtomicUsize::new(0);
-        let refused = || async {
-            asked.fetch_add(1, Ordering::SeqCst);
-            let status = kube::core::Status::failure("applications is forbidden", "Forbidden").with_code(403);
-            Err::<Vec<LeanApp>, anyhow::Error>(kube::Error::Api(status.boxed()).into())
-        };
-        let hub = "a-failed-hub-list-is-kept";
-        futures::executor::block_on(async {
-            for _ in 0..3 {
-                let e = lean_or_kept(hub, refused()).await.unwrap_err();
-                assert_eq!(crate::k8s::lists::load_error(&e), "forbidden");
-            }
-            assert_eq!(asked.load(Ordering::SeqCst), 1);
-            // Kept longer than the TTL: asked again, and a list is kept the same way.
-            let old = Instant::now().checked_sub(LEAN_TTL + Duration::from_secs(1)).unwrap();
-            LEAN_LISTS.lock().unwrap().get_mut(hub).unwrap().0 = old;
-            let one = || async {
-                asked.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![LeanApp::default()])
-            };
-            assert_eq!(lean_or_kept(hub, one()).await.unwrap().len(), 1);
-            assert_eq!(lean_or_kept(hub, refused()).await.unwrap().len(), 1);
-            assert_eq!(asked.load(Ordering::SeqCst), 2);
-        });
-        let e = lean_error(&(None, "did not answer".into()));
-        assert_eq!(crate::k8s::lists::load_error(&e), "failed: did not answer");
-    }
 
     /// An Application opened as a Kubernetes object opens on the server whose feed holds one
     /// of its uid; none connected, none holding it, and those not read are each said.
@@ -2013,41 +1492,6 @@ mod tests {
         assert!(!targets_namespace(&app, "other"));
         assert!(resource_of(&app, "rbac.authorization.k8s.io", "RoleBinding", "monitoring", "read").is_some());
         assert!(resource_of(&app, "", "RoleBinding", "monitoring", "read").is_none());
-    }
-
-    #[test]
-    fn only_quiet_contexts_are_probed_once_per_cluster() {
-        let targets = vec![
-            ctx("work", "https://work.example", Some("kubelogin get-token --x")),
-            ctx("hub", "https://hub.example", Some("kubelogin get-token --x")),
-            ctx("hub-admin", "https://hub.example:443/", None),
-            ctx("eks", "https://eks.example", Some("aws eks get-token --cluster-name eks")),
-            ctx("kind", "https://127.0.0.1:6443", None),
-            ctx("work-again", "https://work.example", None),
-        ];
-        // The same login as a connected context; no login; never another login, nor a
-        // second context for a cluster already asked or connected.
-        assert_eq!(candidates(&targets, &["work".into()]).0, ["hub", "kind"]);
-        // Nothing connected: only contexts without a login.
-        assert_eq!(candidates(&targets, &[]).0, ["hub-admin", "kind", "work-again"]);
-        // Left out, to be offered: a login of their own, one per cluster not asked otherwise.
-        assert_eq!(candidates(&targets, &["work".into()]).1, ["eks"]);
-        assert_eq!(candidates(&targets, &[]).1, ["eks"]);
-    }
-
-    #[test]
-    fn contexts_named_like_a_hub_are_offered_first() {
-        let targets = vec![
-            ctx("prod-eu", "https://a.example", Some("kubelogin --a")),
-            ctx("eu-platform-meta", "https://b.example", Some("kubelogin --b")),
-            ctx("argocd", "https://c.example", Some("kubelogin --c")),
-            ctx("dev", "https://d.example", Some("kubelogin --d")),
-            ctx("hubble", "https://e.example", Some("kubelogin --e")),
-        ];
-        assert_eq!(candidates(&targets, &[]).1, ["argocd", "eu-platform-meta", "dev", "hubble", "prod-eu"]);
-        assert_eq!(hub_likeness("ArgoCD-prod"), 2);
-        assert_eq!(hub_likeness("mgmt"), 1);
-        assert_eq!(hub_likeness("hubble"), 0);
     }
 
     #[test]

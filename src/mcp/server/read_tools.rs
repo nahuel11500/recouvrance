@@ -728,7 +728,7 @@ impl KubeMcp {
         // deploying here; to no other.
         let argo_open = super::argo_tools::argo_open_on(call.policy(), &p.context);
         let skipped = found
-            .skipped_where(|s| argo_apps::skipped_hub(s).is_none() || argo_open)
+            .skipped_where(|s| argo_apps::skipped_server(s).is_none() || argo_open)
             .map(|s| format!("Not checked, could not read {s}."));
         let scanned = found.done.map(|d| {
             let ago = i64::try_from(d.started.elapsed().as_secs()).unwrap_or(i64::MAX);
@@ -742,7 +742,7 @@ impl KubeMcp {
             .filter(|x| {
                 // Only what this agent may see. An Argo CD Application: the rules for
                 // Applications where it deploys (here) decide, in its destination namespace.
-                if x.on_hub.is_some() {
+                if x.on_argo.is_some() {
                     let a = super::argo_tools::problem_access(&p.context, x.namespace.as_deref(), &x.name);
                     return problem_visible(call.policy(), call.approved_rules(), false, &a);
                 }
@@ -754,9 +754,9 @@ impl KubeMcp {
             .take(200)
             .map(|x| {
                 // An Application is listed under where it deploys: say where it lives, to read it.
-                let reason = match &x.on_hub {
+                let reason = match &x.on_argo {
                     Some(on) => {
-                        let reason = x.reason.strip_suffix(&argo_apps::hub_note(&on.context)).unwrap_or(&x.reason);
+                        let reason = x.reason.strip_suffix(&argo_apps::server_note(&on.server)).unwrap_or(&x.reason);
                         format!("{reason} ({})", argo_apps::location(on, &x.name))
                     }
                     None => x.reason,

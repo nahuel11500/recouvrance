@@ -1,17 +1,15 @@
 //! Argo CD Applications that need attention, shown under the cluster they deploy to: Degraded,
 //! a failed sync, an error Argo CD reports, a sync running for long, and resources Missing
-//! while auto-sync is on. The Applications are read from Argo CD's API (the feeds the Argo CD
-//! page holds, else one list per server a minute), or on their hub when no Argo CD server is
-//! logged in.
+//! while auto-sync is on. The Applications are read from Argo CD's API only (the feeds the
+//! Argo CD page holds, else one list per server a minute).
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use kube::Client;
 use serde::Deserialize as _;
 
-use super::{OnHub, Problem, Scan, Severity};
+use super::{OnArgo, Problem, Scan, Severity};
 use crate::k8s;
 use crate::k8s::ContextTarget;
 use crate::k8s::argo::{self, LeanApp, api};
@@ -26,21 +24,20 @@ const MESSAGE_CHARS: usize = 200;
 /// The check's name among a scan's checks.
 pub const CHECK: &str = "Argo CD Applications";
 
-/// What a row's reason ends with when the Application's Argo CD is another cluster, or a server.
-pub fn hub_note(hub: &str) -> String {
-    format!(" (Argo CD on {hub})")
+/// What a row's reason ends with: the Argo CD server the Application is read from.
+pub fn server_note(server: &str) -> String {
+    format!(" (Argo CD on {server})")
 }
 
-/// Where an Application lives, for an agent to read it there: "Argo CD Application
-/// argocd/web on hub", or "... on Argo CD at argocd.example.com" when read by Argo CD's API.
-pub fn location(on: &OnHub, name: &str) -> String {
-    let at = if on.server.is_some() { "Argo CD at " } else { "" };
-    format!("{LABEL} {}/{name} on {at}{}", on.namespace, on.context)
+/// Where an Application lives, for an agent to act on it there: "Argo CD Application
+/// argocd/web on Argo CD at argocd.example.com".
+pub fn location(on: &OnArgo, name: &str) -> String {
+    format!("{LABEL} {}/{name} on Argo CD at {}", on.namespace, on.server)
 }
 
-/// The hub or server a skipped entry of this check names ("Argo CD Applications on hub
-/// (forbidden)").
-pub fn skipped_hub(entry: &str) -> Option<&str> {
+/// The server a skipped entry of this check names ("Argo CD Applications on
+/// argocd.example.com (failed: …)").
+pub fn skipped_server(entry: &str) -> Option<&str> {
     let rest = entry.strip_prefix(CHECK)?.strip_prefix(" on ")?;
     Some(rest.split_once(" (").map_or(rest, |(hub, _)| hub))
 }
@@ -105,15 +102,15 @@ pub fn judge(app: &LeanApp, now: jiff::Timestamp) -> Option<(Severity, String)> 
     Some((worst?, why.join("; ")))
 }
 
-/// Where a scan reads Applications: a hub context, or an Argo CD API server.
+/// The Argo CD API server a scan reads Applications from.
 #[derive(Clone, Debug)]
 struct Home {
-    /// What a row and a skipped entry name it by: the hub context, or the server's name.
+    /// What a row and a skipped entry name it by: the server's name.
     name: String,
-    /// The cluster it runs on (`in-cluster`).
+    /// The cluster it runs on, as its `in-cluster` destination: no context is known to be it.
     target: ContextTarget,
-    /// A server's Argo CD (`Endpoint::instance`); None for a hub.
-    server: Option<String>,
+    /// Its Argo CD (`Endpoint::instance`).
+    instance: String,
 }
 
 /// The Applications that need attention among those `home` holds that deploy to the cluster
@@ -130,10 +127,8 @@ fn found_on(
         .filter(|a| a.dest_namespace().is_none_or(|ns| namespaces.is_empty() || namespaces.iter().any(|n| n == ns)))
         .filter_map(|a| {
             let (severity, mut reason) = judge(a, now)?;
-            // The row is under the cluster it deploys to: say where Argo CD is when elsewhere.
-            if home.server.is_some() || home.name != here.name {
-                reason.push_str(&hub_note(&home.name));
-            }
+            // The row is under the cluster it deploys to: say where Argo CD is.
+            reason.push_str(&server_note(&home.name));
             Some(Problem {
                 severity,
                 kind: argo::application_kind().kubectl_name(),
@@ -142,10 +137,10 @@ fn found_on(
                 name: a.metadata.name.clone(),
                 reason,
                 age: a.metadata.created.as_deref().and_then(|t| t.parse().ok()),
-                on_hub: Some(OnHub {
-                    context: home.name.clone(),
+                on_argo: Some(OnArgo {
+                    server: home.name.clone(),
+                    instance: home.instance.clone(),
                     namespace: a.metadata.namespace.clone(),
-                    server: home.server.clone(),
                 }),
             })
         })
@@ -212,61 +207,35 @@ async fn server_apps(endpoint: &api::Endpoint) -> Result<Arc<Vec<LeanApp>>, Stri
     held_or_listed(&api::watch_key(endpoint), api::running(endpoint), list).await
 }
 
-/// The Argo CD API servers a scan reads: those turned on, when one of them has a login.
-/// None: no Argo CD is read by its API, and the hubs are read instead.
-fn api_servers(endpoints: Vec<api::Endpoint>) -> Option<Vec<api::Endpoint>> {
-    let on: Vec<api::Endpoint> = endpoints.into_iter().filter(|e| e.on).collect();
-    on.iter().any(api::readable).then_some(on)
-}
-
-/// The check of a scan of `context` (`client`: its own; `serves`: it serves Applications): the
-/// Applications that deploy there, read from Argo CD's API servers (the argocd CLI's logins
-/// and those set in Settings → Argo CD) when one is logged in; else on every hub known (see
-/// `argo::problem_hubs`). A server or hub that can't be read is named, and doesn't hide the
-/// others.
-pub async fn scan(context: String, client: Client, serves: bool, namespaces: Vec<String>) -> Scan {
+/// The check of a scan of `context`: the Applications that deploy there, read from Argo CD's
+/// API servers turned on (the argocd CLI's logins and those set in Settings → Argo CD). A
+/// server that can't be read is named, and doesn't hide the others; with none, nothing is
+/// read and nothing said.
+pub async fn scan(context: String, namespaces: Vec<String>) -> Scan {
     let now = jiff::Timestamp::now();
     let targets = argo::targets();
     let here = argo::target(&targets, &context);
     let mut scan = Scan::default();
-    if let Some(endpoints) = api_servers(api::endpoints().list) {
-        let reads = futures::future::join_all(endpoints.iter().map(server_apps)).await;
-        for (endpoint, read) in endpoints.iter().zip(reads) {
-            let name = endpoint.name();
-            match read {
-                Ok(apps) => {
-                    let home = Home { name, target: ContextTarget::default(), server: Some(endpoint.instance()) };
-                    scan.problems.extend(found_on(&apps, &home, &here, &namespaces, now));
-                }
-                Err(why) => scan.skipped.push((format!("{CHECK} on {name}"), anyhow::anyhow!(why))),
-            }
-        }
-        return scan;
-    }
-    let hubs = argo::problem_hubs(&context, &client, serves);
-    let lists = futures::future::join_all(hubs.iter().map(argo::lean_applications)).await;
-    for (hub, list) in hubs.iter().zip(lists) {
-        match list {
+    let endpoints: Vec<api::Endpoint> =
+        api::endpoints().list.into_iter().filter(|e| e.on && api::readable(e)).collect();
+    let reads = futures::future::join_all(endpoints.iter().map(server_apps)).await;
+    for (endpoint, read) in endpoints.iter().zip(reads) {
+        let name = endpoint.name();
+        match read {
             Ok(apps) => {
-                let home =
-                    Home { name: hub.context.clone(), target: argo::target(&targets, &hub.context), server: None };
+                let home = Home { name, target: ContextTarget::default(), instance: endpoint.instance() };
                 scan.problems.extend(found_on(&apps, &home, &here, &namespaces, now));
             }
-            // Access to some namespaces of a cluster with Argo CD's CRDs: not an Argo CD of
-            // the user's, not a check that failed.
-            Err(e) if hub.context == context && k8s::api_status(&e) == Some(403) => {}
-            Err(e) => scan.skipped.push((format!("{CHECK} on {}", hub.context), e)),
+            Err(why) => scan.skipped.push((format!("{CHECK} on {name}"), anyhow::anyhow!(why))),
         }
     }
     scan
 }
 
-/// The check as a job of a scan of `context`, whose `kinds` say whether it serves
-/// Applications itself.
-pub fn job(context: &str, client: &Client, kinds: &[k8s::Kind], namespaces: &[String]) -> super::Job {
+/// The check as a job of a scan of `context`.
+pub fn job(context: &str, namespaces: &[String]) -> super::Job {
     use futures::FutureExt as _;
-    let serves = kinds.iter().any(|k| k.is("argoproj.io", "Application"));
-    (CHECK.to_string(), scan(context.to_string(), client.clone(), serves, namespaces.to_vec()).boxed())
+    (CHECK.to_string(), scan(context.to_string(), namespaces.to_vec()).boxed())
 }
 
 #[cfg(test)]
@@ -365,15 +334,19 @@ mod tests {
 
     #[test]
     fn skipped_entries_name_their_hub() {
-        assert_eq!(skipped_hub("Argo CD Applications on hub-1 (failed: did not answer (x))"), Some("hub-1"));
-        assert_eq!(skipped_hub("Argo CD Applications on hub-1"), Some("hub-1"));
-        assert_eq!(skipped_hub("Pods (forbidden)"), None);
-        let on = OnHub { context: "hub".into(), namespace: "argocd".into(), server: None };
-        assert_eq!(location(&on, "web"), "Argo CD Application argocd/web on hub");
-        let on =
-            OnHub { context: "argocd.example.com".into(), server: Some("https://argocd.example.com".into()), ..on };
+        assert_eq!(skipped_server("Argo CD Applications on a.example (failed: did not answer (x))"), Some("a.example"));
+        assert_eq!(skipped_server("Argo CD Applications on a.example"), Some("a.example"));
+        assert_eq!(skipped_server("Pods (forbidden)"), None);
+        let on = OnArgo {
+            server: "argocd.example.com".into(),
+            instance: "https://argocd.example.com".into(),
+            namespace: "argocd".into(),
+        };
         assert_eq!(location(&on, "web"), "Argo CD Application argocd/web on Argo CD at argocd.example.com");
-        assert_eq!(skipped_hub("Argo CD Applications on argocd.example.com (failed: x)"), Some("argocd.example.com"));
+        assert_eq!(
+            skipped_server("Argo CD Applications on argocd.example.com (failed: x)"),
+            Some("argocd.example.com")
+        );
     }
 
     #[test]
@@ -388,8 +361,9 @@ mod tests {
         ContextTarget { name: name.into(), server: server.map(String::from), ..Default::default() }
     }
 
+    /// A server whose `in-cluster` is known to be the context `name` (only tests know it).
     fn hub(name: &str) -> Home {
-        Home { name: name.into(), target: context(name, None), server: None }
+        Home { name: name.into(), target: context(name, None), instance: format!("https://{name}") }
     }
 
     #[test]
@@ -406,9 +380,12 @@ mod tests {
         let names: Vec<(&str, Option<&str>)> =
             found.iter().map(|p| (p.name.as_str(), p.namespace.as_deref())).collect();
         assert_eq!(names, [("web", Some("web")), ("api", Some("api"))]);
-        assert_eq!(found[0].on_hub, Some(OnHub { context: "hub".into(), namespace: "argocd".into(), server: None }));
+        assert_eq!(
+            found[0].on_argo,
+            Some(OnArgo { server: "hub".into(), instance: "https://hub".into(), namespace: "argocd".into() })
+        );
         assert_eq!(found[0].label, LABEL);
-        assert_eq!(found[0].reason, "Degraded");
+        assert_eq!(found[0].reason, "Degraded (Argo CD on hub)");
         let found = found_on(&apps, &hub("hub"), &context("hub", None), &["api".into()], now);
         assert_eq!(found.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["api"]);
     }
@@ -431,23 +408,22 @@ mod tests {
         let server = Home {
             name: "argocd.example.com".into(),
             target: ContextTarget::default(),
-            server: Some("https://argocd.example.com".into()),
+            instance: "https://argocd.example.com".into(),
         };
         let here = context("prod", Some("https://prod.example:6443"));
         let found = found_on(&apps, &server, &here, &[], now);
         assert_eq!(found.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["web", "named"]);
         assert_eq!(found[0].reason, "Degraded (Argo CD on argocd.example.com)");
         assert_eq!(
-            found[0].on_hub,
-            Some(OnHub {
-                context: "argocd.example.com".into(),
+            found[0].on_argo,
+            Some(OnArgo {
+                server: "argocd.example.com".into(),
+                instance: "https://argocd.example.com".into(),
                 namespace: "argocd".into(),
-                server: Some("https://argocd.example.com".into()),
             })
         );
         assert!(found_on(&apps, &server, &context("staging", Some("https://staging.example")), &[], now).is_empty());
-        // With its cluster known (its hub context's Argo CD server is this one), `in-cluster`
-        // is that cluster.
+        // With its cluster known, `in-cluster` is that cluster.
         let home = Home { target: context("hub", Some("https://hub.example")), ..server };
         let found = found_on(&apps, &home, &context("hub", Some("https://hub.example")), &[], now);
         assert_eq!(found.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["own"]);

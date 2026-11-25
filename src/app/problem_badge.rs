@@ -226,7 +226,7 @@ mod tests {
             name: "web".into(),
             reason: "CrashLoopBackOff".into(),
             age: None,
-            on_hub: None,
+            on_argo: None,
         }
     }
 

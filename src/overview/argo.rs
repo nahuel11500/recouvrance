@@ -194,7 +194,7 @@ fn header(ctx: &Ctx, ix: usize, found: &Found, cx: &App) -> Div {
             "{}/{} on {}",
             app.namespace,
             app.name,
-            found.source.label()
+            found.server.name()
         ))))
         .child(div().flex_1())
         .children(app.urls.iter().take(3).enumerate().map(|(i, url)| {

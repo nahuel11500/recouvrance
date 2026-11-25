@@ -183,7 +183,7 @@ pub async fn problems(client: Client, kind: &Kind, namespace: Option<String>) ->
                 name: job.metadata.name.clone()?,
                 reason,
                 age: time(job.metadata.creation_timestamp.as_deref()),
-                on_hub: None,
+                on_argo: None,
             })
         })
         .collect())

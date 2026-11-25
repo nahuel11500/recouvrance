@@ -36,7 +36,7 @@ mod tabs;
 mod yaml_edit;
 
 pub(crate) use actions::*;
-pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_api_action};
+pub(crate) use argo::{ArgoAction, OpenOn, confirm_api_action};
 use browser::FileBrowser;
 pub(crate) use compare::{diff_block, preview_block, preview_scroll};
 pub(crate) use guard::*;
@@ -229,11 +229,10 @@ pub struct DetailPanel {
     reach: reachability::Reach,
     /// What the Map tab read when it was last opened.
     map: map::MapState,
-    /// The Argo CD Applications that deploy the object or into the namespace, when the read
-    /// shown started, and a read made at once (after a Sync).
+    /// The Argo CD Applications that deploy the object or into the namespace, and when the
+    /// read shown started.
     argo: k8s::argo::Lookup,
     argo_started: Option<std::time::Instant>,
-    argo_load: crate::latest::Latest,
     /// A CRD's spec fields, worked out when it is loaded rather than on every frame.
     schema_rows: Vec<crate::overview::SchemaRow>,
     /// An Application's resources table, worked out when it is read rather than on every frame.
@@ -508,7 +507,6 @@ impl DetailPanel {
             map: Default::default(),
             argo: Default::default(),
             argo_started: None,
-            argo_load: Default::default(),
             schema_rows: Vec::new(),
             argo_resources: Default::default(),
             alert_rule: Default::default(),

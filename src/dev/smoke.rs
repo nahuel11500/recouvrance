@@ -362,13 +362,13 @@ async fn problems_by_kind(client: &kube::Client, kinds: &[k8s::Kind], ctx: &str)
             println!("  could not read {skipped}");
         }
     }
-    // The Argo CD Applications deploying here, read on the hubs known (this cluster when it
-    // serves them), as the app's scans read them.
+    // The Argo CD Applications deploying here, read through Argo CD's API, as the app's scans
+    // read them.
     std::thread::sleep(std::time::Duration::from_secs(1));
     let _ = std::fs::write("/proc/self/clear_refs", "5");
     let before = memory("VmRSS");
     let t = std::time::Instant::now();
-    let (name, job) = problems::argo_apps::job(ctx, client, kinds, &[]);
+    let (name, job) = problems::argo_apps::job(ctx, &[]);
     let scan = job.await;
     println!(
         "{name}: {} problems in {:?}, peak {} MB from {} MB",

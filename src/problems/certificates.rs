@@ -38,7 +38,7 @@ pub async fn certificates(client: Client, kind: &Kind, namespace: Option<String>
                 name: c.metadata.name.clone()?,
                 reason,
                 age: time(c.metadata.creation_timestamp.as_deref()),
-                on_hub: None,
+                on_argo: None,
             })
         })
         .collect())
@@ -268,7 +268,7 @@ pub async fn tls_secrets(
             name: c.name.clone(),
             reason,
             age: c.created,
-            on_hub: None,
+            on_argo: None,
         })
         .collect())
 }

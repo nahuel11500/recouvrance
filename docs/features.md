@@ -289,17 +289,11 @@
   server that doesn't answer within 20 seconds, or can't be logged in to, is named as not checked,
   and that answer serves every cluster's scan for the minute. An Application goes under the
   cluster its destination maps to in the kubeconfig (by the API server's address, or by name; its
-  `in-cluster` is the cluster whose Argo CD server is that one in Settings → Per cluster), the
-  reason names its Argo CD, and a row opens its dashboard on the Argo CD page. An agent sees one
-  when its rules let it `list` `applications.argoproj.io` with the server's name as the context.
-  With no Argo CD server logged in, they are read on their hub instead, which needn't be
-  connected (a row opens the Application's page there; the reason names the hub when it is
-  another cluster): the cluster scanned when it serves Argo CD, and those found this session by
-  the Argo CD page or an object's Argo CD section (only the ones set in Settings, when some are).
-  A scan in the background asks no other context, and so never starts a login for a context not
-  logged in this session. Each hub's Applications are read lean, from the API server's cache, at
-  most once a minute for every cluster scanned, with the same 20 seconds; a cluster whose
-  Applications you may not list (access to some namespaces only) shows no Argo CD line.
+  `in-cluster`, Argo CD's own cluster, maps to no context), the reason names its Argo CD, and a
+  row opens its dashboard on the Argo CD page. An agent sees one when its rules let it `list`
+  `applications.argoproj.io` in the context scanned and the Application's destination namespace.
+  With no Argo CD server connected, there is no Argo CD line: Argo CD is read only through its
+  API.
 - **ExternalSecrets**: ExternalSecrets that fail to sync and secret stores not Ready show on the
   Problems page; a Secret made by an ExternalSecret shows where it comes from (the ExternalSecret,
   its store, last refresh, Ready), and an ExternalSecret's page links its store and target Secret.
@@ -322,16 +316,15 @@
   page the Application that deployed it (by its tracking id): sync and health, auto-sync,
   revision, last sync, conditions, the last 5 deployments (each but the newest with *Roll
   back…*), a link to the Application, and *Refresh*/*Sync* (*Terminate* while an operation runs;
-  write mode and the server's or hub's protection apply). The Applications are found in what
+  write mode and the server's protection apply). The Applications are found in what
   the Argo CD API servers' feeds hold (those the argocd CLI is logged in to and those added in
   Settings → Argo CD): one the Argo CD page follows already is read as it is, else the page
   starts it and it stays 5 minutes after the last page that asked; a server that is down is
   said, never waited on again meanwhile. An object's Application is read whole once found, for
   the object's own state in it; a namespace's are those whose destination is that namespace
-  of this cluster. One read by the API opens on the Argo CD page's dashboard, and its actions
-  go through Argo CD's API (a sync of the whole Application). Only when no server has it are
-  they read from the hub, found among the connected clusters, else among other kubeconfig contexts that
-  need no separate login.
+  of this cluster. One opens on the Argo CD page's dashboard, and its actions go through Argo
+  CD's API (a sync of the whole Application). With no Argo CD server connected, an object's
+  tracking id is named, with how to connect one.
 - **Argo CD page** (sidebar → *Argo CD*): the environments of every Argo CD API server the
   argocd CLI is logged in to or set in Settings → Argo CD, read only through Argo CD's API (no
   kubeconfig for Argo CD's cluster needed, and none is asked: see
@@ -596,9 +589,8 @@
   sources again, without hooks or prune, as `argocd app rollback` does: the deployment the dialog
   names is the one sent, even if another lands meanwhile. With auto-sync on it is disabled, since
   Argo CD refuses it (revert in git instead). Like argocd-server, nothing starts while another
-  operation runs or the Application is being deleted, and the write carries the version of the
-  Application just read, so a change meanwhile refuses it. Each dialog shows the `kubectl patch` it sends; write mode,
-  the hub's protection and *Run as* apply.
+  operation runs or the Application is being deleted. Each dialog shows the `argocd` command it
+  matches; write mode and the server's protection apply.
 - **Argo CD resources**: an Application's page lists what Argo CD tracks for it
   (`status.resources`) as a table: kind, namespace/name, sync, health, whether it is a hook, and
   a message (its health message, and *no longer in git* for one out of sync that a sync with
@@ -763,8 +755,8 @@
   plugins are refused when sent ("prod-eu is read-only"), and a bulk action on checked rows that
   include one does nothing and says so. The local kubectl terminal doesn't open on them (its
   kubectl could write). Reads, logs, port-forwards and dry runs still work. For Argo CD, the
-  hub's setting decides (or the API server's name, when no hub is tied to it), not that of the
-  cluster an Application deploys to: a sync from a writable hub still deploys there. Agents
+  server's own entry decides (its name, `argocd.example.com`), not that of the cluster an
+  Application deploys to (an agent's Argo CD writes are refused on either). Agents
   can't write to them either, whatever their rules say: the refusal is final, and `check_access`
   and the Agents page's test say so. The context picker marks them `read-only`.
 - **Diagnosis** on pods and workloads: why it is broken (crash output and exit code, scheduling,

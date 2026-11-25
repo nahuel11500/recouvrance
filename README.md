@@ -135,7 +135,7 @@ what you can check for yourself:
 
 - **No telemetry.** The app talks to your clusters, to the Prometheus or VictoriaMetrics you point
   it at, to the Anthropic API only if you use the assistant, to an https URL you load in
-  *Create / apply*, to the Argo CD API server you set in Settings when you ask for its diff, and to GitHub when you click *Check for updates* in Settings → About (one
+  *Create / apply*, to the Argo CD API servers the argocd CLI is logged in to or you connect in Settings → Argo CD (when you use Argo CD in the app), and to GitHub when you click *Check for updates* in Settings → About (one
   unauthenticated request for the latest release). Nothing else, and no analytics. The release
   notes shown after an update come with the app.
 - **Safe by default.** Read-only until you turn writes on. Writes show their `kubectl`

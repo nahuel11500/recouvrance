@@ -368,7 +368,7 @@ async fn run(scope: Scope, ask: Ask, judged_since: Option<Instant>, mut finish: 
     let mut jobs =
         super::jobs(&client, &kinds, &scope.namespaces, (context, Some(scope.context.as_str())), judged_since);
     // Argo CD Applications deploying here, read on their hubs (no request when none is known).
-    jobs.push(super::argo_apps::job(&scope.context, &client, &kinds, &scope.namespaces));
+    jobs.push(super::argo_apps::job(&scope.context, &scope.namespaces));
     finish.checks = Some(jobs.iter().map(|(name, _)| Arc::from(name.as_str())).collect());
     let checks = async {
         let mut running: futures::stream::FuturesUnordered<_> = (jobs.into_iter().enumerate())
@@ -464,7 +464,7 @@ mod tests {
             name: name.into(),
             reason: "broken".into(),
             age: None,
-            on_hub: None,
+            on_argo: None,
         }
     }
 

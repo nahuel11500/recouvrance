@@ -33,21 +33,19 @@ pub struct Problem {
     pub reason: String,
     pub age: Option<jiff::Timestamp>,
     /// An Argo CD Application is shown under the cluster and namespace it deploys to, but
-    /// lives on its hub: there, and in this namespace.
-    pub on_hub: Option<OnHub>,
+    /// lives on its Argo CD server: there, and in this namespace.
+    pub on_argo: Option<OnArgo>,
 }
 
-/// Where an Argo CD Application found by a scan lives: its Argo CD, and its own namespace
-/// there.
+/// Where an Argo CD Application found by a scan lives: the Argo CD API server it was read
+/// from, and its own namespace there.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OnHub {
-    /// The hub context it was read on, or the name of the Argo CD API server it was read from
-    /// (`argocd.example.com`, as agents' rules name a server).
-    pub context: String,
+pub struct OnArgo {
+    /// The server's name (`argocd.example.com`).
+    pub server: String,
+    /// Its Argo CD (`Endpoint::instance`), whose Argo CD page dashboard opens it.
+    pub instance: String,
     pub namespace: String,
-    /// Read from Argo CD's API: that Argo CD (`Endpoint::instance`), whose Argo CD page
-    /// dashboard opens it.
-    pub server: Option<String>,
 }
 
 fn cell<'a>(defs: &[ColumnDef], row: &'a Row, name: &str) -> &'a str {
@@ -341,7 +339,7 @@ async fn scan_kind(
         name,
         reason,
         age,
-        on_hub: None,
+        on_argo: None,
     };
     // One namespace: its own object, not every namespace.
     if let Some(ns) = namespace.as_deref().filter(|_| kind.is("", "Namespace")) {
@@ -525,7 +523,7 @@ async fn run_all(jobs: Vec<Job>) -> Scan {
 #[cfg(feature = "dev")]
 pub async fn scan_with_argo(client: Client, kinds: &[Kind], context: &str) -> Scan {
     let mut jobs = kind_jobs(&client, kinds, None, (None, None), None);
-    jobs.push(argo_apps::job(context, &client, kinds, &[]));
+    jobs.push(argo_apps::job(context, &[]));
     run_all(jobs).await
 }
 

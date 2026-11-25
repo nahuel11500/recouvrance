@@ -166,7 +166,7 @@ pub fn problems(filling: &[Filling], namespaces: &[String], alerted: impl Fn(&st
                 name: f.claim.clone(),
                 reason,
                 age: None,
-                on_hub: None,
+                on_argo: None,
             }
         })
         .collect()
