@@ -650,6 +650,7 @@ mod tests {
             last_sync: None,
             cluster: String::new(),
             namespace: String::new(),
+            more_clusters: Vec::new(),
             dest_written: String::new(),
             on: None,
             main: 0,

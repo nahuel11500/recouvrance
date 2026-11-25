@@ -357,8 +357,10 @@
   commit sha cut to 7: `main-77b324b`), the product's first (the images whose tag differs between
   the project's environments, or whose path names the project: `shop/api`, `team/shop-web`; a
   database or exporter every environment runs alike comes after,
-  all of them on hover), when its last sync ended, and where it deploys (Argo CD's name of the
-  cluster, from the Application or Argo CD's cluster list, and the namespace) when that differs
+  all of them on hover), when its last sync ended, and where its workload deploys (Argo CD's
+  name of the cluster, from the Application or Argo CD's cluster list, and the namespace, of its
+  Applications that made no other: not the app of apps'; on several clusters, the main one and
+  `+N`, the others named on hover) when that differs
   between rows: a column with the same value on 95% of the rows is left out, and the Argo CD
   server's column shows only with several. Its chevron unfolds its Applications (named after the
   environment: `workload`, `managed-namespace`), each with its sync, health, revision, auto-sync,

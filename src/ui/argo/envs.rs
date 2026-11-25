@@ -63,9 +63,11 @@ pub struct Env {
     pub images: Vec<(bool, EnvImage)>,
     /// When its last operation ended.
     pub last_sync: Option<jiff::Timestamp>,
-    /// Where its workload deploys: Argo CD's name of the cluster, and the namespace.
+    /// Where its workload deploys (`workload_destination`): Argo CD's name of the cluster, and
+    /// the namespace; the other clusters its workload deploys to, by name.
     pub cluster: String,
     pub namespace: String,
+    pub more_clusters: Vec<String>,
     /// Its workload's destination as the Application writes it (a server URL or a name), and
     /// the context shown for it, if one reaches it: what the destination's tooltip says.
     pub dest_written: String,
@@ -152,6 +154,12 @@ pub fn environments(
                 .max_by_key(|&i| (apps[i].app.images.len(), std::cmp::Reverse(i)))
                 .filter(|&i| !apps[i].app.images.is_empty())
                 .unwrap_or(members[0].0);
+            let (dest, more_clusters) = workload_destination(
+                &members,
+                |i| apps[i].parent,
+                |i| apps[i].app.images.len(),
+                |i| apps[i].cluster.as_str(),
+            );
             let last_sync =
                 summaries().filter_map(|a| a.operation.as_ref()?.2.as_deref()?.parse::<jiff::Timestamp>().ok()).max();
             let images: Vec<(bool, EnvImage)> =
@@ -178,16 +186,51 @@ pub fn environments(
                 on_tag,
                 images,
                 last_sync,
-                cluster: apps[main].cluster.clone(),
-                namespace: apps[main].app.dest_namespace.clone(),
-                dest_written: written(&apps[main].app),
-                on: apps[main].on.clone(),
+                cluster: apps[dest].cluster.clone(),
+                namespace: apps[dest].app.dest_namespace.clone(),
+                more_clusters,
+                dest_written: written(&apps[dest].app),
+                on: apps[dest].on.clone(),
                 main,
                 search: search.join(" ").to_lowercase(),
                 members,
             }
         })
         .collect()
+}
+
+/// Where an environment's workload runs: its Applications that made none of the others (an
+/// app of apps holds only Applications, and deploys them to Argo CD's own cluster), the one
+/// with the most images first, then the one on the cluster most of them deploy to, then the
+/// first in tree order. Gives that one (an index in the fleet) and the other clusters, by Argo
+/// CD's name, that the others deploy to.
+pub fn workload_destination<'a>(
+    members: &[(usize, usize)],
+    parent: impl Fn(usize) -> Option<usize>,
+    images: impl Fn(usize) -> usize,
+    cluster: impl Fn(usize) -> &'a str,
+) -> (usize, Vec<String>) {
+    let parents: HashSet<usize> = members.iter().filter_map(|(i, _)| parent(*i)).collect();
+    let workload: Vec<usize> = members.iter().map(|(i, _)| *i).filter(|i| !parents.contains(i)).collect();
+    // A loop of parents leaves none: the root then.
+    let workload = if workload.is_empty() { vec![members[0].0] } else { workload };
+    let mut per_cluster: HashMap<&str, usize> = HashMap::new();
+    for &i in &workload {
+        *per_cluster.entry(cluster(i)).or_default() += 1;
+    }
+    let dest = workload
+        .iter()
+        .enumerate()
+        .max_by_key(|&(at, &i)| (images(i), per_cluster[cluster(i)], std::cmp::Reverse(at)))
+        .map_or(members[0].0, |(_, &i)| i);
+    let mut more: Vec<String> = Vec::new();
+    for &i in &workload {
+        let c = cluster(i);
+        if c != cluster(dest) && !c.is_empty() && !more.iter().any(|m| m == c) {
+            more.push(c.to_string());
+        }
+    }
+    (dest, more)
 }
 
 /// The destination cluster as the Application writes it: its server URL, else its name.
@@ -201,6 +244,9 @@ pub fn destination_tip(env: &Env) -> String {
     let mut lines = Vec::new();
     if !env.dest_written.is_empty() && env.dest_written != env.cluster {
         lines.push(env.dest_written.clone());
+    }
+    if !env.more_clusters.is_empty() {
+        lines.push(format!("Also on {}", env.more_clusters.join(", ")));
     }
     lines.push(match &env.on {
         Some(context) => format!("Context: {context}"),
@@ -457,6 +503,7 @@ mod tests {
             last_sync: None,
             cluster: String::new(),
             namespace: String::new(),
+            more_clusters: Vec::new(),
             dest_written: String::new(),
             on: None,
             main: 0,
@@ -583,6 +630,28 @@ mod tests {
         assert_eq!(section_order(&e), [4, 5, 6], "no workload: the root first");
         e.members = vec![(4, 0)];
         assert_eq!(section_order(&e), [4]);
+    }
+
+    /// The app of apps deploys to Argo CD's own cluster: the destination is its children's,
+    /// with no image to tell them apart too (Argo CD sums none up), and the others counted.
+    #[test]
+    fn the_destination_is_where_the_workload_runs_not_the_app_of_apps() {
+        // 0: root (in-cluster), 1: workload (prod-a), 2: namespace (prod-a), 3: other (prod-b).
+        let clusters = ["in-cluster", "prod-a", "prod-a", "prod-b"];
+        let parent = |i: usize| (i > 0).then_some(0);
+        let members = [(0, 0), (1, 1), (2, 1), (3, 1)];
+        let dest = |images: [usize; 4], members: &[(usize, usize)]| {
+            workload_destination(members, parent, |i| images[i], |i| clusters[i])
+        };
+        assert_eq!(dest([0; 4], &members), (1, vec!["prod-b".to_string()]), "most of them on prod-a");
+        assert_eq!(dest([0, 0, 0, 2], &members), (3, vec!["prod-a".to_string()]), "the most images");
+        assert_eq!(dest([0; 4], &members[..2]), (1, vec![]));
+        // An Application on its own, an app of apps with no child yet: itself.
+        assert_eq!(dest([0; 4], &members[..1]), (0, vec![]));
+        // An app of apps above another: the leaves only.
+        let nested = |i: usize| [None, Some(0), Some(1), Some(1)][i];
+        let (d, more) = workload_destination(&members, nested, |_| 0, |i| clusters[i]);
+        assert_eq!((d, more), (2, vec!["prod-b".to_string()]));
     }
 
     #[test]
