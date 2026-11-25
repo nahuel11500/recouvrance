@@ -289,7 +289,8 @@ fn cli_entries(text: &str, notes: &mut Vec<String>) -> Result<Vec<CliEntry>, Str
             args: CliArgs {
                 server: s.server.trim().to_string(),
                 grpc_web: s.grpc_web,
-                root_path: root.to_string(),
+                // As the config has it: the CLI is given back what it was given.
+                root_path: s.grpc_web_root_path.trim().to_string(),
                 plaintext: s.plain_text,
                 insecure: s.insecure,
             },
@@ -2377,7 +2378,7 @@ users:
         assert_eq!(args("argocd.example.com"), "account get-user-info --server argocd.example.com --grpc-web");
         assert_eq!(
             args("argocd-dev.example.com"),
-            "account get-user-info --server argocd-dev.example.com --grpc-web-root-path argo --insecure"
+            "account get-user-info --server argocd-dev.example.com --grpc-web-root-path /argo --insecure"
         );
         assert_eq!(args("localhost:8080"), "account get-user-info --server localhost:8080 --plaintext");
         for x in &e.list {
