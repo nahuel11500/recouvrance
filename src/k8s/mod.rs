@@ -214,8 +214,16 @@ pub fn error_chain(e: &anyhow::Error) -> String {
         return said;
     }
     if let Some(said) = unreachable::connect_failure(e.as_ref()) {
-        let doing =
-            (e.chain()).take_while(|c| !c.is::<kube::Error>() && !unreachable::is_connect(*c)).map(ToString::to_string);
+        // What was being done, up to kube's or hyper's error, or a cause that already prints the
+        // next one (kube-runtime's watcher error holds hyper's text).
+        let texts: Vec<String> = e.chain().map(ToString::to_string).collect();
+        let doing = (e.chain().zip(&texts).enumerate())
+            .take_while(|(i, (c, text))| {
+                !c.is::<kube::Error>()
+                    && !unreachable::is_connect(*c)
+                    && !texts.get(i + 1).is_some_and(|next| text.contains(next.as_str()))
+            })
+            .map(|(_, (_, text))| text.clone());
         return doing.chain([said]).collect::<Vec<_>>().join(": ");
     }
     format!("{e:#}")

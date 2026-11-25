@@ -6,26 +6,40 @@ use std::error::Error as StdError;
 use std::net::SocketAddr;
 
 /// What to say when `e`, or an error behind it, is a connection to the API server that failed:
-/// refused (with the address that refused it), a host that can't be resolved, a TLS handshake
-/// that failed, a timeout, or else its last cause. None for any other error (the API server's
-/// answer, a login command...). No URL in it keeps its user and password.
+/// refused (by the address that refused it), a host that can't be resolved (with the
+/// resolver's reason: no such host and a resolver that can't be reached read apart), a TLS
+/// handshake that failed, a timeout, or else its last cause. Worded for whichever hop failed,
+/// the API server or a proxy on the way. None for any other error (the API server's answer, a
+/// login command...). No URL in it keeps its user and password.
 pub(super) fn connect_failure(e: &(dyn StdError + 'static)) -> Option<String> {
     let causes: Vec<&(dyn StdError + 'static)> = std::iter::successors(Some(e), |c| (*c).source()).collect();
     if !causes.iter().any(|c| is_connect(*c)) {
         return None;
     }
-    let at = causes.iter().find_map(|c| address(*c)).map_or_default(|a| format!(" ({a})"));
+    let addr = causes.iter().find_map(|c| address(*c));
+    let root = causes.last().map_or_default(ToString::to_string);
     let said = if let Some(tls) = causes.iter().find_map(|c| tls(*c)) {
-        format!("TLS handshake with the API server failed: {tls}")
+        match addr {
+            Some(a) => format!("TLS handshake failed with {a}: {tls}"),
+            None => format!("TLS handshake failed: {tls}"),
+        }
     } else if causes.iter().any(|c| io_kind(*c) == Some(std::io::ErrorKind::ConnectionRefused)) {
-        format!("The API server refused the connection{at}")
+        match addr {
+            Some(a) => format!("Connection refused by {a}"),
+            None => "Connection refused".to_string(),
+        }
     } else if causes.iter().any(|c| c.to_string() == "dns error") {
-        "Can't resolve the API server's host".to_string()
+        format!("Can't resolve the API server's host: {root}")
     } else if causes.iter().any(|c| io_kind(*c) == Some(std::io::ErrorKind::TimedOut) || timed_out(*c)) {
-        "The cluster did not answer (timed out connecting to the API server)".to_string()
+        match addr {
+            Some(a) => format!("The cluster did not answer (timed out connecting to {a})"),
+            None => "The cluster did not answer (timed out connecting to the API server)".to_string(),
+        }
     } else {
-        let root = causes.last().map_or_default(ToString::to_string);
-        format!("Can't connect to the API server{at}: {root}")
+        match addr {
+            Some(a) => format!("Can't connect to {a}: {root}"),
+            None => format!("Can't connect to the API server: {root}"),
+        }
     };
     Some(super::login::without_userinfo(&said).into_owned())
 }
@@ -89,9 +103,26 @@ mod tests {
         let port = closed_port();
         let e = client(&format!("https://127.0.0.1:{port}")).apiserver_version().await.unwrap_err();
         let e = anyhow::Error::from(e).context("discovery failed");
-        let said = format!("The API server refused the connection (127.0.0.1:{port})");
+        let said = format!("Connection refused by 127.0.0.1:{port}");
         assert_eq!(short_error(&e), said);
         assert_eq!(error_chain(&e), format!("discovery failed: {said}"));
+        // A cause that already prints the next one (kube-runtime's watcher error) is left out
+        // with it: hyper's text never comes back through it.
+        #[derive(Debug)]
+        struct Watcher(kube::Error);
+        impl std::fmt::Display for Watcher {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "failed to perform initial object list: {}", self.0)
+            }
+        }
+        impl std::error::Error for Watcher {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let e = client(&format!("https://127.0.0.1:{port}")).apiserver_version().await.unwrap_err();
+        let e = anyhow::Error::from(Watcher(e)).context("listing pods");
+        assert_eq!(error_chain(&e), format!("listing pods: {said}"));
     }
 
     /// A server that doesn't speak TLS: the handshake's own error, not hyper's chain.
@@ -111,7 +142,8 @@ mod tests {
         let rustls = std::io::Error::new(std::io::ErrorKind::InvalidData, rustls::Error::DecryptError);
         let wrapped = std::io::Error::other(rustls);
         assert_eq!(super::tls(&wrapped), Some(rustls::Error::DecryptError.to_string()));
-        assert!(said.starts_with("TLS handshake with the API server failed: "), "{said}");
+        assert!(said.starts_with("TLS handshake failed"), "{said}");
+        assert!(said.contains("received corrupt message"), "{said}");
         assert!(!said.contains("client error"), "{said}");
     }
 
