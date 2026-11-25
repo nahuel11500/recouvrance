@@ -38,6 +38,7 @@ const STAGING_EXTRA: [(&str, &str); 7] = [
 const THIRD_PARTY: [&str; 2] = ["docker.io/library/redis:7.2", "quay.io/prometheus/statsd-exporter:v0.26.0"];
 
 /// The images of the example whose tag holds a commit: (repository, tag).
+#[cfg(feature = "dev")]
 pub fn commits() -> Vec<(String, String)> {
     STAGING_EXTRA.iter().map(|(c, t)| (format!("{REGISTRY}/{c}"), (*t).to_string())).collect()
 }
