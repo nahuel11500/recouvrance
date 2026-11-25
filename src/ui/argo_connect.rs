@@ -42,8 +42,13 @@ pub struct ConnectArgo {
 pub fn open(reconnect: Option<(String, bool)>, window: &mut Window, cx: &mut App) {
     let view = cx.new(|cx| ConnectArgo::new(reconnect, window, cx));
     let focus = view.read(cx).address.focus_handle(cx);
+    window.open_dialog(cx, move |dialog, _, _| {
+        // Enter belongs to the field it is pressed in (Next, Sign in, Use the token): the
+        // dialog's own Enter would close it first. Escape still closes it.
+        dialog.title("Connect to Argo CD").w(px(600.)).on_ok(|_, _, _| false).child(view.clone())
+    });
+    // After the dialog took the focus for itself on opening (from the palette too).
     focus.focus(window, cx);
-    window.open_dialog(cx, move |dialog, _, _| dialog.title("Connect to Argo CD").w(px(600.)).child(view.clone()));
 }
 
 impl ConnectArgo {
@@ -64,6 +69,12 @@ impl ConnectArgo {
                     this.address_changed(cx);
                 }
                 _ => {}
+            }),
+            // Enter in the username: on to the password.
+            cx.subscribe_in(&username, window, |this, _, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    this.password.update(cx, |s, cx| s.focus(window, cx));
+                }
             }),
             cx.subscribe_in(&password, window, |this, _, ev: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { .. } = ev {
