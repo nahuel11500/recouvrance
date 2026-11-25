@@ -694,6 +694,101 @@ impl Policy {
     }
 }
 
+/// The rules' name of Argo CD's Application kind, and what else they may call it.
+const ARGO_APPLICATIONS: &str = "applications.argoproj.io";
+const ARGO_ALIASES: [&str; 2] = ["applications", "application"];
+
+/// Where agent rules judge an action on an Argo CD Application: where it deploys, never the
+/// Argo CD server that holds it nor the cluster Argo CD runs in. So `sync
+/// applications.argoproj.io -n *-staging` decides the same whichever Argo CD holds them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArgoPlace {
+    /// The kubeconfig's contexts that reach its destination cluster.
+    pub contexts: Vec<String>,
+    /// Its destination cluster as the Application writes it (`in-cluster`, a cluster name,
+    /// the server's host): the rules' context when no context reaches it.
+    pub cluster: String,
+    /// Its `destination.namespace`.
+    pub namespace: String,
+    /// The Application's name.
+    pub name: String,
+}
+
+impl ArgoPlace {
+    /// The requests `verb` on the Application makes, one per context that reaches its
+    /// destination (each must be allowed), or one on its cluster's name when none does.
+    pub fn accesses(&self, verb: Verb) -> Vec<Access> {
+        let mut contexts = self.contexts.clone();
+        contexts.sort();
+        contexts.dedup();
+        if contexts.is_empty() {
+            contexts.push(if self.cluster.is_empty() { "unknown".into() } else { self.cluster.clone() });
+        }
+        contexts
+            .into_iter()
+            .map(|context| Access {
+                context,
+                verb,
+                resource: ARGO_APPLICATIONS.into(),
+                resource_aliases: ARGO_ALIASES.map(String::from).to_vec(),
+                namespace: Some(self.namespace.clone()),
+                name: Some(self.name.clone()),
+                cluster_scoped: false,
+            })
+            .collect()
+    }
+}
+
+impl Policy {
+    /// The decision on requests that must all go ahead: the strictest of theirs (a Deny,
+    /// else an Ask, else an Allow). None at all is a Deny: nothing says where it goes.
+    pub fn decide_all(&self, all: &[Access]) -> Verdict {
+        let rank = |m: Mode| match m {
+            Mode::Allow => 0,
+            Mode::Ask => 1,
+            Mode::Deny => 2,
+        };
+        all.iter()
+            .map(|a| self.decide(a))
+            .max_by_key(|v| rank(v.mode))
+            .unwrap_or(Verdict { mode: Mode::Deny, rule: None })
+    }
+
+    /// Whether some Allow or Ask rule lets one of `verbs` on Argo CD's Applications through
+    /// somewhere: checked before any Argo CD server is asked for an agent.
+    pub fn may_reach_argo(&self, verbs: &[Verb]) -> bool {
+        self.rules.iter().any(|r| {
+            r.effect != Mode::Deny
+                && !r.expired()
+                && (r.verbs.iter().any(|v| v == "*") || verbs.iter().any(|v| r.lists_verb(*v)))
+                && std::iter::once(ARGO_APPLICATIONS).chain(ARGO_ALIASES).any(|res| any_glob(&r.resources, res))
+        })
+    }
+}
+
+/// The context patterns of a rule on Argo CD's Applications that name where Argo CD itself
+/// is (`homes`: its servers, the contexts it was read on): Argo CD actions are judged on where
+/// each Application deploys, so these decide none of them now. A rule naming every resource
+/// (`*`) is not about Argo CD and is left alone, as is `*` among its contexts.
+pub fn argo_home_patterns(rule: &Rule, homes: &[String]) -> Vec<String> {
+    let about_argo = rule.resources.iter().any(|p| {
+        p.trim() != "*"
+            && std::iter::once(ARGO_APPLICATIONS).chain(ARGO_ALIASES).any(|r| any_glob(std::slice::from_ref(p), r))
+    });
+    if !about_argo {
+        return Vec::new();
+    }
+    let mut named: Vec<String> = rule
+        .contexts
+        .iter()
+        .filter(|p| p.trim() != "*" && !is_protected_selector(p))
+        .filter(|p| homes.iter().any(|h| any_glob(std::slice::from_ref(*p), h)))
+        .cloned()
+        .collect();
+    named.dedup();
+    named
+}
+
 /// A write to a Namespace object changes (or deletes) everything in it, so it also meets
 /// the Deny and Ask rules of that namespace: the same request, inside it.
 fn namespace_contents(a: &Access) -> Option<Access> {
@@ -1336,7 +1431,7 @@ pub(super) mod tests {
 /// single examples: what a reviewer would otherwise have to check case by case.
 #[cfg(test)]
 pub(crate) mod properties {
-    use super::{Access, Mode, PROTECTED, Policy, Rule, Verb};
+    use super::{Access, ArgoPlace, Mode, PROTECTED, Policy, Rule, Verb, argo_home_patterns};
     use crate::mcp::Approval;
     use proptest::prelude::*;
 
@@ -1552,6 +1647,84 @@ pub(crate) mod properties {
             let verdicts = |p: &Policy, b: &Access| (p.decide(b), p.decide_any_namespace(b));
             let before = if Verb::GITOPS.contains(&a.verb) { Access { verb: Verb::Patch, ..a.clone() } } else { a.clone() };
             prop_assert_eq!(verdicts(&new, &a), verdicts(&old, &before));
+        }
+    }
+
+    /// A rule that may name Argo CD's Applications.
+    fn argo_rule() -> impl Strategy<Value = Rule> {
+        let resources = prop::collection::vec(
+            prop_oneof![Just("*"), Just("applications.argoproj.io"), Just("applications"), Just("pods")]
+                .prop_map(String::from),
+            0..3,
+        );
+        (rule(), resources).prop_map(|(r, resources)| Rule { resources, ..r })
+    }
+
+    fn argo_policy() -> impl Strategy<Value = Policy> {
+        prop::collection::vec(argo_rule(), 0..6).prop_map(|rules| Policy { rules, ..Policy::default() })
+    }
+
+    /// Where an Application deploys: the contexts reaching it (maybe none), its cluster as
+    /// written, its destination namespace and its name.
+    fn place() -> impl Strategy<Value = ArgoPlace> {
+        (prop::collection::vec(value(), 0..3), value(), value(), value())
+            .prop_map(|(contexts, cluster, namespace, name)| ArgoPlace { contexts, cluster, namespace, name })
+    }
+
+    /// Where Argo CD itself is: a server or a hub context, never among the destinations.
+    fn home() -> impl Strategy<Value = String> {
+        prop_oneof![Just("argocd.example.com"), Just("hub"), Just("argo-hub-eu")].prop_map(String::from)
+    }
+
+    proptest! {
+        /// An Argo CD action is decided on every context that reaches the Application's
+        /// destination: the strictest of their decisions, whatever their order or repeats;
+        /// with none, on its cluster's name. Never on nothing.
+        #[test]
+        fn an_argo_action_is_decided_where_the_application_deploys(
+            policy in argo_policy(), place in place(), verb in verb(), unprotected in unprotected(),
+        ) {
+            let policy = resolved(&policy, &unprotected);
+            let all = place.accesses(verb);
+            prop_assert!(!all.is_empty());
+            let contexts: Vec<&str> = all.iter().map(|a| a.context.as_str()).collect();
+            if place.contexts.is_empty() {
+                prop_assert_eq!(contexts, vec![place.cluster.as_str()]);
+            } else {
+                prop_assert!(contexts.iter().all(|c| place.contexts.iter().any(|p| p == c)));
+                prop_assert!(place.contexts.iter().all(|p| contexts.contains(&p.as_str())));
+            }
+            for a in &all {
+                prop_assert_eq!(a.namespace.as_deref(), Some(place.namespace.as_str()));
+                prop_assert_eq!(a.name.as_deref(), Some(place.name.as_str()));
+                prop_assert_eq!(a.resource.as_str(), "applications.argoproj.io");
+            }
+            let verdict = policy.decide_all(&all);
+            let worst = all.iter().map(|a| strictness(policy.decide(a).mode)).max().unwrap();
+            prop_assert_eq!(strictness(verdict.mode), worst);
+            // Reordered and repeated, the same.
+            let mut shuffled = place.clone();
+            shuffled.contexts.reverse();
+            shuffled.contexts.extend(place.contexts.first().cloned());
+            prop_assert_eq!(policy.decide_all(&shuffled.accesses(verb)).mode, verdict.mode);
+            prop_assert_eq!(policy.decide_all(&[]).mode, Mode::Deny);
+        }
+
+        /// A rule naming where Argo CD itself is (its server, its hub context) decides no
+        /// Argo CD action: whatever its effect, the decisions stay as they were (an Allow
+        /// that named the hub fails closed), and the Agents page flags it.
+        #[test]
+        fn a_rule_naming_argo_cds_home_decides_no_argo_action(
+            policy in argo_policy(), extra in argo_rule(), home in home(), place in place(), verb in verb(),
+        ) {
+            let all = place.accesses(verb);
+            let before = policy.decide_all(&all).mode;
+            let mut more = policy;
+            more.rules.push(Rule { contexts: vec![home.clone()], ..extra.clone() });
+            prop_assert_eq!(more.decide_all(&all).mode, before);
+            let flagged = argo_home_patterns(&more.rules[more.rules.len() - 1], std::slice::from_ref(&home));
+            let about_argo = extra.resources.iter().any(|r| r != "*" && r != "pods");
+            prop_assert_eq!(flagged.is_empty(), !about_argo);
         }
     }
 }
