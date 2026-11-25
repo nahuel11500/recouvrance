@@ -327,7 +327,7 @@ pub fn deployed(app: &Value) -> (Vec<Deployed>, Option<i64>) {
     let (holder, sources): (&Value, Vec<&Value>) = if let Some(h) = last {
         (h, sources_of(h))
     } else {
-        let spec = app.pointer("/spec").map(sources_of).unwrap_or_default();
+        let spec = app.pointer("/spec").map_or_default(sources_of);
         (app.pointer("/status/sync").unwrap_or(&Value::Null), spec)
     };
     let one = |source: Option<&Value>, revision: &str, index: Option<usize>| Deployed {
