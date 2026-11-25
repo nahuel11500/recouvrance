@@ -792,6 +792,9 @@ mod url_properties {
             path in "([/?#][^@]{0,12})?",
             after in "([ \"<>\\n][^@]{0,20})?",
         ) {
+            // A `://` already in the text before makes the URL start there (`://a://@0` loses
+            // `a://` as its user): more is hidden, never less, which the next property checks.
+            prop_assume!(!before.contains("://"));
             let userinfo = password.map_or_else(|| user.clone(), |p| format!("{user}:{p}"));
             let host = port.map_or_else(|| host.clone(), |p| format!("{host}:{p}"));
             let text = format!("{before}{scheme}://{userinfo}@{host}{path}{after}");
