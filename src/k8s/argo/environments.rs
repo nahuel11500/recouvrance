@@ -197,7 +197,7 @@ impl EnvTypes {
                 Rule::Name(re) => re.find(name),
                 Rule::Tagged(_) => None,
             })
-            .min_by_key(|m| m.start())?;
+            .min_by_key(regex::Match::start)?;
         Some(name[m.end()..].trim_matches('-')).filter(|c| !c.is_empty())
     }
 

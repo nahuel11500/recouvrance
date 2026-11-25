@@ -496,9 +496,12 @@ pub fn regroup(diffs: &[Option<&SmartDiff>], names: &[Names], noise: bool) -> Ve
     out.into_iter().map(|(_, _, c)| c).collect()
 }
 
+/// Where a change is in one Application and what it says there (see [`Seen`]).
+type Signature<'a> = Vec<(&'a str, &'a Fact, u64)>;
+
 /// Where a change is in one Application and what it says there, sorted, each once.
-fn signature(seen: &[Seen]) -> Vec<(&str, &Fact, u64)> {
-    let mut sig: Vec<(&str, &Fact, u64)> = seen.iter().map(|(n, f, d)| (n.as_str(), f, *d)).collect();
+fn signature(seen: &[Seen]) -> Signature<'_> {
+    let mut sig: Signature<'_> = seen.iter().map(|(n, f, d)| (n.as_str(), f, *d)).collect();
     sig.sort();
     sig.dedup();
     sig
@@ -516,22 +519,23 @@ fn own_line(shaped: &Fact, kind: &str, places: &Places) -> (String, Vec<usize>) 
     };
     let names: Vec<&str> = names.into_iter().collect();
     let mut text = own_text(&fact, kind, &names);
-    let valued = !matches!(fact, Fact::Added | Fact::Pruned | Fact::Renamed { .. });
-    if values.len() > 1 && valued {
-        text.push_str(&format!(" ({} values)", values.len()));
-    }
-    // Each Application's resources and values: those unlike the most's differ.
-    let sigs: Vec<(usize, Vec<(&str, &Fact, u64)>)> = places.iter().map(|(a, (_, s))| (*a, signature(s))).collect();
+    // Each Application's resources and values: when most are alike, those unlike them differ.
+    let sigs: Vec<(usize, Signature<'_>)> = places.iter().map(|(a, (_, s))| (*a, signature(s))).collect();
     let mut count: BTreeMap<&[(&str, &Fact, u64)], usize> = BTreeMap::new();
     for (_, sig) in &sigs {
         *count.entry(sig.as_slice()).or_default() += 1;
     }
     let differs: Vec<usize> = match count.iter().max_by_key(|(_, n)| **n) {
-        Some((most, _)) if count.len() > 1 => {
+        Some((most, n)) if count.len() > 1 && 2 * n > sigs.len() => {
             sigs.iter().filter(|(_, s)| s.as_slice() != *most).map(|(a, _)| *a).collect()
         }
         _ => Vec::new(),
     };
+    // Values that differ only between those environments are said by them.
+    let valued = !matches!(fact, Fact::Added | Fact::Pruned | Fact::Renamed { .. });
+    if values.len() > 1 && valued && differs.is_empty() {
+        text.push_str(&format!(" ({} values)", values.len()));
+    }
     if !differs.is_empty() {
         text.push_str(&format!(" (differs in {})", crate::plural::count(differs.len(), "environment")));
     }

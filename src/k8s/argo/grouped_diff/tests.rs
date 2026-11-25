@@ -316,7 +316,7 @@ fn the_same_key_to_different_values_says_where_it_differs() {
     };
     let (a, b, c) = (level("a", "debug"), level("b", "warn"), level("c", "debug"));
     let groups = regroup(&[Some(&a.diff), Some(&b.diff), Some(&c.diff)], &[], false);
-    assert_eq!(texts(&groups), ["ConfigMap app-config key LOG_LEVEL changed (2 values) (differs in 1 environment)"]);
+    assert_eq!(texts(&groups), ["ConfigMap app-config key LOG_LEVEL changed (differs in 1 environment)"]);
     assert_eq!(groups[0].apps.iter().map(|(a, _)| *a).collect::<Vec<_>>(), [0, 1, 2]);
     assert_eq!(groups[0].differs, [1], "the one unlike the most");
 }
@@ -359,16 +359,16 @@ fn one_change_on_many_resources_and_environments_is_one_line() {
         [
             "image web 1.15.0 → 1.16.0",
             "36 Deployments: annotation example.io/role added (36 values)",
-            "PrometheusRule shop-rules: spec.groups[shop].rules[0] added (differs in 1 environment)",
+            "PrometheusRule shop-rules: spec.groups[shop].rules changed (differs in 1 environment)",
         ]
     );
     assert_eq!(groups[1].apps.len(), 3);
     assert_eq!(groups[1].apps[0].1.len(), 36, "each environment's 36 resources");
     assert!(groups[1].differs.is_empty());
     assert_eq!(groups[2].differs, [2], "the third's threshold differs; the names alone don't");
-    // Without the names, every environment's rule is its own.
+    // Without the names, every environment's rule is its own: no most to differ from.
     let groups = regroup(&read, &[], false);
-    assert_eq!(groups[2].differs.len(), 2, "{:?}", texts(&groups));
+    assert!(groups[2].differs.is_empty() && groups[2].text.ends_with("(3 values)"), "{:?}", texts(&groups));
     let (heading, lines) = summary_lines(&groups, 3).unwrap();
     assert_eq!(heading, "3 changes in 3 environments");
     assert_eq!(lines.len(), 3);
