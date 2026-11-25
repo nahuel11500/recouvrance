@@ -1170,7 +1170,7 @@ pub fn from_api(reads: Vec<ApiRead>, targets: &[ContextTarget], connected: &[Str
         if let Some(e) = read.state.error.as_ref().filter(|_| !read.state.live) {
             fleet.errors.push(format!("{name}: {e}"));
             if !read.state.listed {
-                fleet.unread.push(name.clone());
+                fleet.unread.push(name);
             }
         }
         if read.state.refused && !fleet.relogin.iter().any(|(b, _)| *b == endpoint.server.base) {
