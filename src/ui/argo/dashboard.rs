@@ -802,12 +802,10 @@ impl ArgoView {
             _ => None,
         };
         let from_status = tip.map(|tip| hint("argo-dash-diff-source", "from status", tip, cx));
-        // A list's copy holds no resources: what differs isn't known, only whether it does.
-        if total == 0 && c.note.is_some() {
-            let sync = c.summary.sync.clone();
-            let color = if sync == "Synced" { theme.success } else { muted };
+        // A list's copy holds no resources: what differs isn't known, only that something does.
+        if total == 0 && c.note.is_some() && c.summary.sync != "Synced" {
             return tile("Sync diff", None, cx)
-                .child(figure(sync, color))
+                .child(figure(c.summary.sync.clone(), muted))
                 .child(div().text_xs().text_color(muted).child("What differs wasn't read."));
         }
         if total == 0 {
