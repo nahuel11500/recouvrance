@@ -370,6 +370,19 @@ pub fn lines(
     (out, heads)
 }
 
+/// An environment's Applications in the order its dashboard shows them: its workload (`main`)
+/// first, the others in tree order, its root (the app of apps, whose cards list its
+/// children) last.
+pub fn section_order(env: &Env) -> Vec<usize> {
+    let root = env.root();
+    let mut out = vec![env.main];
+    out.extend(env.members.iter().map(|(i, _)| *i).filter(|&i| i != env.main && i != root));
+    if root != env.main {
+        out.push(root);
+    }
+    out
+}
+
 /// An Application's name under its environment's: what follows `<environment>-`, else its own.
 pub fn member_label<'a>(env: &str, app: &'a str) -> &'a str {
     app.strip_prefix(env).and_then(|rest| rest.strip_prefix('-')).filter(|r| !r.is_empty()).unwrap_or(app)
@@ -470,6 +483,18 @@ mod tests {
         );
         assert_eq!(summary(2, None, 3, &[]), "2 environments · 3 Applications");
         assert_eq!(summary(2, Some(1), 3, &[]), "1 of 2 environments · 3 Applications");
+    }
+
+    #[test]
+    fn the_workload_comes_first_and_the_root_last() {
+        let mut e = env("shop-prod-a", "shop", 0, State::default());
+        e.members = vec![(4, 0), (5, 1), (6, 1)];
+        e.main = 6;
+        assert_eq!(section_order(&e), [6, 5, 4]);
+        e.main = 4;
+        assert_eq!(section_order(&e), [4, 5, 6], "no workload: the root first");
+        e.members = vec![(4, 0)];
+        assert_eq!(section_order(&e), [4]);
     }
 
     #[test]

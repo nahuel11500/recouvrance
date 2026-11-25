@@ -273,6 +273,9 @@ pub struct ArgoView {
     /// How many environments the filter keeps, and which.
     kept: usize,
     env_keeps: Vec<bool>,
+    /// The environments the filter keeps, in the list's order (folded ones too): what the
+    /// dashboard's previous and next go through.
+    env_order: Vec<usize>,
     favorites: Entity<crate::favorites::Favorites>,
     /// Which Applications (by index in the rows shown) are favorites, and how many.
     starred: Vec<bool>,
@@ -426,6 +429,7 @@ impl ArgoView {
             headings: Vec::new(),
             kept: 0,
             env_keeps: Vec::new(),
+            env_order: Vec::new(),
             favorites,
             starred: Vec::new(),
             starred_count: 0,
@@ -563,6 +567,7 @@ impl ArgoView {
             self.headings.clear();
             self.kept = 0;
             self.env_keeps.clear();
+            self.env_order.clear();
             self.starred.clear();
             self.starred_count = 0;
             self.keeps.clear();
@@ -599,6 +604,7 @@ impl ArgoView {
             |e| rows.envs[e].tone,
         );
         (self.lines, self.headings) = (lines, headings);
+        self.env_order = listed.iter().map(|(_, e)| *e).filter(|&e| env_keeps[e]).collect();
         self.keeps = rows.env_of.iter().map(|&e| env_keeps[e]).collect();
         self.env_keeps = env_keeps;
         self.recount_picked();

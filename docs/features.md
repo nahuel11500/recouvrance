@@ -391,10 +391,14 @@
   context's (the server's name typed, or a wait). Settings → Argo CD lists the servers, says how
   each logs in, tests one (who the token is, Argo CD's version, how many Applications it may
   read), turns one off, and never shows a token.
-- **Argo CD Application dashboard**: a row's click opens the dashboard of its environment: a
-  tab per Application (with a dot in its color; with its Argo CD's name too when two share a name or
-  several Argo CDs are read), *Updated
-  at* and *Refresh*, and cards. *State*: the sync in big (*Synced*, *OutOfSync*, *Sync Failed* or
+- **Argo CD environment dashboard**: a row's click opens the dashboard of its environment,
+  titled with its name, its type and its Argo CD; *‹ 3 / 12 ›* goes to the environment before or
+  after it among those the list's filter keeps, in the list's order. An entry per Application of
+  the environment, its workload (the one running the most images) first, its root (the app of
+  apps, whose cards list its children) last, each named under the environment (`workload`,
+  `managed-namespace`) with a dot in its color, its sync and health (with its Argo CD's name too
+  when two share a name or several Argo CDs are read); a click shows its cards, the workload's
+  first. *Updated at* and *Refresh*, and cards. *State*: the sync in big (*Synced*, *OutOfSync*, *Sync Failed* or
   *Syncing*), the health, the resources Degraded (`worker Degraded +1`) and *Why?* (the diagnosis
   below), the card tinted green, amber or red. *Versions*: a chip per component's image (the
   repository's last part and its tag), red with `1.4.1 → 1.5.0` when it changed since the
