@@ -1707,28 +1707,22 @@ mod tests {
     #[test]
     fn a_server_whose_first_list_is_not_in_yet_is_said_to_be_read() {
         let (one, two) = (endpoint("https://argocd.example.com"), endpoint("https://argocd.example.org"));
-        let mut fleet = Fleet::default();
         let pending = ApiRead { endpoint: one.clone(), state: api::FeedState::default() };
         let failed = api::FeedState { error: Some("HTTP 401".into()), ..Default::default() };
-        add_api(
-            &mut fleet,
-            vec![pending, ApiRead { endpoint: two.clone(), state: failed }],
-            &[],
-            &[],
-            &Default::default(),
-        );
+        let fleet =
+            from_api(vec![pending, ApiRead { endpoint: two.clone(), state: failed }], &[], &[], &Default::default());
         // The one that failed says why instead.
         assert_eq!(fleet.reading, [one.name()]);
         assert_eq!(fleet.summary(None), format!("Reading Applications from {}…", one.name()));
         assert_eq!(fleet.summary(Some(0)), fleet.summary(None));
 
         // One listed, the other still read: both said.
-        let mut fleet = Fleet::default();
         let mut listed = api::FeedState { listed: true, ..Default::default() };
         let a = api_app("argocd", "web", None);
         listed.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
         let pending = ApiRead { endpoint: one.clone(), state: api::FeedState::default() };
-        add_api(&mut fleet, vec![ApiRead { endpoint: two, state: listed }, pending], &[], &[], &Default::default());
+        let mut fleet =
+            from_api(vec![ApiRead { endpoint: two, state: listed }, pending], &[], &[], &Default::default());
         let reading = format!("Reading Applications from {}…", one.name());
         assert_eq!(fleet.summary(None), format!("1 Application · {reading}"));
         assert_eq!(fleet.summary(Some(0)), format!("0 of 1 Application · {reading}"));
