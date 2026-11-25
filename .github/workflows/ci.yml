@@ -1,11 +1,10 @@
 name: CI
 
-# Three levels, so a pull request answers in about two minutes:
-# - pull requests: format, spelling, licenses and clippy (with and without the developer tools);
-# - the merge queue (merge_group): those, plus the tests, the end-to-end run on a kind cluster
-#   (the write guards) and the Windows check, so main only gets what passed them all;
-# - pushes to main, release tags and manual runs: everything, plus macOS, Windows tests, the
-#   minimum Rust version, docs and release builds.
+# Pull requests get the quick checks, in about two minutes: format, spelling, licenses and
+# clippy (with and without the developer tools). Pushes to main, release tags and manual runs
+# get everything: the tests, the end-to-end run on a kind cluster (the write guards), Windows,
+# macOS, the minimum Rust version, docs and release builds. A failure on main is fixed first.
+# (merge_group stays for a merge queue, which needs an organization-owned repository.)
 on:
   pull_request:
   merge_group:
