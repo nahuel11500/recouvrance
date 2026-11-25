@@ -1239,7 +1239,8 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>, cell: TokenCell)
             if said.as_ref() != Some(&why) {
                 {
                     let mut s = lock(&state);
-                    s.refused = why.is_some();
+                    // A server refusing this machine: no Reconnect would help.
+                    s.refused = why.is_some() && !super::connect::renewal_forbidden(&endpoint.server.base);
                     s.error.clone_from(&why);
                 }
                 changed();
@@ -1285,6 +1286,15 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>, cell: TokenCell)
                     lock(&state).error = Some(note.unwrap_or(f.why));
                     changed();
                     return;
+                }
+                Err(f) if f.forbidden => {
+                    let note = super::connect::renewal_note(&endpoint.name(), &endpoint.server.base);
+                    {
+                        let mut s = lock(&state);
+                        s.error = Some(note.unwrap_or(f.why));
+                        s.refused = false;
+                    }
+                    changed();
                 }
                 Err(_) => {}
             }
