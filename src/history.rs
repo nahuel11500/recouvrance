@@ -521,9 +521,10 @@ pub fn argo_changes(app: &Value) -> Vec<Change> {
     out
 }
 
-/// ` from <repo> <path or chart> @ <target>`, from a deployment's (first) source.
+/// ` from <repo> <path or chart> @ <target>`, from a deployment's (first) source. `sources`
+/// wins: with several, Argo CD's API still sends `source` as `{"repoURL": ""}`.
 fn argo_source(h: &Value) -> String {
-    let Some(src) = h.get("source").filter(|s| s.is_object()).or_else(|| h.pointer("/sources/0")) else {
+    let Some(src) = h.pointer("/sources/0").or_else(|| h.get("source").filter(|s| s.is_object())) else {
         return String::new();
     };
     let s = |k: &str| src[k].as_str().filter(|s| !s.is_empty());
@@ -1091,6 +1092,16 @@ mod tests {
     }
 
     #[test]
+    fn an_argo_deployment_with_several_sources_names_the_first() {
+        // Argo CD's API sends an empty `source` next to `sources` (#1071).
+        let h = json!({"source": {"repoURL": ""}, "sources": [
+            {"repoURL": "https://github.com/acme/config.git", "targetRevision": "HEAD", "ref": "configs"},
+            {"repoURL": "https://charts.example.com", "chart": "web", "targetRevision": "0.35.0"},
+        ]});
+        assert_eq!(argo_source(&h), " from github.com/acme/config @ HEAD");
+    }
+
+    #[test]
     fn argo_deployments_and_a_failed_sync() {
         let app = json!({"metadata": {"name": "shop"}, "status": {
             "history": [
@@ -1107,8 +1118,8 @@ mod tests {
             summaries,
             [
                 "sync Failed: one or more objects failed",
-                "deployed bbbbbbbb from github.com/acme/deploy shop @ main by auto-sync",
-                "deployed aaaaaaaa from github.com/acme/deploy shop @ main by ana",
+                "deployed bbbbbbb from github.com/acme/deploy shop @ main by auto-sync",
+                "deployed aaaaaaa from github.com/acme/deploy shop @ main by ana",
             ]
         );
         assert!(changes[0].warning);

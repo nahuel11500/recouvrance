@@ -1523,12 +1523,7 @@ impl Render for ArgoView {
             Some(rows) if rows.fleet.hubs.is_empty() && rows.fleet.servers.is_empty() => self.no_hub(&rows.fleet, cx),
             Some(rows) => {
                 let count = self.lines.len();
-                let total = rows.fleet.apps.len();
-                let summary = if self.filter == Filter::default() {
-                    crate::plural::count(total, "Application")
-                } else {
-                    format!("{} of {}", self.kept, crate::plural::count(total, "Application"))
-                };
+                let summary = rows.fleet.summary((self.filter != Filter::default()).then_some(self.kept));
                 v_flex()
                     .size_full()
                     .child(div().px_2().pb_2().text_sm().child(summary))

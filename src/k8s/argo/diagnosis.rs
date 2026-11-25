@@ -1489,7 +1489,7 @@ mod tests {
         assert_eq!(f.tone, Tone::Done);
         assert_eq!(f.title, "Out of sync: 3 resources");
         assert!(f.hint.contains("Auto-sync is off"), "{}", f.hint);
-        assert!(f.message.as_deref().unwrap().contains("aaaaaaaa deployed, bbbbbbbb now"), "{:?}", f.message);
+        assert!(f.message.as_deref().unwrap().contains("aaaaaaa deployed, bbbbbbb now"), "{:?}", f.message);
         let what: Vec<&str> = f.objects.iter().map(|(_, w)| w.as_str()).collect();
         assert_eq!(
             what,
@@ -1822,12 +1822,12 @@ mod tests {
             entry(4, "2026-10-30T11:50:00Z", &sha),
         ]);
         let lp = sync_loop(&looping, now()).unwrap();
-        assert_eq!(lp, SyncLoop { revision: "cccccccc".into(), syncs: 3, over: 30 * 60 });
+        assert_eq!(lp, SyncLoop { revision: "ccccccc".into(), syncs: 3, over: 30 * 60 });
         let d = Diagnosis::of(&looping, now());
         assert_eq!(d.looping, [deployment()]);
         assert_eq!(d.to_compare, [deployment()]);
         let f = d.findings.iter().find(|f| f.title.starts_with("Sync loop")).unwrap();
-        assert_eq!(f.title, "Sync loop: revision cccccccc synced 3 times in 30 min");
+        assert_eq!(f.title, "Sync loop: revision ccccccc synced 3 times in 30 min");
         assert!(f.hint.contains("ignoreDifferences"));
         // Spread over hours, or long over: not a loop.
         let slow = app(vec![
