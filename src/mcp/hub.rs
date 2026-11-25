@@ -789,29 +789,6 @@ impl Hub {
         self.cluster(context).map_or_default(|c| lock(&c.skipped).clone())
     }
 
-    /// Whether the context is connected for agents and its kinds discovered: getting its
-    /// client ([`client`](Self::client)) starts no connection, discovery or login. A request
-    /// on that client still runs the context's login command once its token has expired.
-    /// No request.
-    pub fn ready(&self, context: &str) -> bool {
-        let cluster = lock(&self.clients).get(context).cloned();
-        cluster.is_some_and(|c| c.client.initialized() && lock(&c.kinds).is_some())
-    }
-
-    /// The contexts connected for agents whose discovered kinds hold `group`/`kind`, sorted.
-    /// No request: a context not connected yet is not among them.
-    pub fn contexts_serving(&self, group: &str, kind: &str) -> Vec<String> {
-        let clusters: Vec<(String, Arc<Cluster>)> =
-            lock(&self.clients).iter().map(|(n, c)| (n.clone(), c.clone())).collect();
-        let mut out: Vec<String> = clusters
-            .into_iter()
-            .filter(|(_, c)| lock(&c.kinds).as_ref().is_some_and(|(kinds, _)| kinds.iter().any(|k| k.is(group, kind))))
-            .map(|(n, _)| n)
-            .collect();
-        out.sort();
-        out
-    }
-
     /// Discover again (a CRD may have been installed since), at most once a minute per
     /// context. None when it ran too recently or failed.
     pub async fn rediscover(&self, context: &str) -> Option<Arc<Vec<Kind>>> {
@@ -1007,43 +984,6 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-
-    /// An API server that is never asked: `Hub::ready` sends no request.
-    struct NoServer;
-
-    impl tower::Service<http::Request<kube::client::Body>> for NoServer {
-        type Response = http::Response<http_body_util::Empty<bytes::Bytes>>;
-        type Error = std::convert::Infallible;
-        type Future = std::future::Ready<std::result::Result<Self::Response, Self::Error>>;
-
-        fn poll_ready(
-            &mut self,
-            _: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, _: http::Request<kube::client::Body>) -> Self::Future {
-            panic!("Hub::ready sent a request")
-        }
-    }
-
-    /// A context is ready only once both its client and its kinds are there: a label read
-    /// on it then starts no connection or discovery.
-    #[tokio::test]
-    async fn a_context_is_ready_once_connected_and_discovered() {
-        let hub = Hub::for_test(Vec::new());
-        assert!(!hub.ready("hub"), "never connected");
-        let cluster = Arc::new(Cluster::default());
-        lock(&hub.clients).insert("hub".into(), cluster.clone());
-        assert!(!hub.ready("hub"), "no client yet");
-        assert!(cluster.client.set(Client::new(NoServer, "default")).is_ok());
-        assert!(!hub.ready("hub"), "connected, kinds not discovered yet");
-        let kinds = Arc::new(vec![Kind::fake("argoproj.io", "Application")]);
-        *lock(&cluster.kinds) = Some((kinds, Instant::now()));
-        assert!(hub.ready("hub"));
-        assert!(!hub.ready("other"));
-    }
 
     #[test]
     fn switching_an_agent_off_leaves_the_rules_file_alone() {
