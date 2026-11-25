@@ -182,6 +182,10 @@ impl AppView {
             this.show_detail_on(ev.context.clone(), ev.client.clone(), ev.obj.clone(), window, cx);
         })
         .detach();
+        cx.subscribe_in(&panel, window, |this, _, ev: &crate::ui::argo::OpenArgoApp, window, cx| {
+            this.show_argo_app(ev, window, cx);
+        })
+        .detach();
         cx.subscribe_in(&panel, window, move |this, asker, ev: &crate::details::OpenOn, window, cx| {
             this.open_on(ev.context.clone(), ev.res.clone(), Some(own.clone()), asker.entity_id(), window, cx);
         })
@@ -260,12 +264,17 @@ impl AppView {
         })
         .detach();
         cx.subscribe_in(page, window, |this, _, ev: &crate::ui::argo::OpenArgoApp, window, cx| {
-            this.open_argo(window, cx);
-            if let Route::Argo(argo) = this.route().clone() {
-                argo.update(cx, |argo, cx| argo.show_app(ev, cx));
-            }
+            this.show_argo_app(ev, window, cx);
         })
         .detach();
+    }
+
+    /// Open the Argo CD page on an Application's dashboard (one read by Argo CD's API).
+    fn show_argo_app(&mut self, ev: &crate::ui::argo::OpenArgoApp, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_argo(window, cx);
+        if let Route::Argo(argo) = self.route().clone() {
+            argo.update(cx, |argo, cx| argo.show_app(ev, cx));
+        }
     }
 
     /// Open an Application (on Argo CD's cluster) or where it deploys, from the Argo CD page

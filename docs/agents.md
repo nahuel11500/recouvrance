@@ -247,9 +247,15 @@ tools' definitions. What some of them need beyond the obvious verb:
   tracking id (`argocd.argoproj.io/tracking-id`, Argo CD's annotation tracking) or else its
   `app.kubernetes.io/instance` label (label tracking; Helm sets it too, so it counts only when
   the Application is found tracking the object), with its hub, sync, health and the object's own
-  state in it; `get_changes` adds the Application's deployments. That Application is read on the
-  same hubs, only where an Allow rule gives `get` on it (or `list`, to find it in another
-  namespace or by label), and nothing is read for an object that names none. A label alone
+  state in it; `get_changes` adds the Application's deployments. That Application is found
+  first in what the Argo CD API servers' feeds hold (no list of its own; see the Argo CD panel in
+  [features](features.md)), on the servers the rules name: a server is a rule's context, by its
+  name (`argocd.example.com`), and an Allow rule must give `get` or `list` on the Application
+  there. A label alone reads only feeds running already. The reply names the server, and the
+  hub context tied to it in Settings, if the rules name one, for `gitops` and `wait_for`. Only
+  when no server has an Application of that name is it read on the same hubs as `argocd_apps`,
+  only where an Allow rule gives `get` on it (or `list`, to find it in another namespace or by
+  label), and nothing is read for an object that names none. A label alone
   reads only hubs already connected for agents: it never connects to one. The hubs are read
   together, each bounded in time (10 s to connect, 30 s to read). A hub that can't be reached,
   whose credentials are refused or whose login command fails is left alone 5 minutes (said for

@@ -322,11 +322,18 @@
   page the Application that deployed it (by its tracking id): sync and health, auto-sync,
   revision, last sync, conditions, the last 5 deployments (each but the newest with *Roll
   back…*), a link to the Application, and *Refresh*/*Sync* (*Terminate* while an operation runs;
-  write mode and the hub's protection apply). The Applications are read from the
-  hub, found among the connected clusters, else among other kubeconfig contexts that need no
-  separate login; when the hub isn't found, the Argo CD page lists the contexts left out (named
-  like a hub first) to ask with one click, and the one that answers is kept. It can also be
-  ticked in Settings → Contexts (*Argo CD*; see
+  write mode and the server's or hub's protection apply). The Applications are found in what
+  the Argo CD API servers' feeds hold (those the argocd CLI is logged in to and those added in
+  Settings → Argo CD): one the Argo CD page follows already is read as it is, else the page
+  starts it and it stays 5 minutes after the last page that asked; a server that is down is
+  said, never waited on again meanwhile. An object's Application is read whole once found, for
+  the object's own state in it; a namespace's are those whose destination is that namespace
+  of this cluster. One read by the API opens on the Argo CD page's dashboard, and its actions go through
+  Argo CD's API (a sync of the whole Application). Only when no server has it are they read
+  from the hub, found among the connected clusters, else among other kubeconfig contexts that
+  need no separate login; when the hub isn't found, the Argo CD page lists the contexts left
+  out (named like a hub first) to ask with one click, and the one that answers is kept. It can
+  also be ticked in Settings → Contexts (*Argo CD*; see
   [configuration](configuration.md#argo-cd-hub-argocd_contexts)).
 - **Argo CD page** (sidebar → *Argo CD*): every Application of every context that serves Argo
   CD, read with one list per Argo CD cluster, and of every Argo CD API server the argocd CLI is
