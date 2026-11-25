@@ -403,8 +403,8 @@ pub(crate) fn merge_clusters(
                 answered = true;
                 releases.extend(rels);
             }
-            Err(e) if single => errors.push(format!("{e:#}")),
-            Err(e) => errors.push(format!("{ctx}: {e:#}")),
+            Err(e) if single => errors.push(k8s::error_chain(&e)),
+            Err(e) => errors.push(format!("{ctx}: {}", k8s::error_chain(&e))),
         }
     }
     if answered || errors.is_empty() { (Ok(releases), errors) } else { (Err(errors.join("\n")), Vec::new()) }

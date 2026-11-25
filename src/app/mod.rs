@@ -517,7 +517,8 @@ pub struct AppView {
     conn: conn::ConnStates,
     /// What the bar above the list says of the connect besides each context's state (a
     /// namespace list that failed, the kubeconfig that can't be read).
-    connect_notes: Option<SharedString>,
+    /// Kept with full names: the status line names each context as the screen does.
+    connect_notes: Vec<String>,
     /// The add-on API groups a connected cluster couldn't read (`k8s::SkippedGroup`), until
     /// the next connect: by cluster, for the status line, and their names.
     skipped: Vec<(String, Vec<k8s::SkippedGroup>)>,
@@ -562,7 +563,7 @@ impl AppView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (contexts, current, status) = match k8s::load_contexts() {
             Ok(c) => (c.names, dev_var("RECOUVRANCE_CONTEXT").or(c.current), None),
-            Err(e) => (Vec::new(), None, Some(format!("{e:#}").into())),
+            Err(e) => (Vec::new(), None, Some(SharedString::from(format!("{e:#}")))),
         };
         // One store for every window: a window never saves over the stars of another.
         let favorites = crate::favorites::shared(cx);
@@ -806,7 +807,7 @@ impl AppView {
             forwards_open: false,
             table,
             // A kubeconfig that can't be read shows where connect errors do.
-            connect_notes: status.clone(),
+            connect_notes: status.iter().map(SharedString::to_string).collect(),
             connect_errors: status,
             conn: conn::ConnStates::default(),
             skipped_groups: HashSet::new(),
@@ -1015,18 +1016,36 @@ fn notify_desktop(title: &str, body: &str) {
     let mut cmd = {
         let mut cmd = std::process::Command::new("notify-send");
         // `--`: a title or body starting with '-' (an agent's text) is never read as an option.
+        // The body may be read as markup: the agent's text is escaped (no links, no formatting).
         cmd.args([
             "--app-name=recouvrance",
             "--urgency=critical",
             "--icon=dialog-question",
             "--",
             title,
-            body.as_str(),
+            markup_escaped(&body).as_str(),
         ]);
         cmd
     };
     #[cfg(not(windows))]
     crate::forwards::spawn_reaped(cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()));
+}
+
+/// Text as plain text in a notification's body, which notification servers may read as markup
+/// (the Desktop Notifications spec allows `<b>`, `<i>`, `<a href>` and `<img>`): `&`, `<` and
+/// `>` are escaped, so an agent's text shows as written and can't add a link or an image.
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+fn markup_escaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// osascript's arguments for a notification on macOS (Notification Center). The agent's text
@@ -1102,6 +1121,32 @@ mod tests {
         assert!(odd.is_empty());
         assert!(pairs.iter().all(|[flag, statement]| *flag == "-e" && *statement != "-e"));
         assert!(script.iter().any(|a| a.contains("item 2 of argv") && a.contains("item 3 of argv")));
+    }
+
+    /// The agent's text is never markup in a notify-send body: no tag and no entity survive,
+    /// and unescaping gives the text back.
+    #[test]
+    fn a_notification_body_is_never_markup() {
+        let text = r#"<a href="https://evil.example">approve</a> & <b>x</b> &lt; <img src="/x">"#;
+        let escaped = super::markup_escaped(text);
+        assert!(!escaped.contains('<') && !escaped.contains('>'), "{escaped}");
+        assert!(
+            escaped.split('&').skip(1).all(|e| e.starts_with("amp;") || e.starts_with("lt;") || e.starts_with("gt;"))
+        );
+        let back = escaped.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+        assert_eq!(back, text);
+        assert_eq!(super::markup_escaped("plain -- text\nsecond"), "plain -- text\nsecond");
+    }
+
+    proptest::proptest! {
+        /// Whatever the text, its escaped form has no tag delimiters and gives the text back.
+        #[test]
+        fn any_notification_body_comes_back_as_written(text in "\\PC{0,40}") {
+            let escaped = super::markup_escaped(&text);
+            proptest::prop_assert!(!escaped.contains('<') && !escaped.contains('>'));
+            let back = escaped.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+            proptest::prop_assert_eq!(back, text);
+        }
     }
 
     #[test]

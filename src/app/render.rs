@@ -396,12 +396,18 @@ impl AppView {
             return v_flex().size_full().child(view_bar).child(self.render_connect(cx)).into_any_element();
         }
         let banner = self.render_conn_banner(cx);
+        let (status, status_hover) = self.status_lines();
         v_flex()
             .size_full()
             .child(view_bar)
             .children(banner)
-            .when_some(self.status_line(), |d, s| {
-                d.child(div().px_3().py_1().text_sm().text_color(cx.theme().muted_foreground).child(s))
+            .when_some(status, |d, s| {
+                // A context named by its short name: the full names on hover.
+                let line = div().id("status-line").px_3().py_1().text_sm().text_color(cx.theme().muted_foreground);
+                let line = line.when_some(status_hover, |l, full| {
+                    l.tooltip(move |w, cx| component::tooltip::Tooltip::new(full.clone()).build(w, cx))
+                });
+                d.child(line.child(s))
             })
             .children(self.render_selection_bar(cx))
             // Row presses are recorded by the table itself (see `ResourceTable::render_tr`).
