@@ -1588,6 +1588,22 @@ pub fn cluster_name(name: &str, server: &str, names: &std::collections::BTreeMap
     host.split(['/', ':']).next().unwrap_or(host).to_string()
 }
 
+/// The contexts that reach a destination given by its `server` URL when no kubeconfig
+/// `server:` is that URL (a context reaching the cluster by its IP address or another host
+/// name): those named as Argo CD's cluster list names that server, or whose kubeconfig
+/// cluster is, as `destination_is` matches a destination given by name.
+fn named_contexts(
+    server: &str,
+    names: &std::collections::BTreeMap<String, String>,
+    targets: &[ContextTarget],
+) -> Vec<String> {
+    if server.is_empty() {
+        return Vec::new();
+    }
+    let Some(name) = names.get(&server_key(server)) else { return Vec::new() };
+    targets.iter().filter(|t| t.name == *name || t.cluster == *name).map(|t| t.name.clone()).collect()
+}
+
 /// Every Application read by Argo CD's API, each server's under the app of apps that made it.
 /// `targets` are the kubeconfig's contexts, `connected` those connected, `servers` each hub
 /// context's Argo CD server (`argocd_servers`), which says the cluster `in-cluster` is.
@@ -1618,9 +1634,12 @@ pub fn from_api(
         let values: Vec<&Value> = apps.iter().map(|a| &a.value).collect();
         let base = fleet.apps.len();
         for (a, parent) in apps.iter().zip(parents(values.as_slice())) {
-            let dest = destination(&a.value, &hub, targets);
-            let on = dest.context(connected).map(String::from);
+            let mut dest = destination(&a.value, &hub, targets);
             let cluster = cluster_name(&a.summary.dest_name, &a.summary.dest_server, &read.state.clusters);
+            if dest.contexts.is_empty() {
+                dest.contexts = named_contexts(&a.summary.dest_server, &read.state.clusters, targets);
+            }
+            let on = dest.context(connected).map(String::from);
             fleet.apps.push(FleetApp {
                 server: endpoint.clone(),
                 instance: instance.clone(),
@@ -1742,6 +1761,45 @@ mod tests {
         assert_eq!(fleet.servers.len(), 2);
         assert!(fleet.projects[&one.instance()].is_ok());
         assert!(!fleet.projects.contains_key(&two.instance()), "not read yet");
+    }
+
+    /// #1072: a destination is named by Argo CD's cluster list, and reaches the context named
+    /// so even when the context's `server:` is another address of the cluster.
+    #[test]
+    fn a_destination_is_named_as_argo_cd_names_its_cluster() {
+        let source = endpoint("https://argocd.example.com");
+        let app = |name: &str, dest: Value| {
+            let v = json!({"metadata": {"name": name, "namespace": "argocd"},
+                "spec": {"project": "shop", "destination": dest}});
+            Arc::new(api::ApiApp { summary: Summary::of(&v), value: v })
+        };
+        let clusters = std::iter::once(("https://apiserver-prod.example".to_string(), "prod".to_string()));
+        let mut state = api::FeedState { clusters: Arc::new(clusters.collect()), ..Default::default() };
+        for a in [
+            app("a", json!({"server": "https://apiserver-prod.example", "namespace": "web"})),
+            app("b", json!({"server": "https://kubernetes.default.svc", "namespace": "argocd"})),
+            app("c", json!({"server": "https://other.example:6443", "namespace": "web"})),
+        ] {
+            state.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
+        }
+        let targets = [
+            ContextTarget {
+                name: "prod".into(),
+                cluster: "prod".into(),
+                server: Some("https://10.0.0.1".into()),
+                exec: None,
+            },
+            ContextTarget {
+                name: "else".into(),
+                cluster: "else".into(),
+                server: Some("https://10.0.0.2".into()),
+                exec: None,
+            },
+        ];
+        let fleet = from_api(vec![ApiRead { endpoint: source, state }], &targets, &[], &Default::default());
+        let rows: Vec<(&str, &str, Option<&str>)> =
+            fleet.apps.iter().map(|a| (a.app.name.as_str(), a.cluster.as_str(), a.on.as_deref())).collect();
+        assert_eq!(rows, [("a", "prod", Some("prod")), ("b", "in-cluster", None), ("c", "other.example", None)]);
     }
 
     /// #1076: while a server's first list is being read, the page says so, never `0 Applications`.
