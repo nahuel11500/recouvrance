@@ -348,6 +348,24 @@ pub struct SavedForward {
     pub open_browser: bool,
 }
 
+/// How the Argo CD page was last left, restored when it opens: its filters and search, how
+/// it groups, the headings folded and the environments unfolded (by their root: Argo CD,
+/// namespace, name). One that does not read is the default page.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArgoPage {
+    pub filter: crate::ui::argo::envs::Filter,
+    pub group_by: crate::ui::argo::envs::GroupBy,
+    pub folded: Vec<String>,
+    pub expanded: Vec<(String, String, String)>,
+}
+
+impl ArgoPage {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -445,6 +463,9 @@ pub struct Settings {
     /// `k8s::argo::environments`). Empty: the defaults.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub argocd_env_types: Vec<String>,
+    /// How the Argo CD page was last left: its filters, search, grouping and folds.
+    #[serde(skip_serializing_if = "ArgoPage::is_default")]
+    pub argocd_page: ArgoPage,
     /// Which kubeconfig file keeps a context name that several files have: the first one
     /// seen. The others' contexts are `name@file`, whatever order the files are read in.
     #[serde(deserialize_with = "string_entries")]
@@ -685,6 +706,7 @@ impl Default for Settings {
             argocd_api_servers: Vec::new(),
             argocd_api_off: Vec::new(),
             argocd_env_types: Vec::new(),
+            argocd_page: ArgoPage::default(),
             context_files: Default::default(),
             open_browser_on_forward: true,
             recent_forwards: Vec::new(),
@@ -1292,6 +1314,35 @@ mod tests {
         assert!(s.timeline.record, "on unless turned off");
         assert_eq!(s.timeline.kinds, ["configmaps"]);
         assert_eq!((s.timeline.max_mb(), s.timeline.days()), (1, 365));
+    }
+
+    /// The Argo CD page's state reads back as saved; one that doesn't read is the default
+    /// page, and the other settings stay.
+    #[test]
+    fn the_argo_cd_page_state_reads_back_or_is_the_default() {
+        use crate::ui::argo::envs::{Filter, GroupBy};
+        let page = super::ArgoPage {
+            filter: Filter {
+                needs_look: true,
+                project: Some("shop".into()),
+                query: "1.4".into(),
+                ..Default::default()
+            },
+            group_by: GroupBy::Project,
+            folded: vec!["shop / prod".into()],
+            expanded: vec![("https://argocd.example.com".into(), "argocd".into(), "shop-prod-a".into())],
+        };
+        let saved = serde_json::to_vec(&Settings { argocd_page: page.clone(), ..Settings::default() }).unwrap();
+        let (s, error, _) = super::from_bytes(&saved);
+        assert!(error.is_none());
+        assert_eq!(s.argocd_page, page);
+        let (s, error, lost) =
+            super::from_bytes(br#"{"argocd_page": {"group_by": "Sideways", "folded": ["x"]}, "metrics_refresh": 7}"#);
+        assert!(error.is_some() && !lost);
+        assert_eq!((s.argocd_page, s.metrics_refresh), (super::ArgoPage::default(), 7));
+        // A field it doesn't know is left: the rest reads.
+        let (s, _, _) = super::from_bytes(br#"{"argocd_page": {"folded": ["x"], "later": 1}}"#);
+        assert_eq!(s.argocd_page.folded, ["x"]);
     }
 
     #[test]
