@@ -22,6 +22,7 @@ mod external_secrets;
 mod favorites;
 mod filter_syntax;
 mod forwards;
+mod git_host;
 mod glob;
 mod helm;
 mod hex;

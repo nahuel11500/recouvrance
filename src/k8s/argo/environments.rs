@@ -260,6 +260,21 @@ pub fn product_first<'a>(images: &'a [EnvImage], product: &HashSet<String>) -> V
     out
 }
 
+/// Whether an image repository is named after `name` (a project, an Application): a part of
+/// its path past the registry is `name`, or starts with `name-` (`shop/api`, `team/shop-web`).
+/// A third-party image (`library/redis`) isn't.
+pub fn named_after(repo: &str, name: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    if name.len() < 2 {
+        return false;
+    }
+    let path = match repo.split_once('/') {
+        Some((registry, path)) if registry.contains(['.', ':']) => path,
+        _ => repo,
+    };
+    path.to_lowercase().split('/').any(|p| p == name || p.strip_prefix(&name).is_some_and(|r| r.starts_with('-')))
+}
+
 /// Whether a tag is a version (`1.4.2`, `v2.0`, `26-8-4-<sha>`), not a branch's build
 /// (`main-<sha>`) or `latest`.
 pub fn version_tag(tag: &str) -> bool {
@@ -357,6 +372,18 @@ mod tests {
 
     fn types() -> EnvTypes {
         EnvTypes::default()
+    }
+
+    #[test]
+    fn an_image_is_named_after_its_project_by_a_part_of_its_path() {
+        assert!(named_after("registry.example.com/shop/api", "shop"));
+        assert!(named_after("registry.example.com/team/shop-web", "shop"));
+        assert!(named_after("registry.example.com/team/shop-web", "Shop"));
+        assert!(!named_after("registry.example.com/team/shopping", "shop"));
+        assert!(!named_after("docker.io/library/redis", "shop"));
+        assert!(!named_after("shop.example.com/library/redis", "shop"), "the registry's name doesn't count");
+        assert!(named_after("shop/api", "shop"), "no registry: the whole path");
+        assert!(!named_after("registry.example.com/x/y", ""));
     }
 
     #[test]
