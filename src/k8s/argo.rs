@@ -21,6 +21,7 @@ use super::{ContextTarget, Kind, ObjectRef};
 use crate::status::Tone;
 
 pub mod api;
+pub mod connect;
 pub mod dashboard;
 pub mod diagnosis;
 pub mod grouped_diff;
@@ -1329,6 +1330,8 @@ pub struct Fleet {
     pub servers: Vec<String>,
     /// Each Argo CD's projects' sync windows (by `instance`), or why they couldn't be read.
     pub projects: HashMap<String, Result<ProjectWindows, String>>,
+    /// The API servers (their address) whose login is missing, expired or refused.
+    pub relogin: Vec<String>,
 }
 
 impl Fleet {
@@ -1486,6 +1489,9 @@ pub fn add_api(
         if let Some(e) = read.state.error.as_ref().filter(|_| !read.state.live) {
             fleet.errors.push(format!("{name}: {e}"));
         }
+        if read.state.refused && !fleet.relogin.contains(&endpoint.server.base) {
+            fleet.relogin.push(endpoint.server.base.clone());
+        }
         // The hub's windows, when read, stay: the API's failing doesn't hide them.
         match (read.state.projects, fleet.projects.get(&instance)) {
             (Some(Err(_)), Some(Ok(_))) | (None, _) => {}
@@ -1577,6 +1583,7 @@ mod tests {
             login: Err("no login in tests".into()),
             on: true,
             settings_token: false,
+            renewable: false,
         })
     }
 

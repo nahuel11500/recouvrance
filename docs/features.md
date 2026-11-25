@@ -366,7 +366,11 @@
   through the same API, need write mode when they are sent, and are confirmed like a protected
   context's (the server's name typed, or a wait). Settings → Argo CD lists the servers, says how
   each logs in, tests one (who the token is, Argo CD's version, how many Applications it may
-  read), turns one off, and never shows a token.
+  read), turns one off, and never shows a token. **Connect to Argo CD…** (palette, Settings →
+  Argo CD, the Argo CD page) takes the address as pasted, reads how the server signs in and
+  offers only those ways: SSO in the browser (no CLI needed; kept signed in with its own refresh
+  token), a username and password, or a token; *Reconnect* shows where a login expired or was
+  refused (see [configuration](configuration.md#argo-cd-by-its-api-argocd_api_servers)).
 - **Argo CD Application dashboard**: a row's click, or a click on a service heading's name, opens
   the dashboard of that service (the heading's chevron folds it): a tab per environment (each of
   its Applications, with a dot in its color; with its Argo CD's name too when two share a name or

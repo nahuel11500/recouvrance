@@ -319,6 +319,7 @@ gpui_kit::actions!(
         GoSettings,
         ToggleAssistant,
         OpenArgo,
+        ConnectArgoCd,
         OpenTimeline,
         OpenAccess,
         OpenUpgradeCheck,

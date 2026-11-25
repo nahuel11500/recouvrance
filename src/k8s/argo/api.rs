@@ -107,6 +107,8 @@ pub struct Endpoint {
     pub on: bool,
     /// A token is set for it in Settings, expired or not (it can be forgotten).
     pub settings_token: bool,
+    /// Its token set here came from an SSO sign-in made here, renewed with its refresh token.
+    pub renewable: bool,
 }
 
 impl Endpoint {
@@ -266,6 +268,7 @@ fn endpoints_from(
             login: Err(String::new()),
             on: true,
             settings_token: false,
+            renewable: false,
         });
     }
     for text in settings {
@@ -280,6 +283,7 @@ fn endpoints_from(
                     login: Err(String::new()),
                     on: true,
                     settings_token: false,
+                    renewable: false,
                 }),
             },
             Err(e) => out.errors.push(format!("Settings → Argo CD: {e}")),
@@ -322,6 +326,8 @@ pub fn save_token(base: &str, token: &str) -> std::io::Result<()> {
     });
     let token = token.trim();
     if token.is_empty() {
+        // What renewed it goes too.
+        super::connect::save_refresh(base, None)?;
         tokens.remove(base);
     } else {
         tokens.insert(base.to_string(), token.to_string());
@@ -347,7 +353,20 @@ pub fn endpoints() -> Endpoints {
     };
     let (settings, off) = crate::settings::with(|s| (s.argocd_api_servers.clone(), s.argocd_api_off.clone()));
     let settings_ok = crate::settings::load_error().is_none();
-    endpoints_from(cli, &settings, read_tokens(), &off, settings_ok, jiff::Timestamp::now().as_second())
+    let mut found =
+        endpoints_from(cli, &settings, read_tokens(), &off, settings_ok, jiff::Timestamp::now().as_second());
+    for x in &mut found.list {
+        x.renewable = x.settings_token && super::connect::renewable(&x.server.base);
+        // A login renewed here says it has expired only once renewing it failed, and why.
+        if x.renewable && x.login.is_err() {
+            let name = x.name();
+            x.login = Err(match super::connect::renewal_failure(&x.server.base) {
+                Some(why) => format!("The login to {name} has expired, and renewing it failed: {why}"),
+                None => format!("Renewing the login to {name}…"),
+            });
+        }
+    }
+    found
 }
 
 /// When the argocd CLI's config and the tokens file last changed (and their sizes): a page
@@ -424,7 +443,7 @@ impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
 
 /// The client for servers whose certificate is checked, or not (`insecure`): made once, its
 /// connections kept for the next requests (each server's own).
-fn http_client(insecure: bool) -> anyhow::Result<HttpClient> {
+pub(super) fn http_client(insecure: bool) -> anyhow::Result<HttpClient> {
     static CLIENTS: LazyLock<Mutex<HashMap<bool, HttpClient>>> = LazyLock::new(Default::default);
     let mut clients = CLIENTS.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(c) = clients.get(&insecure) {
@@ -852,12 +871,16 @@ pub struct FeedState {
     pub listed: bool,
     /// The stream is open.
     pub live: bool,
+    /// Its login is missing, expired or refused (401): Reconnect is offered.
+    pub refused: bool,
 }
 
 struct Feed {
     state: Arc<Mutex<FeedState>>,
     users: usize,
     _task: crate::k8s::TaskGuard,
+    /// Renews its login before it expires, while a page holds the feed.
+    _renew: Option<crate::k8s::TaskGuard>,
 }
 
 static FEEDS: LazyLock<Mutex<HashMap<String, Feed>>> = LazyLock::new(Default::default);
@@ -914,10 +937,26 @@ pub fn watch(endpoint: &Endpoint) -> Watch {
     let feed = feeds.entry(key.clone()).or_insert_with(|| {
         let state = Arc::new(Mutex::new(FeedState::default()));
         let task = crate::k8s::spawn_guarded(feed(endpoint.clone(), state.clone()));
-        Feed { state, users: 0, _task: task }
+        let renew = endpoint.renewable.then(|| {
+            let exp = endpoint.login.as_ref().ok().and_then(|(t, _)| server::exp_of(&t.0));
+            crate::k8s::spawn_guarded(keep_renewed(endpoint.server.base.clone(), endpoint.login.is_err(), exp))
+        });
+        Feed { state, users: 0, _task: task, _renew: renew }
     });
     feed.users += 1;
     Watch { endpoint: Arc::new(endpoint.clone()), state: feed.state.clone(), key }
+}
+
+/// Renew the login to `base` shortly before it expires at `exp` (at once when it has
+/// `expired`), again after a while when that fails. Once renewed, the pages read the servers
+/// again and a new feed renews the next one.
+async fn keep_renewed(base: String, expired: bool, exp: Option<i64>) {
+    let wait = if expired { Some(0) } else { super::connect::renew_in(exp, jiff::Timestamp::now().as_second()) };
+    let Some(wait) = wait else { return };
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+    while super::connect::renew(base.clone()).await.is_err() {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
 }
 
 fn lock(state: &Mutex<FeedState>) -> std::sync::MutexGuard<'_, FeedState> {
@@ -938,7 +977,10 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>) {
     let conn = match endpoint.conn() {
         Ok(c) => c,
         Err(why) => {
-            lock(&state).error = Some(why);
+            let mut s = lock(&state);
+            s.error = Some(why);
+            s.refused = true;
+            drop(s);
             changed();
             return;
         }
@@ -957,12 +999,19 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>) {
                 }
                 Ended::Failed(f) => {
                     s.error = Some(f.text);
-                    f.status == Some(401)
+                    s.refused = f.status == Some(401);
+                    s.refused
                 }
             }
         };
         changed();
         if refused {
+            // Refused before its time (revoked?): renewing may help.
+            if endpoint.renewable {
+                crate::k8s::spawn_detached(async move {
+                    let _ = super::connect::renew(endpoint.server.base.clone()).await;
+                });
+            }
             return;
         }
         if started.elapsed() >= STEADY {
@@ -1144,6 +1193,15 @@ pub async fn test(endpoint: Endpoint) -> Result<String, String> {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
+        Ok(check(&conn).await.map_err(|f| f.text))
+    });
+    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
+/// Check a token for `server` before keeping it (Connect to Argo CD…): as [`test`] does.
+pub async fn check_token(server: Server, token: String) -> Result<String, String> {
+    let read = crate::k8s::run_abortable(async move {
+        let conn = Conn { server, token: Token(token), insecure: false };
         Ok(check(&conn).await.map_err(|f| f.text))
     });
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))

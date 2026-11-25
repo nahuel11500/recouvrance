@@ -13,13 +13,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{
-    AppView, CloseTab, CloseWindow, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm,
-    GoProblems, GoSettings, GoWorkloads, MinimizeWindow, NewTab, NextTab, OpenAccess, OpenAgentActivity, OpenAgents,
-    OpenApiRequests, OpenApply, OpenArgo, OpenContexts, OpenHelmInstall, OpenPalette, OpenSelected, OpenTerminal,
-    OpenTimeline, OpenUpgradeCheck, PrevTab, RefreshPage, Route, RowCopyName, RowDelete, RowEvents, RowFavorite,
-    RowLogs, RowOpen, RowOpenTab, RowRestart, RowRun, RowScale, RowShell, RowYaml, ShowAbout, ShowShortcuts,
-    ToggleAssistant, ToggleFavorite, ToggleSidebar, ToggleTheme, ToggleWriteMode, ZoomIn, ZoomOut, ZoomReset,
-    ZoomWindow, set_theme, with_keys,
+    AppView, CloseTab, CloseWindow, ConnectArgoCd, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward,
+    GoHelm, GoProblems, GoSettings, GoWorkloads, MinimizeWindow, NewTab, NextTab, OpenAccess, OpenAgentActivity,
+    OpenAgents, OpenApiRequests, OpenApply, OpenArgo, OpenContexts, OpenHelmInstall, OpenPalette, OpenSelected,
+    OpenTerminal, OpenTimeline, OpenUpgradeCheck, PrevTab, RefreshPage, Route, RowCopyName, RowDelete, RowEvents,
+    RowFavorite, RowLogs, RowOpen, RowOpenTab, RowRestart, RowRun, RowScale, RowShell, RowYaml, ShowAbout,
+    ShowShortcuts, ToggleAssistant, ToggleFavorite, ToggleSidebar, ToggleTheme, ToggleWriteMode, ZoomIn, ZoomOut,
+    ZoomReset, ZoomWindow, set_theme, with_keys,
 };
 use crate::favorites::Favorite;
 use crate::ui::a11y::Control as _;
@@ -489,6 +489,7 @@ impl AppView {
             .on_action(|_: &ShowShortcuts, window, cx| super::shortcuts::open_panel(window, cx))
             // Pages and commands the palette lists without a key (see `commands::COMMANDS`).
             .on_action(cx.listener(|this, _: &OpenArgo, window, cx| this.open_argo(window, cx)))
+            .on_action(|_: &ConnectArgoCd, window, cx| crate::ui::argo_connect::open(None, window, cx))
             .on_action(cx.listener(|this, _: &OpenTimeline, window, cx| this.open_timeline(window, cx)))
             .on_action(cx.listener(|this, _: &OpenAccess, window, cx| this.open_access(window, cx)))
             .on_action(cx.listener(|this, _: &OpenUpgradeCheck, window, cx| this.open_upgrade_check(window, cx)))

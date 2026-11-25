@@ -9,11 +9,11 @@ use gpui_kit::assets::IconName as Lucide;
 use crate::ui::palette::{Item as PaletteItem, Target};
 
 use super::{
-    CloseTab, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm, GoProblems, GoSettings,
-    GoWorkloads, NewTab, NewWindow, NextTab, OpenAccess, OpenAgentActivity, OpenAgents, OpenApiRequests, OpenApply,
-    OpenArgo, OpenContexts, OpenHelmInstall, OpenPalette, OpenTerminal, OpenTimeline, OpenUpgradeCheck, PrevTab,
-    RefreshPage, ShowShortcuts, ToggleAssistant, ToggleFavorite, ToggleSidebar, ToggleTheme, ToggleWriteMode, ZoomIn,
-    ZoomOut, ZoomReset,
+    CloseTab, ConnectArgoCd, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm, GoProblems,
+    GoSettings, GoWorkloads, NewTab, NewWindow, NextTab, OpenAccess, OpenAgentActivity, OpenAgents, OpenApiRequests,
+    OpenApply, OpenArgo, OpenContexts, OpenHelmInstall, OpenPalette, OpenTerminal, OpenTimeline, OpenUpgradeCheck,
+    PrevTab, RefreshPage, ShowShortcuts, ToggleAssistant, ToggleFavorite, ToggleSidebar, ToggleTheme, ToggleWriteMode,
+    ZoomIn, ZoomOut, ZoomReset,
 };
 
 /// Where a command's keys act.
@@ -191,6 +191,13 @@ pub(crate) const COMMANDS: &[Command] = &[
     Command::here("Connect to just that context", "", "Double-click a context", Scope::Contexts),
     // Only in the palette.
     Command::new("Argo CD Applications", "", Lucide::GitFork, run::<OpenArgo>).also("gitops sync argocd"),
+    Command::new(
+        "Connect to Argo CD…",
+        "paste its address and sign in: SSO, a password or a token",
+        Lucide::Plug,
+        run::<ConnectArgoCd>,
+    )
+    .also("argocd login sso server token"),
     Command::new("Timeline", "what changed, across clusters", Lucide::ClockArrowDown, run::<OpenTimeline>)
         .also("history changes events rollouts"),
     Command::new("My access", "what you may do in this namespace, and who can", Lucide::KeyRound, run::<OpenAccess>)

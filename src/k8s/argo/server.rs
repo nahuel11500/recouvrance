@@ -95,7 +95,7 @@ pub(super) fn host_port(authority: &str, https: bool) -> Option<(String, u16)> {
     Some((host, authority.port_u16().unwrap_or(if https { 443 } else { 80 })))
 }
 
-fn loopback(host: &str) -> bool {
+pub(super) fn loopback(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     host == "localhost" || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
@@ -259,11 +259,14 @@ fn cli_token(text: &str, server: &Server) -> Option<String> {
 /// Whether a JWT's `exp` is past at `now` (seconds). A token that isn't a JWT, or has no
 /// `exp`, is left for the server to judge.
 pub(super) fn expired(token: &str, now: i64) -> bool {
-    let Some(payload) = token.split('.').nth(1) else { return false };
-    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')) else {
-        return false;
-    };
-    serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v.get("exp")?.as_i64()).is_some_and(|exp| exp <= now)
+    exp_of(token).is_some_and(|exp| exp <= now)
+}
+
+/// A JWT's `exp` (seconds), if it is one and has it.
+pub(super) fn exp_of(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v.get("exp")?.as_i64())
 }
 
 /// The token to send for `context`'s `server`, and where it comes from: Settings first, then

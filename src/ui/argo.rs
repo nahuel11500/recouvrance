@@ -740,8 +740,18 @@ impl ArgoView {
             .text_color(theme.muted_foreground)
             .child(intro)
             .child(
-                "Without access to Argo CD's cluster, read Argo CD by its API: log in with `argocd login <server>`, \
-                 or add its address and a token in Settings → Argo CD.",
+                "Without access to Argo CD's cluster, read Argo CD by its API: connect to it here (SSO, a password or \
+                 a token), or log in with `argocd login <server>`.",
+            )
+            .child(
+                h_flex().child(
+                    Button::new("argo-connect")
+                        .small()
+                        .primary()
+                        .icon(Lucide::Plug)
+                        .label("Connect to Argo CD…")
+                        .on_click(|_, window, cx| crate::ui::argo_connect::open(None, window, cx)),
+                ),
             )
             .children(fleet.errors.iter().map(|e| div().text_color(theme.danger).child(e.clone())))
             .when(!fleet.not_asked.is_empty(), |d| {
@@ -1519,6 +1529,7 @@ impl Render for ArgoView {
             }
         };
         let errors = self.rows.as_ref().map_or_else(Vec::new, |r| r.fleet.errors.clone());
+        let relogin = self.rows.as_ref().map_or_else(Vec::new, |r| r.fleet.relogin.clone());
         v_flex()
             .size_full()
             .p_2()
@@ -1531,7 +1542,22 @@ impl Render for ArgoView {
                         .text_xs()
                         .text_color(theme.danger)
                         .child("Some Argo CD clusters or servers could not be read:")
-                        .children(errors.into_iter().map(|e| div().child(e))),
+                        .children(errors.into_iter().map(|e| div().child(e)))
+                        .when(!relogin.is_empty(), |d| {
+                            d.child(h_flex().gap_1().pt_1().children(relogin.into_iter().enumerate().map(
+                                |(i, base)| {
+                                    let name =
+                                        argo::server::Server::parse(&base).map_or_else(|_| base.clone(), |s| s.name());
+                                    Button::new(("argo-reconnect", i))
+                                        .xsmall()
+                                        .outline()
+                                        .label(format!("Reconnect {name}"))
+                                        .on_click(move |_, window, cx| {
+                                            crate::ui::argo_connect::open(Some(base.clone()), window, cx);
+                                        })
+                                },
+                            )))
+                        }),
                 )
             })
             .child(div().flex_1().min_h_0().child(body))
