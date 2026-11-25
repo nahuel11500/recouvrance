@@ -617,7 +617,8 @@ impl ColumnPrefs {
 #[cfg(test)]
 mod tests {
     use super::{
-        FavApp, FavNamespace, FavObject, Favorite, Favorites, Read, Stored, favorite_namespaces, from_bytes, load_from,
+        FavApp, FavNamespace, FavObject, Favorite, Favorites, Read, Stored, adopted, favorite_namespaces, from_bytes,
+        load_from,
     };
 
     fn ns(context: &str, namespace: &str) -> FavNamespace {

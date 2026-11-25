@@ -113,8 +113,6 @@ fn argo_api_seen() -> (u64, u64) {
     (crate::k8s::argo::api::generation(), crate::k8s::argo::api::renewals())
 }
 
-/// The Argo CD token field, empty: one is saved, or the argocd CLI's login is used.
-
 /// What Check for updates found.
 enum UpdateCheck {
     Checking,

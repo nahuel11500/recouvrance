@@ -311,7 +311,7 @@ impl KubeMcp {
                 .map(|text| Managed { text, app: None });
         }
         let targets = argo::targets();
-        let may_read = |endpoint: &api::Endpoint, app: &Summary| {
+        let may_read = |_: &api::Endpoint, app: &Summary| {
             let place = ArgoPlace {
                 contexts: argo::api_contexts(app, &targets),
                 cluster: written_cluster(app),
