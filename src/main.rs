@@ -1,9 +1,16 @@
+// Windows: the app is a GUI program, so starting it from the Start menu or Explorer opens no
+// console window. Its commands (`serve`, `--help`...) attach to the terminal they are run from
+// (`console::attach_for_cli`). Dev builds and tests stay console programs: the developer tools
+// print to the terminal and read nothing back from it.
+#![cfg_attr(all(windows, not(test), not(feature = "dev")), windows_subsystem = "windows")]
+
 mod agents;
 mod alerts;
 mod app;
 mod assistant;
 mod cert_manager;
 mod certs;
+mod console;
 mod cron;
 mod details;
 #[cfg(feature = "dev")]
@@ -76,6 +83,9 @@ fn main() {
         return dev::smoke::run(ctx);
     }
     let args: Vec<String> = std::env::args().collect();
+    if console::is_cli(&args) {
+        console::attach_for_cli();
+    }
     match args.get(1).map(String::as_str) {
         // Headless MCP server, without the window.
         Some("serve") => return serve(),
