@@ -1,6 +1,6 @@
 # What the Windows end-to-end job's kwok cluster holds: a fake node (kwok runs its pods without
 # containers), a deployment, and two pods placed on the node by hand, which kwok reports Running
-# (kube-controller-manager doesn't create the deployment's pods on Windows).
+# without waiting for the scheduler or the controller manager to start.
 apiVersion: v1
 kind: Node
 metadata:
