@@ -542,3 +542,23 @@ fn the_sync_diff_says_what_changes_images_first() {
     assert!(!text.contains("++++"), "a Secret's values are masked: {text}");
     assert!(Cards::of(example::read("example-staging", now()), None, now()).smart.is_some_and(|s| s.in_sync()));
 }
+
+/// The Sync diff groups as the grouped diff does: one annotation added on three Deployments
+/// is one line, images first.
+#[test]
+fn the_sync_diff_groups_a_field_by_kind() {
+    let cards = Cards::of(example::read("example-prod", now()), None, now());
+    let lines: Vec<&str> = cards.changes.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(
+        lines,
+        [
+            "image api 1.4.1 → 1.5.0",
+            "image worker 1.4.1 → 1.5.0",
+            "ConfigMap shop-config key CRAWL_BATCH changed",
+            "Secret shop-secrets key SMTP_HOST changed",
+            "Service metrics added",
+            "ConfigMap legacy-flags pruned (with prune)",
+            "3 Deployments: annotation example.io/owner added (3 values)",
+        ]
+    );
+}

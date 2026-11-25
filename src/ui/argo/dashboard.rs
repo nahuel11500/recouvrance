@@ -23,7 +23,7 @@ use crate::details::ArgoAction;
 use crate::k8s;
 use crate::k8s::argo::dashboard::{self, Cards, Commit, Problem};
 use crate::k8s::argo::diagnosis::{Res, span_text};
-use crate::k8s::argo::grouped_diff::AppDiff;
+use crate::k8s::argo::grouped_diff::{AppDiff, Cross};
 use crate::k8s::argo::sync_diff::{self, Entry};
 use crate::k8s::argo::{self, api, short_revision};
 use crate::smartdiff::{self, ObjectKey, ResourceChange, SmartDiff};
@@ -921,17 +921,9 @@ impl ArgoView {
         };
         let changed: Vec<Res> = diff.changed.iter().chain(&diff.unknown).cloned().collect();
         // What changes, images first, when the smart diff has it; else which resources.
-        let lines: Vec<String> = match c.smart.as_ref().filter(|s| !s.diff.groups.is_empty()) {
-            Some(s) => {
-                let groups = &s.diff.groups;
-                let mut lines: Vec<String> = groups
-                    .iter()
-                    .take(CHANGES_IN_TILE)
-                    .map(|g| match g.resources.len() {
-                        1 => g.text(),
-                        n => format!("{} ({n})", g.text()),
-                    })
-                    .collect();
+        let lines: Vec<String> = match Some(&c.changes).filter(|g| !g.is_empty()) {
+            Some(groups) => {
+                let mut lines: Vec<String> = groups.iter().take(CHANGES_IN_TILE).map(|g| g.text.clone()).collect();
                 if groups.len() > CHANGES_IN_TILE {
                     lines.push(format!("+{}", crate::plural::count(groups.len() - CHANGES_IN_TILE, "more change")));
                 }
@@ -1084,7 +1076,7 @@ impl ArgoView {
             let diff = &c.diff;
             let panel = self.panel("Sync diff", "diff", d, cx);
             out.push(match (&c.smart, &c.git_diff) {
-                (Some(smart), _) => panel.child(self.sync_diff_view(d, smart, cx)),
+                (Some(smart), _) => panel.child(self.sync_diff_view(d, smart, &c.changes, cx)),
                 (None, Some(Ok(g))) => panel.children(g.changed.iter().map(|r| {
                     v_flex()
                         .gap_0p5()
@@ -1127,7 +1119,7 @@ impl ArgoView {
     /// What a sync would change, read with the smart diff: what changes first (images first,
     /// each change once with where), then a row per resource with what changes in it, its YAML
     /// diff unfolded on demand; what Argo CD says differs where no change shows; hooks left out.
-    fn sync_diff_view(&self, d: &Dashboard, smart: &AppDiff, cx: &mut Context<Self>) -> Div {
+    fn sync_diff_view(&self, d: &Dashboard, smart: &AppDiff, changes: &[Cross], cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let shown = Smart {
             at: DiffAt::Sync,
@@ -1139,6 +1131,7 @@ impl ArgoView {
             same: smart.same,
             noise: d.sync_noise,
             open: &d.sync_open,
+            changes: Some(changes),
         };
         let unexplained = (!smart.unexplained.is_empty()).then(|| {
             let which: Vec<String> = smart.unexplained.iter().take(NAMES_SHOWN).map(ObjectKey::label).collect();
@@ -1552,6 +1545,7 @@ impl ArgoView {
             same: m.unchanged,
             noise: c.noise,
             open: &c.open,
+            changes: None,
         };
         self.smart_view(&shown, m, cx)
     }
@@ -1578,7 +1572,23 @@ impl ArgoView {
         );
         let rows: Vec<&ResourceChange> = m.resources.iter().filter(|r| v.noise || !r.facts.is_empty()).collect();
         let more_rows = rows.len().saturating_sub(ROWS_SHOWN);
-        let more_groups = m.groups.len().saturating_sub(GROUPS_SHOWN);
+        // Each change in a line with where: the changes grouped across resources, else the
+        // diff's own groups.
+        let groups: Vec<(String, String)> = match v.changes {
+            Some(changes) => changes
+                .iter()
+                .map(|c| {
+                    let keys: Vec<ObjectKey> = c
+                        .apps
+                        .iter()
+                        .flat_map(|(_, r)| r.iter().filter_map(|i| m.resources.get(*i).map(|r| r.key.clone())))
+                        .collect();
+                    (c.text.clone(), names(&keys))
+                })
+                .collect(),
+            None => m.groups.iter().map(|g| (g.text(), names(&g.resources))).collect(),
+        };
+        let more_groups = groups.len().saturating_sub(GROUPS_SHOWN);
         let changed = m.resources.iter().filter(|r| !r.facts.is_empty()).count();
         let counts = format!(
             "{} changed, {} the same or noise only",
@@ -1589,11 +1599,11 @@ impl ArgoView {
             .gap_1()
             .children(v.intro.map(|i| div().text_xs().text_color(muted).child(i)))
             .children(empty.map(|e| div().text_sm().text_color(muted).child(e)))
-            .children(m.groups.iter().take(GROUPS_SHOWN).map(|g| {
+            .children(groups.into_iter().take(GROUPS_SHOWN).map(|(text, names)| {
                 h_flex()
                     .gap_2()
-                    .child(div().text_sm().child(selectable(g.text())))
-                    .child(div().text_xs().text_color(muted).child(selectable(names(&g.resources))))
+                    .child(div().text_sm().child(selectable(text)))
+                    .child(div().text_xs().text_color(muted).child(selectable(names)))
             }))
             .when(more_groups > 0, |v| {
                 v.child(
@@ -1665,6 +1675,9 @@ struct Smart<'a> {
     same: usize,
     noise: bool,
     open: &'a HashSet<ObjectKey>,
+    /// Its changes grouped across resources (see `grouped_diff::regroup`), instead of the
+    /// diff's own groups.
+    changes: Option<&'a [Cross]>,
 }
 
 /// Some resources by kind and name, the first few.

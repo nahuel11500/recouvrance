@@ -937,6 +937,9 @@ pub struct Cards {
     /// What a sync would change, read with the smart diff (facts, noise folded, a Secret's
     /// values masked), from the managed resources; None when they weren't read.
     pub smart: Option<Arc<super::grouped_diff::AppDiff>>,
+    /// What it changes, each change once with where, grouped as the grouped diff groups them
+    /// (a field added on 36 Deployments is one): images first.
+    pub changes: Vec<super::grouped_diff::Cross>,
     pub history: History,
     pub note: Option<String>,
     /// A selective sync newer than the newest deployment.
@@ -962,6 +965,10 @@ impl Cards {
         };
         let (deployed, _) = deployed(app);
         let commits = read.commits.into_iter().chain(std::iter::repeat(None));
+        // Worked out here, off the UI thread, with every line.
+        let smart = read.managed.as_ref().map(|m| Arc::new(super::grouped_diff::AppDiff::of(m)));
+        let changes =
+            smart.as_ref().map_or_else(Vec::new, |s| super::grouped_diff::regroup(&[Some(&s.diff)], &[], false));
         Self {
             summary: Summary::of(app),
             state: state(app, tree),
@@ -974,7 +981,8 @@ impl Cards {
             diff,
             git_diff: read.diff,
             // Worked out here, off the UI thread, with every line.
-            smart: read.managed.as_ref().map(|m| Arc::new(super::grouped_diff::AppDiff::of(m))),
+            smart,
+            changes,
             history: history(app, HISTORY_DOTS),
             note: read.note,
             partial: partial(app),

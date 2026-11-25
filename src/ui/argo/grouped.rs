@@ -63,6 +63,8 @@ enum Outcome {
 pub(super) struct GroupedDiff {
     /// The Applications read, in the order of the list by name, with their name as shown.
     picked: Vec<(Key, String)>,
+    /// Each one's own names, replaced before values are compared (`grouped_diff::Names`).
+    names: Arc<Vec<grouped_diff::Names>>,
     /// Picked past `MAX_APPS`: not read.
     left_out: usize,
     /// What each one gave, once known.
@@ -318,6 +320,21 @@ impl ArgoView {
 
     // MARK: Diff
 
+    /// The own names of `a`'s environment, replaced before values are compared: the
+    /// environment's name, the Application's, its destination namespace, and the client its
+    /// environment's name says.
+    fn names_of(&self, a: &FleetApp) -> grouped_diff::Names {
+        let k = key(a);
+        let env = self.rows.as_ref().and_then(|rows| {
+            let ix = rows.fleet.apps.iter().position(|x| key(x) == k)?;
+            let env = rows.envs.get(*rows.env_of.get(ix)?)?;
+            Some((env.name.clone(), rows.types.client(&env.name).map(String::from)))
+        });
+        let (env, client) = env.unzip();
+        let own = [env, Some(a.app.name.clone()), Some(a.dest.namespace.clone())].into_iter().flatten();
+        grouped_diff::Names::new(own, client.flatten())
+    }
+
     /// Read what a sync of each Application picked would change, at most a few at a time; the
     /// changes are regrouped as reads end. One Argo CD couldn't compare is not read. `fresh` (Read again): none is taken from those kept.
     pub(super) fn diff_selected(&mut self, fresh: bool, cx: &mut Context<Self>) {
@@ -328,6 +345,7 @@ impl ArgoView {
         let left_out = apps.len().saturating_sub(MAX_APPS);
         apps.truncate(MAX_APPS);
         let names = labels(&apps);
+        let own: Vec<grouped_diff::Names> = apps.iter().map(|a| self.names_of(a)).collect();
         let mut results: Vec<Option<Outcome>> = vec![None; apps.len()];
         let mut targets: Vec<(usize, Arc<api::Endpoint>, grouped_diff::CacheKey)> = Vec::new();
         for (i, a) in apps.iter().enumerate() {
@@ -348,6 +366,7 @@ impl ArgoView {
         });
         let mut g = GroupedDiff {
             picked: apps.iter().map(key).zip(names).collect(),
+            names: Arc::new(own),
             left_out,
             results,
             done,
@@ -363,6 +382,40 @@ impl ArgoView {
         };
         g.load.spawn_each(cx, reads, |this: &mut Self, (_, (i, read)), cx| this.grouped_read(i, read, cx));
         self.grouped = Some(g);
+        cx.notify();
+    }
+
+    /// The grouped diff of the made-up example of the developer tools: nothing is read.
+    #[cfg(feature = "dev")]
+    pub fn demo_grouped(&mut self, cx: &mut Context<Self>) {
+        let example = grouped_diff::example::diffs();
+        let n = example.len();
+        let mut picked = Vec::new();
+        let mut names = Vec::new();
+        let mut results = Vec::new();
+        for (name, own, diff) in example {
+            picked.push((("argocd.example.com".to_string(), "argocd".to_string(), name.clone()), name));
+            names.push(own);
+            results.push(Some(Outcome::Diff(Arc::new(diff))));
+        }
+        let g = GroupedDiff {
+            picked,
+            names: Arc::new(names),
+            left_out: 0,
+            results,
+            done: n,
+            groups: Arc::default(),
+            noise_groups: Arc::default(),
+            regrouping: false,
+            regroup_again: false,
+            regrouped_at: None,
+            noise: false,
+            open: HashSet::new(),
+            load: Default::default(),
+            regroup: Default::default(),
+        };
+        self.grouped = Some(g);
+        self.schedule_regroup(cx);
         cx.notify();
     }
 
@@ -392,12 +445,14 @@ impl ArgoView {
         (g.regrouping, g.regroup_again) = (true, false);
         let wait = g.regrouped_at.map_or(Duration::ZERO, |t| REGROUP_EVERY.saturating_sub(t.elapsed()));
         let diffs: Vec<Option<Arc<AppDiff>>> = (0..g.results.len()).map(|i| g.diff(i).cloned()).collect();
+        let names = g.names.clone();
         let exec = cx.background_executor().clone();
         let work = async move {
             exec.timer(wait).await;
             exec.spawn(async move {
                 let refs: Vec<Option<&SmartDiff>> = diffs.iter().map(|d| d.as_ref().map(|d| &d.diff)).collect();
-                (Arc::new(grouped_diff::regroup(&refs, false)), Arc::new(grouped_diff::regroup(&refs, true)))
+                let changes = grouped_diff::regroup(&refs, &names, false);
+                (Arc::new(changes), Arc::new(grouped_diff::regroup(&refs, &names, true)))
             })
             .await
         };
@@ -517,7 +572,7 @@ impl ArgoView {
                     .disabled(reading)
                     .on_click(cx.listener(|this, _, _, cx| this.diff_selected(true, cx))),
             );
-        let summary = grouped_diff::summary(&g.groups, with_changes);
+        let summary = grouped_diff::summary_lines(&g.groups, with_changes);
         let nothing = !reading && summary.is_none() && errors.is_empty() && not_compared.is_empty();
         let noise_line = format!(
             "{} {}",
@@ -562,7 +617,12 @@ impl ArgoView {
                         .child(format!("{} more picked are not read: at most {MAX_APPS} at a time.", g.left_out)),
                 )
             })
-            .children(summary.map(|s| div().text_sm().font_weight(FontWeight::MEDIUM).child(selectable(s))))
+            .children(summary.map(|(heading, lines)| {
+                v_flex()
+                    .gap_0p5()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(selectable(heading)))
+                    .children(lines.into_iter().map(|l| div().pl_3().text_sm().child(selectable(format!("• {l}")))))
+            }))
             .when(nothing, |v| v.child(div().text_sm().text_color(muted).child("A sync would change nothing.")))
             .when(read_ok > 0, |v| {
                 v.child(div().text_xs().text_color(muted).child(format!(
@@ -668,11 +728,14 @@ impl ArgoView {
         let muted = cx.theme().muted_foreground;
         let open = g.open.contains(&c.key);
         let name = |a: usize| g.picked.get(a).map_or_else(String::new, |(_, l)| l.clone());
-        let where_ = if c.apps.len() == read_ok && read_ok > 1 {
+        let mut where_ = if c.apps.len() == read_ok && read_ok > 1 {
             format!("in all {read_ok}")
         } else {
             format!("in {} of {read_ok}: {}", c.apps.len(), some(c.apps.iter().map(|(a, _)| name(*a)), APPS_NAMED))
         };
+        if !c.differs.is_empty() {
+            where_.push_str(&format!("; differs in {}", some(c.differs.iter().map(|a| name(*a)), APPS_NAMED)));
+        }
         let k = c.key.clone();
         let label = format!("{} {} ({})", if open { "▾" } else { "▸" }, c.text, c.apps.len());
         let toggle = cx.listener(move |this, _, _, cx| {
