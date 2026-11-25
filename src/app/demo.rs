@@ -196,6 +196,14 @@ impl AppView {
                     page.update(cx, |p, cx| p.demo_journal(window, cx));
                 }
             }
+            // The Argo CD page's grouped sync, on a made-up example (no real data, nothing sent):
+            // `argo-sync-example`, `-oos` (out of sync only), `-oos-armed` (the second click).
+            other if other.starts_with("argo-sync-example") => {
+                if let Route::Argo(page) = self.route().clone() {
+                    let how = other["argo-sync-example".len()..].to_string();
+                    page.update(cx, |p, cx| p.demo_sync(&how, cx));
+                }
+            }
             // The Argo CD page's list of environments, on a made-up example (no real data).
             "argo-example-list" => {
                 if let Route::Argo(page) = self.route().clone() {

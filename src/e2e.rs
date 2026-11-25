@@ -2486,6 +2486,32 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
             assert!(out.contains("Dry run Succeeded") && out.contains("Pruned: pruned (dry run)"), "{out}");
             assert!(read().await?.get("operation").is_none());
 
+            // The grouped sync, out of sync only: the Application's resources out of sync
+            // named, the one in sync and the one to prune (prune off) left out, no hooks.
+            let checked = k8s::argo::grouped_sync::check(
+                &read().await?,
+                &k8s::argo::windows::NextSync::NoWindow,
+                jiff::Timestamp::now(),
+            );
+            let opts = k8s::argo::grouped_sync::Options { hooks: false, prune: false, dry_run: false };
+            let req = opts.request(&checked).expect("a resource is out of sync");
+            k8s::argo_operation(
+                admin.clone(),
+                k8s::argo::application_kind(),
+                Some(NS.into()),
+                name.into(),
+                k8s::argo::ops::Op::Sync(req),
+            )
+            .await?;
+            let sync = read().await?["operation"]["sync"].clone();
+            assert_eq!(
+                sync["resources"],
+                json!([{"group": "apps", "kind": "Deployment", "namespace": NS, "name": "web"}]),
+                "{sync}"
+            );
+            assert_eq!(sync["syncStrategy"], json!({"apply": {}}), "{sync}");
+            set(json!({"operation": null})).await?;
+
             // The window's client: write mode off refuses it when it is sent.
             gate::set_ui_writes(false);
             let ui = k8s::connect(ctx.clone()).await?;
