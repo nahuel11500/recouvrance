@@ -41,8 +41,8 @@ RECOUVRANCE_TAB=logs cargo run --features dev -- --snapshot out.png 8
 Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, `assistant-dock`…),
 `RECOUVRANCE_FILTER`, `RECOUVRANCE_ACT` (comma-separated hooks, see `src/app/demo.rs` and
 `src/details/demo.rs`; `timeline:all` shows every event on the Timeline, `page:argo,argo-example`
-shows the Argo CD dashboard on a made-up example, no real data, and `page:argo,argo-journal-example`
-its sync journal), `RECOUVRANCE_INPUT`
+shows the Argo CD dashboard on a made-up example, no real data, `page:argo,argo-journal-example`
+its sync journal, and `page:argo,argo-example-list` its list of environments), `RECOUVRANCE_INPUT`
 (`click:x,y;key:enter;wait:2`; `shot:name.png` saves a frame next to the snapshot, for
 recordings), `RECOUVRANCE_WRITES=1`, `RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`,
 `RECOUVRANCE_SIZE=1000x800` (the window's size, 1500x920 by default), and `RECOUVRANCE_METER=1`, which prints at the end what the run cost: each cluster's API requests and

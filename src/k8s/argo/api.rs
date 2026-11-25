@@ -871,6 +871,9 @@ pub struct FeedState {
     pub apps: Apps,
     /// Each project's sync windows, once read; or why they couldn't be.
     pub projects: Option<Result<super::ProjectWindows, String>>,
+    /// The name Argo CD gives each cluster, by its server URL (`server_key`); empty until
+    /// read, or when this login may not list them.
+    pub clusters: Arc<BTreeMap<String, String>>,
     /// Why the last read or stream failed (never the token).
     pub error: Option<String>,
     /// Listed at least once.
@@ -1125,9 +1128,14 @@ fn listed(list: &Value) -> impl Iterator<Item = ApiApp> + '_ {
         .filter(|a| !a.summary.name.is_empty())
 }
 
-/// Read the projects' sync windows now and every `PROJECTS_EVERY` while the feed follows.
+/// Read the projects' sync windows and the clusters' names now and every `PROJECTS_EVERY`
+/// while the feed follows.
 async fn keep_windows(conn: Conn, state: Arc<Mutex<FeedState>>) {
     loop {
+        // Names only: a login that may not list the clusters keeps their URLs.
+        if let Ok(listed) = conn.get("/api/v1/clusters").await {
+            lock(&state).clusters = Arc::new(cluster_names(&listed));
+        }
         let projects: Vec<String> = {
             let s = lock(&state);
             let mut p: Vec<String> = s.apps.values().map(|a| a.summary.project.clone()).collect();
@@ -1140,6 +1148,20 @@ async fn keep_windows(conn: Conn, state: Arc<Mutex<FeedState>>) {
         changed();
         tokio::time::sleep(PROJECTS_EVERY).await;
     }
+}
+
+/// The name of each cluster of Argo CD's cluster list, by its server URL (`server_key`).
+pub(super) fn cluster_names(listed: &Value) -> BTreeMap<String, String> {
+    listed
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let name = c.get("name")?.as_str().filter(|n| !n.is_empty())?;
+            Some((super::server_key(c.get("server")?.as_str()?), name.to_string()))
+        })
+        .collect()
 }
 
 /// Each project's sync windows: one list of the projects, else (when this login may not

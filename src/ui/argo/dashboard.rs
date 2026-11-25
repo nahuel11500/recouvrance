@@ -205,28 +205,17 @@ fn when_shown<V: 'static>(
 }
 
 impl ArgoView {
-    /// Open the dashboard of the service of the Application `k`, on its tab.
+    /// Open the dashboard of the environment of the Application `k`, on its tab.
     pub(super) fn open_dashboard(&mut self, k: &Key, cx: &mut Context<Self>) {
         let Some(rows) = &self.rows else { return };
         let apps = &rows.fleet.apps;
         let Some(ix) = apps.iter().position(|a| key(a) == *k) else { return };
-        let (service, members) = rows
-            .services
-            .iter()
-            .find(|(_, m)| m.contains(&ix))
-            .map_or_else(|| (apps[ix].app.name.clone(), vec![ix]), |(s, m)| (s.clone(), m.clone()));
+        let Some(env) = rows.env_of.get(ix).and_then(|&e| rows.envs.get(e)) else { return };
+        let members: Vec<usize> = env.members.iter().map(|(i, _)| *i).collect();
         let tab = members.iter().position(|&m| m == ix).unwrap_or(0);
         let members = members.iter().map(|&m| key(&apps[m])).collect();
-        self.dashboard = Some(Dashboard::new(service, members, tab));
+        self.dashboard = Some(Dashboard::new(env.name.clone(), members, tab));
         self.load_dashboard(cx);
-    }
-
-    /// Open the dashboard of the service at `g` of the services, on its first Application.
-    pub(super) fn open_service(&mut self, g: usize, cx: &mut Context<Self>) {
-        let first = self.rows.as_ref().and_then(|r| r.services.get(g)?.1.first().map(|&m| key(&r.fleet.apps[m])));
-        if let Some(k) = first {
-            self.open_dashboard(&k, cx);
-        }
     }
 
     pub(super) fn close_dashboard(&mut self, cx: &mut Context<Self>) {

@@ -23,6 +23,7 @@ use crate::status::Tone;
 pub mod api;
 pub mod dashboard;
 pub mod diagnosis;
+pub mod environments;
 pub mod grouped_diff;
 pub mod grouped_sync;
 pub mod grouping;
@@ -326,6 +327,8 @@ pub struct Summary {
     pub own: Option<(String, String, Option<String>)>,
     /// Its labels, sorted by key.
     pub labels: Vec<(String, String)>,
+    /// The images it runs, as Argo CD sums them up (`status.summary.images`).
+    pub images: Vec<String>,
     /// Its destination as written: the server URL, the cluster name, the namespace.
     pub dest_server: String,
     pub dest_name: String,
@@ -429,6 +432,14 @@ impl Summary {
                 .into_iter()
                 .flatten()
                 .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect(),
+            images: app
+                .pointer("/status/summary/images")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(String::from)
                 .collect(),
             dest_server: s("/spec/destination/server").unwrap_or_default(),
             dest_name: s("/spec/destination/name").unwrap_or_default(),
@@ -1486,6 +1497,8 @@ pub struct FleetApp {
     pub instance: String,
     pub app: Summary,
     pub dest: Destination,
+    /// Its destination cluster as Argo CD names it (see `cluster_name`).
+    pub cluster: String,
     /// The context its destination is shown on (a connected one first), if any reaches it.
     pub on: Option<String>,
     /// The Application that made it (an app of apps), as an index in the fleet.
@@ -1514,20 +1527,6 @@ pub struct Fleet {
 }
 
 impl Fleet {
-    /// The line above the list: how many Applications (`kept` of them, when filtered), and
-    /// which servers are still being read. Never `0 Applications` while one is.
-    pub fn summary(&self, kept: Option<usize>) -> String {
-        let count = crate::plural::count(self.apps.len(), "Application");
-        let reading = format!("Reading Applications from {}…", self.reading.join(", "));
-        match kept {
-            _ if self.apps.is_empty() && !self.reading.is_empty() => reading,
-            Some(kept) if self.reading.is_empty() => format!("{kept} of {count}"),
-            Some(kept) => format!("{kept} of {count} · {reading}"),
-            None if self.reading.is_empty() => count,
-            None => format!("{count} · {reading}"),
-        }
-    }
-
     /// When the next sync of `a` can start, from `now`, under its project's sync windows.
     pub fn next_sync(&self, a: &FleetApp, plan: &mut windows::Planner) -> windows::NextSync {
         // Auto-sync is held by every window; a manual sync goes through those that allow it.
@@ -1568,6 +1567,27 @@ pub struct ApiRead {
     pub state: api::FeedState,
 }
 
+/// A destination cluster as Argo CD names it: the name the Application gives, else the one
+/// Argo CD's cluster list gives its server URL (`names`, by `server_key`), else `in-cluster`
+/// for Argo CD's own, else the URL's host.
+pub fn cluster_name(name: &str, server: &str, names: &std::collections::BTreeMap<String, String>) -> String {
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    if server.is_empty() {
+        return String::new();
+    }
+    let key = server_key(server);
+    if let Some(n) = names.get(&key) {
+        return n.clone();
+    }
+    if key == server_key(IN_CLUSTER) {
+        return "in-cluster".into();
+    }
+    let host = key.split_once("://").map_or(key.as_str(), |(_, h)| h);
+    host.split(['/', ':']).next().unwrap_or(host).to_string()
+}
+
 /// Every Application read by Argo CD's API, each server's under the app of apps that made it.
 /// `targets` are the kubeconfig's contexts, `connected` those connected, `servers` each hub
 /// context's Argo CD server (`argocd_servers`), which says the cluster `in-cluster` is.
@@ -1600,11 +1620,13 @@ pub fn from_api(
         for (a, parent) in apps.iter().zip(parents(values.as_slice())) {
             let dest = destination(&a.value, &hub, targets);
             let on = dest.context(connected).map(String::from);
+            let cluster = cluster_name(&a.summary.dest_name, &a.summary.dest_server, &read.state.clusters);
             fleet.apps.push(FleetApp {
                 server: endpoint.clone(),
                 instance: instance.clone(),
                 app: a.summary.clone(),
                 dest,
+                cluster,
                 on,
                 parent: parent.map(|p| base + p),
                 version: resource_version(&a.value),
@@ -1679,6 +1701,7 @@ mod tests {
             instance: source.instance(),
             app: app.summary.clone(),
             dest: Destination::default(),
+            cluster: String::new(),
             on: None,
             parent: None,
             version: String::new(),
@@ -1731,24 +1754,14 @@ mod tests {
             from_api(vec![pending, ApiRead { endpoint: two.clone(), state: failed }], &[], &[], &Default::default());
         // The one that failed says why instead.
         assert_eq!(fleet.reading, [one.name()]);
-        assert_eq!(fleet.summary(None), format!("Reading Applications from {}…", one.name()));
-        assert_eq!(fleet.summary(Some(0)), fleet.summary(None));
 
         // One listed, the other still read: both said.
         let mut listed = api::FeedState { listed: true, ..Default::default() };
         let a = api_app("argocd", "web", None);
         listed.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
         let pending = ApiRead { endpoint: one.clone(), state: api::FeedState::default() };
-        let mut fleet =
-            from_api(vec![ApiRead { endpoint: two, state: listed }, pending], &[], &[], &Default::default());
-        let reading = format!("Reading Applications from {}…", one.name());
-        assert_eq!(fleet.summary(None), format!("1 Application · {reading}"));
-        assert_eq!(fleet.summary(Some(0)), format!("0 of 1 Application · {reading}"));
-
-        // Every list in: the count alone.
-        fleet.reading.clear();
-        assert_eq!(fleet.summary(None), "1 Application");
-        assert_eq!(fleet.summary(Some(1)), "1 of 1 Application");
+        let fleet = from_api(vec![ApiRead { endpoint: two, state: listed }, pending], &[], &[], &Default::default());
+        assert_eq!((fleet.apps.len(), fleet.reading), (1, vec![one.name()]));
     }
 
     #[test]

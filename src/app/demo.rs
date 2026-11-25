@@ -196,6 +196,12 @@ impl AppView {
                     page.update(cx, |p, cx| p.demo_journal(window, cx));
                 }
             }
+            // The Argo CD page's list of environments, on a made-up example (no real data).
+            "argo-example-list" => {
+                if let Route::Argo(page) = self.route().clone() {
+                    page.update(cx, crate::ui::argo::ArgoView::demo_list);
+                }
+            }
             // What's new: this version's notes, or those shown after an update from a version.
             "whats-new" => crate::ui::whats_new::open_own(window, cx),
             other if other.starts_with("whats-new:") => {

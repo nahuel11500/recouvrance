@@ -333,32 +333,46 @@
   they read from the hub, found among the connected clusters, else among other kubeconfig contexts that
   need no separate login. The hub can be ticked in Settings → Contexts (*Argo CD*; see
   [configuration](configuration.md#argo-cd-hub-argocd_contexts)).
-- **Argo CD page** (sidebar → *Argo CD*): every Application of every Argo CD API server the
+- **Argo CD page** (sidebar → *Argo CD*): the environments of every Argo CD API server the
   argocd CLI is logged in to or set in Settings → Argo CD, read only through Argo CD's API (no
   kubeconfig for Argo CD's cluster needed, and none is asked: see
   [configuration](configuration.md#argo-cd-by-its-api-argocd_api_servers)). With no server, the
-  page says how to add one. Name, project, sync, health, revision, destination
-  (the kubeconfig context whose API server is the Application's `destination.server`, and its
-  namespace), auto-sync, the next time it can sync, last sync and its result. *Next sync* reads
-  its project's sync windows (`allow` and `deny`, their cron schedule, duration and time zone, the
-  windows applying by name, namespace or cluster): *no window*, *now*, *in 5h*, or *not within 8
-  days*; auto-sync is held by every window that applies, a manual sync goes through those with
-  `manualSync`. Applications sit under the app of apps that made them (its tracking id, the parent
-  listing them among its resources, or the instance label), with how many they hold and how many
-  of those are red; or, grouped by service, under a heading per service with its environments
-  (the value of a label chosen in Settings → Argo CD, else the name without its environment:
-  `shop-prod`, `shop-staging` and `shop-prod-eu` are `shop`), how many are synced and red; or not
-  grouped. Groups fold. Filters: out of sync, Degraded, failed sync (any of those picked),
-  favorites, project, destination context, sync status, health, auto-sync, labels (picked from those the
-  Applications have, all required), and a search, each word in turn, where `key=value` is a label
-  (`key=` any value of it). The star on a row makes the Application a favorite: favorites, with the app of apps or service they are in,
-  come first.
+  page says how to add one. An *environment* is a root Application (an app of apps) and the
+  Applications it made (its tracking id, the parent listing them among its resources, or the
+  instance label), or an Application on its own; above an app of apps, a *bootstrap* that made
+  apps of apps is an environment of its own, and its apps of apps each one. One row per
+  environment, grouped by project, then by type in the order Settings → Argo CD gives them (by
+  default prod, preprod, acc on a tag, acc, staging, review, platform, then other: from the
+  root's name, see [configuration](configuration.md)), or by project only, or not grouped; each
+  heading says how many environments it holds and how many need a look, and folds. A row: the
+  worst color of its Applications, its name and how many Applications, what is wrong as badges
+  (*Sync failed*, *Degraded*, *OutOfSync*, *Syncing*), the images it runs with their tag (a
+  commit sha cut to 7: `main-77b324b`), the product's first (the images whose tag differs between
+  the project's environments; a database or exporter every environment runs alike comes after,
+  all of them on hover), when its last sync ended, and where it deploys (Argo CD's name of the
+  cluster, from the Application or Argo CD's cluster list, and the namespace) when that differs
+  between rows: a column with the same value on 95% of the rows is left out, and the Argo CD
+  server's column shows only with several. Its chevron unfolds its Applications (named after the
+  environment: `workload`, `managed-namespace`), each with its sync, health, revision, auto-sync,
+  the next time it can sync and its last sync. *Next sync* reads its project's sync windows
+  (`allow` and `deny`, their cron schedule, duration and time zone, the windows applying by name,
+  namespace or cluster): *no window*, *now*, *in 5h*, or *not within 8 days*; auto-sync is held
+  by every window that applies, a manual sync goes through those with `manualSync`. Filters:
+  *Needs a look* (out of sync, Degraded or a failed sync), *Out of sync*, *Degraded or failed*,
+  *Running* (any of those picked), favorites, project, type (or *On a version tag*: the
+  product's images all on a version tag such as `1.4.2` or `26-8-4-<sha>`, not a branch build),
+  and a search, each word in turn, in the names, namespaces, clusters, project, server and image
+  tags (find every environment on a tag), where `key=value` is a label of one of its
+  Applications (`key=` any value of it). The star on a row makes the Application a favorite;
+  environments with one come first in their group. The groups are worked out once per change of
+  the feeds, off the UI thread, and only the rows on screen are drawn.
   Red is for a failed sync, an error Argo CD reports or Degraded health: an Application with
   auto-sync off that is out of sync (a `*-workload` one synced by hand) is not red. A click opens
-  its service's dashboard (below); the row menu opens the Application in Argo CD's web UI or its
-  destination namespace, and asks for *Refresh*, *Hard refresh*, *Sync*, *Terminate* (while an
-  operation runs) or *Roll back to the previous deployment* (auto-sync off) (see *Argo CD by its
-  API*). An Argo CD server that can't be read is named above the list; the others are shown.
+  the environment's dashboard (below); a row's menu opens the Application (an environment's:
+  its root) in Argo CD's web UI or its destination namespace, picks the environment's
+  Applications, and asks for *Refresh*, *Hard refresh*, *Sync*, *Terminate* (while an operation
+  runs) or *Roll back to the previous deployment* (auto-sync off) (see *Argo CD by its API*). An
+  Argo CD server that can't be read is named above the list; the others are shown.
 - **Argo CD by its API**: Applications are read from Argo CD's own API, with the argocd CLI's
   login (`argocd login`, its contexts, servers and tokens; `--insecure`, `--plaintext` to this
   machine and `--grpc-web-root-path` are honoured, `--core` contexts have no server) or a token
@@ -375,9 +389,8 @@
   context's (the server's name typed, or a wait). Settings → Argo CD lists the servers, says how
   each logs in, tests one (who the token is, Argo CD's version, how many Applications it may
   read), turns one off, and never shows a token.
-- **Argo CD Application dashboard**: a row's click, or a click on a service heading's name, opens
-  the dashboard of that service (the heading's chevron folds it): a tab per environment (each of
-  its Applications, with a dot in its color; with its Argo CD's name too when two share a name or
+- **Argo CD Application dashboard**: a row's click opens the dashboard of its environment: a
+  tab per Application (with a dot in its color; with its Argo CD's name too when two share a name or
   several Argo CDs are read), *Updated
   at* and *Refresh*, and cards. *State*: the sync in big (*Synced*, *OutOfSync*, *Sync Failed* or
   *Syncing*), the health, the resources Degraded (`worker Degraded +1`) and *Why?* (the diagnosis
