@@ -147,6 +147,13 @@ struct Rows {
 }
 
 impl Rows {
+    /// The type of the environment of the Application `k`, when it is a production one.
+    fn production_type(&self, k: &Key) -> Option<String> {
+        let i = self.fleet.apps.iter().position(|a| key(a) == *k)?;
+        let name = self.types.name(self.envs.get(*self.env_of.get(i)?)?.kind);
+        argo::environments::is_production(name).then(|| name.to_string())
+    }
+
     fn new(fleet: Fleet, types: Arc<EnvTypes>, plan: &mut Planner) -> Self {
         let now = plan.now();
         let apps = &fleet.apps;

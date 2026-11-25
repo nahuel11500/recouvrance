@@ -90,6 +90,15 @@ pub const DEFAULT_TYPES: [&str; 7] = [
     "platform = ^platform-",
 ];
 
+/// The types of production environments, or close to them: a grouped sync that includes one
+/// asks for a second click. A type of Settings named with `prod` is one too.
+pub const PRODUCTION_TYPES: [&str; 4] = ["prod", "preprod", "acc on a tag", "platform"];
+
+/// Whether environments of the type named `name` are production ones (see [`PRODUCTION_TYPES`]).
+pub fn is_production(name: &str) -> bool {
+    PRODUCTION_TYPES.contains(&name) || name.contains("prod")
+}
+
 /// The type of an environment no pattern matches.
 pub const OTHER: &str = "other";
 
@@ -407,6 +416,16 @@ mod tests {
         // No line: the defaults.
         let defaults = lines(&["", "# nothing"]);
         assert_eq!((defaults.name(DEFAULT_TYPES.len() - 1), defaults.name(DEFAULT_TYPES.len())), ("platform", OTHER));
+    }
+
+    #[test]
+    fn production_types() {
+        for t in ["prod", "preprod", "acc on a tag", "platform", "prod-eu"] {
+            assert!(is_production(t), "{t}");
+        }
+        for t in ["acc", "staging", "review", OTHER] {
+            assert!(!is_production(t), "{t}");
+        }
     }
 
     #[test]
