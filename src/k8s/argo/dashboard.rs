@@ -1,9 +1,7 @@
 //! An Application's dashboard: its cards (state, versions, what runs in the cluster,
 //! problems, last sync, sync diff, history), worked out from what Argo CD says of it. The
 //! Application itself, its resource tree, its diff (managed resources) and the commits it
-//! deploys are read by Argo CD's API ([`super::api::dashboard`]) or, for an Application read
-//! on its hub, from the hub and the Argo CD server set for it ([`read_hub`]). The cards are
-//! pure functions of what was read, worked out off the UI thread.
+//! deploys are read by Argo CD's API ([`super::api::dashboard`]). The cards are pure functions of what was read, worked out off the UI thread.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{LazyLock, Mutex, PoisonError};
@@ -859,7 +857,6 @@ impl Cards {
 
 mod read;
 pub(in crate::k8s::argo) use read::extras;
-pub use read::read_hub;
 
 /// A made-up example, for the developer tools' snapshots and the tests.
 #[cfg(any(test, feature = "dev"))]

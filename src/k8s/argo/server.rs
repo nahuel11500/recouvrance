@@ -287,34 +287,6 @@ fn login(context: &str, server: &Server) -> Result<(String, Login), String> {
     }
 }
 
-/// The Argo CD server set for the hub `context`, the token to send it and where that comes
-/// from; or why there is none to ask. Reads files: call it off the UI thread.
-pub(super) fn login_for(context: &str) -> Result<(Server, String, Login), String> {
-    let server = match server_of(context) {
-        Some(Ok(server)) => server,
-        Some(Err(e)) => return Err(e),
-        None => return Err(format!("No Argo CD server is set for {context} in Settings")),
-    };
-    let (token, how) = login(context, &server)?;
-    Ok((server, token, how))
-}
-
-/// GET `path` (of Argo CD's API) on `server` with `token`; errors never hold the token.
-pub(super) async fn get_path(server: &Server, token: &str, path: &str) -> Result<Value, String> {
-    get_path_within(server, token, path, TIMEOUT).await
-}
-
-/// The same, waiting up to `timeout` for the answer.
-pub(super) async fn get_path_within(
-    server: &Server,
-    token: &str,
-    path: &str,
-    timeout: std::time::Duration,
-) -> Result<Value, String> {
-    let url = format!("{}{path}", server.base);
-    super::api::send_within(http::Method::GET, url, token, None, false, server, timeout).await.map_err(|f| f.text)
-}
-
 /// `text` with every copy of `token` replaced: an error never shows it, whatever echoed it.
 pub(super) fn scrub(text: &str, token: &str) -> String {
     if token.is_empty() { text.to_string() } else { text.replace(token, "[token]") }

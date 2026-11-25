@@ -103,31 +103,12 @@ pub fn server_instance(base: &str) -> String {
     super::server_key(base)
 }
 
-/// An Application, the same whichever way it was read: its Argo CD (see `hub_instance`),
-/// namespace and name.
+/// An Application: its Argo CD (`api::Endpoint::instance`), namespace and name.
 pub type AppKey = (String, String, String);
-
-/// Where each Application of `second` goes once added after `first`: `Ok(i)` a row of its
-/// own, the `i`-th added; `Err(j)` the same Application as `first[j]`, shown once (the
-/// first's). Two of `second` with the same key are one too.
-pub fn merge_plan(first: &[AppKey], second: &[AppKey]) -> Vec<Result<usize, usize>> {
-    let mut seen: std::collections::HashMap<&AppKey, Result<usize, usize>> =
-        first.iter().enumerate().map(|(j, k)| (k, Err(j))).collect();
-    let mut added = 0;
-    second
-        .iter()
-        .map(|k| {
-            *seen.entry(k).or_insert_with(|| {
-                added += 1;
-                Ok(added - 1)
-            })
-        })
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {
-    use super::{by_service, hub_instance, merge_plan, server_instance, service_of};
+    use super::{by_service, hub_instance, server_instance, service_of};
     use std::collections::BTreeMap;
 
     #[test]
@@ -171,22 +152,12 @@ mod tests {
     }
 
     #[test]
-    fn one_application_read_from_a_hub_and_the_api_is_one() {
+    fn a_hub_with_its_server_set_is_that_server_s_argo_cd() {
         let mut servers = BTreeMap::new();
         servers.insert("hub".to_string(), "https://ArgoCD.example.com:443/".to_string());
         let hub = hub_instance("hub", &servers);
         assert_eq!(hub, server_instance("https://argocd.example.com"));
         // A hub without its server set is its own instance, never an API server's.
         assert_eq!(hub_instance("other", &servers), "context:other");
-        let key = |i: &str, ns: &str, n: &str| (i.to_string(), ns.to_string(), n.to_string());
-        let first = [key(&hub, "argocd", "web"), key("context:other", "argocd", "web")];
-        let second = [
-            key(&hub, "argocd", "web"),
-            key(&hub, "argocd", "api"),
-            key(&hub, "team", "web"),
-            key(&hub, "argocd", "api"),
-        ];
-        assert_eq!(merge_plan(&first, &second), [Err(0), Ok(0), Ok(1), Ok(0)]);
-        assert_eq!(merge_plan(&[], &second), [Ok(0), Ok(1), Ok(2), Ok(1)]);
     }
 }

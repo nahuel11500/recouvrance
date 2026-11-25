@@ -1,6 +1,5 @@
-//! A sync of several Applications at once, each the way it was read: on its hub through the
-//! Kubernetes API (`k8s::argo_start`, with the hub's window client: the write gate applies),
-//! or through Argo CD's API (`api::act`, which checks write mode as it sends).
+//! A sync of several Applications at once, through Argo CD's API (`api::act_read`, which
+//! checks write mode and the server's protection as it sends).
 //!
 //! Each Application is read first ([`check`]): one whose sync window denies a manual sync now,
 //! one already syncing, or one being deleted is left out, saying why; what prune would delete
@@ -15,14 +14,15 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::StreamExt as _;
 use serde_json::Value;
 
+use super::api;
 use super::diagnosis::Res;
 use super::ops::{self, Op, SyncRequest};
 use super::windows::{HORIZON_DAYS, NextSync};
-use super::{Source, api};
 
 /// Syncs sent, and Applications read, at the same time, at most.
 pub const PARALLEL: usize = 4;
@@ -90,21 +90,9 @@ pub fn started_at(app: &Value) -> Option<String> {
     app.pointer("/status/operationState/startedAt").and_then(Value::as_str).map(String::from)
 }
 
-/// What to say when an Application's sync windows aren't known (`next`): by Argo CD's API,
-/// argocd-server refuses a sync a window denies, and says so; on a hub (`hub`) the operation is
-/// written and Argo CD's controller waits for a window to open, which may take hours.
-pub fn window_warning(next: &NextSync, hub: bool) -> Option<String> {
-    match next {
-        NextSync::Unknown(why) if hub => Some(format!(
-            "its sync windows aren't known ({why}): if one denies a sync now, Argo CD starts it only once it opens"
-        )),
-        _ => None,
-    }
-}
-
 /// Why a manual sync can't start now under the sync windows that apply (`next`, from the
-/// Application's project); None when it can, or when the windows aren't known (see
-/// [`window_warning`]).
+/// Application's project); None when it can, or when the windows aren't known
+/// (argocd-server then refuses a sync a window denies, and says so).
 pub fn window_refusal(next: &NextSync, now: jiff::Timestamp) -> Option<String> {
     match next {
         NextSync::NoWindow | NextSync::Now | NextSync::Unknown(_) => None,
@@ -130,10 +118,11 @@ pub fn check(app: &Value, window: &NextSync, now: jiff::Timestamp) -> Checked {
     }
 }
 
-/// An Application to sync: where it is read, its Argo CD, its namespace and name.
+/// An Application to sync: the Argo CD API server it is read from, its Argo CD, its
+/// namespace and name.
 #[derive(Clone)]
 pub struct Target {
-    pub source: Source,
+    pub server: Arc<api::Endpoint>,
     pub instance: String,
     pub namespace: String,
     pub name: String,
@@ -149,48 +138,24 @@ impl Target {
     pub fn read(&self) -> Call<Value> {
         let (t, instance) = (self.clone(), self.instance.clone());
         Box::pin(async move {
-            let app = match &t.source {
-                Source::Hub(hub) => {
-                    let obj = crate::k8s::ObjectRef {
-                        kind: super::application_kind(),
-                        name: t.name.clone(),
-                        namespace: Some(t.namespace.clone()),
-                        uid: String::new(),
-                    };
-                    crate::k8s::get_object(hub.client.clone(), obj).await.map_err(|e| crate::k8s::short_error(&e))?
-                }
-                Source::Api(endpoint) => api::read_app(endpoint.clone(), t.namespace.clone(), t.name.clone()).await?,
-            };
+            let app = api::read_app(t.server.clone(), t.namespace.clone(), t.name.clone()).await?;
             super::journal::observe(&instance, &app);
             Ok(app)
         })
     }
 
-    /// Send `op` (a sync or a terminate): on a hub with its window client (the write gate
-    /// refuses it while write mode is off), by Argo CD's API with write mode checked as it is
-    /// sent. A dry run's result is not waited for: it is followed like any sync. What Argo CD
-    /// said, and when the Application's last operation started as read right before the write
-    /// (the operation sent is a later one).
+    /// Send `op` (a sync or a terminate) by Argo CD's API, with write mode and the server's
+    /// protection checked as it is sent. A dry run's result is not waited for: it is followed
+    /// like any sync. What Argo CD said, and when the Application's last operation started as
+    /// read right before the write (the operation sent is a later one).
     pub fn send(&self, op: Op) -> Call<(String, Option<String>)> {
         let (ns, name) = (self.namespace.clone(), self.name.clone());
-        match &self.source {
-            Source::Hub(hub) => {
-                let client = hub.client.clone();
-                Box::pin(async move {
-                    crate::k8s::argo_start(client, super::application_kind(), Some(ns), name, op)
-                        .await
-                        .map_err(|e| crate::k8s::short_error(&e))
-                })
-            }
-            Source::Api(endpoint) => {
-                let action = match op {
-                    Op::Sync(req) => api::Action::Sync(req),
-                    Op::Terminate => api::Action::Terminate,
-                    Op::Rollback { .. } => return Box::pin(async { Err("not part of a grouped sync".to_string()) }),
-                };
-                Box::pin(api::act_read(endpoint.clone(), ns, name, action))
-            }
-        }
+        let action = match op {
+            Op::Sync(req) => api::Action::Sync(req),
+            Op::Terminate => api::Action::Terminate,
+            Op::Rollback { .. } => return Box::pin(async { Err("not part of a grouped sync".to_string()) }),
+        };
+        Box::pin(api::act_read(self.server.clone(), ns, name, action))
     }
 }
 
@@ -328,14 +293,6 @@ mod tests {
         // From the read right before the write: still waiting for Argo CD to start it.
         let p = progress(&a, Some(auto));
         assert_eq!((p.phase.as_str(), p.ended), ("Waiting", false));
-    }
-
-    #[test]
-    fn a_window_not_known_is_said_on_a_hub() {
-        let unknown = NextSync::Unknown("project shop can't be read".into());
-        assert!(window_warning(&unknown, true).unwrap().contains("once it opens"));
-        assert_eq!(window_warning(&unknown, false), None, "argocd-server refuses it, and says so");
-        assert_eq!(window_warning(&NextSync::Now, true), None);
     }
 
     #[test]

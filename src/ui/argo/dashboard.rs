@@ -2,8 +2,8 @@
 //! environment, and the cards of the one shown (see `k8s::argo::dashboard`).
 //!
 //! Only the tab shown is read: the Application whole, its resource tree, its diff and its
-//! commits, by Argo CD's API (or on its hub). It is read again when its row changes (the
-//! stream, the hubs' next read), every few seconds while a sync runs, and on Refresh; a
+//! commits, by Argo CD's API. It is read again when its row changes (the stream), every few
+//! seconds while a sync runs, and on Refresh; a
 //! newer read replaces the one running, and leaving the tab or the page drops it.
 
 use std::collections::HashSet;
@@ -24,7 +24,7 @@ use crate::k8s;
 use crate::k8s::argo::dashboard::{self, Cards, Commit, Problem};
 use crate::k8s::argo::diagnosis::{Res, span_text};
 use crate::k8s::argo::sync_diff::{self, Entry};
-use crate::k8s::argo::{self, Source, api, short_revision};
+use crate::k8s::argo::{self, api, short_revision};
 use crate::smartdiff::{self, ObjectKey, ResourceChange, SmartDiff};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
@@ -258,7 +258,7 @@ impl ArgoView {
         cx.notify();
     }
 
-    /// Read the tab shown, off the UI thread: by Argo CD's API, or on its hub. Its cards are
+    /// Read the tab shown, off the UI thread, by Argo CD's API. Its cards are
     /// worked out there too. A result for another tab than the one shown by then is left.
     pub(super) fn load_dashboard(&mut self, cx: &mut Context<Self>) {
         let Some(k) = self.dashboard.as_ref().filter(|d| d.example.is_none()).and_then(|d| d.current().cloned()) else {
@@ -275,10 +275,7 @@ impl ArgoView {
             return;
         };
         let (ns, name) = (a.app.namespace.clone(), a.app.name.clone());
-        let read: std::pin::Pin<Box<dyn Future<Output = Result<dashboard::Read, String>>>> = match &a.source {
-            Source::Hub(hub) => Box::pin(dashboard::read_hub(hub.clone(), ns, name)),
-            Source::Api(endpoint) => Box::pin(api::dashboard(endpoint.clone(), ns, name)),
-        };
+        let read = api::dashboard(a.server.clone(), ns, name);
         let exec = cx.background_executor().clone();
         let seen_key = k.clone();
         let work = async move {
@@ -344,7 +341,7 @@ impl ArgoView {
     }
 
     /// The read of the manifests rendered at the deployments `from` and `to` of the tab shown:
-    /// by Argo CD's API, or from the Argo CD server set for its hub.
+    /// by Argo CD's API.
     fn manifests_read(&self, spec: u64, from: &Entry, to: &Entry) -> DiffRead {
         let fail = |why: &str| -> DiffRead {
             let why = why.to_string();
@@ -361,10 +358,7 @@ impl ArgoView {
             return fail("This Application is no longer listed.");
         };
         let (ns, name) = (a.app.namespace.clone(), a.app.name.clone());
-        match &a.source {
-            Source::Hub(hub) => Box::pin(sync_diff::read_hub(hub.context.clone(), ns, name, spec, rf, rt)),
-            Source::Api(endpoint) => Box::pin(api::manifests_diff(endpoint.clone(), ns, name, spec, rf, rt)),
-        }
+        Box::pin(api::manifests_diff(a.server.clone(), ns, name, spec, rf, rt))
     }
 
     /// Compare the deployments `from` and `to` (ids, the older first) of the tab shown: their
@@ -462,7 +456,6 @@ impl ArgoView {
             format!("Updated at {at}")
         });
         let current = d.current().and_then(|k| self.find(k));
-        let by_api = current.is_some_and(|a| matches!(a.source, Source::Api(_)));
         let header = h_flex()
             .gap_2()
             .child(
@@ -498,8 +491,8 @@ impl ArgoView {
                     Button::new("argo-dash-open")
                         .small()
                         .ghost()
-                        .icon(if by_api { Lucide::ExternalLink } else { Lucide::PanelRightOpen })
-                        .label(if by_api { "Open in Argo CD" } else { "Open" })
+                        .icon(Lucide::ExternalLink)
+                        .label("Open in Argo CD")
                         .on_click(cx.listener(move |this, _, _, cx| this.open(&k, cx))),
                 )
             });
@@ -534,7 +527,7 @@ impl ArgoView {
                 .map(|k| {
                     let found = self.find(k);
                     let tone = found.map_or(Tone::Done, |a| argo::attention(&a.app));
-                    (k.2.clone(), found.filter(|_| sourced).map(|a| a.source.label()), tone)
+                    (k.2.clone(), found.filter(|_| sourced).map(|a| a.server.name()), tone)
                 })
                 .collect()
         };
