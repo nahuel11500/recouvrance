@@ -448,11 +448,16 @@ impl ArgoView {
     pub fn demo_dashboard(&mut self, cx: &mut Context<Self>) {
         use dashboard::example;
         let now = Timestamp::now();
-        let tabs = example::ENVIRONMENTS
+        // An environment's three Applications, each shown with one of the example's reads.
+        let sections = ["workload", "managed-namespace", "shop-prod-acme (app of apps)"];
+        let tabs = sections
             .iter()
-            .map(|env| (env.to_string(), Arc::new(Cards::of(example::read(env, now), None, now))))
+            .zip([example::ENVIRONMENTS[1], example::ENVIRONMENTS[0], example::ENVIRONMENTS[2]])
+            .map(|(name, env)| (name.to_string(), Arc::new(Cards::of(example::read(env, now), None, now))))
             .collect();
-        let mut d = Dashboard::new("shop (example, no real data)".into(), Vec::new(), 1);
+        let mut d = Dashboard::new("shop-prod-acme (example, no real data)".into(), Vec::new(), 0);
+        d.kind = "prod".into();
+        d.server = "argocd.example.com".into();
         d.example = Some(tabs);
         d.updated = Some(now);
         self.dashboard = Some(d);
