@@ -6,6 +6,7 @@ pub mod access_view;
 pub mod api_requests;
 pub mod apply_view;
 pub mod argo;
+pub mod argo_connect;
 pub mod assistant_view;
 pub mod cluster;
 pub mod container_select;

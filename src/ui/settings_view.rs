@@ -89,6 +89,8 @@ pub struct SettingsView {
     _argo_api_test_tasks: std::collections::HashMap<String, Task<()>>,
     /// Reads the servers off the UI thread.
     argo_api_read: crate::latest::Latest,
+    /// The servers' config generation last read (see `api::generation`).
+    argo_api_generation: u64,
     /// A server to add: its address, and a token (never shown back).
     argo_api_url: Entity<InputState>,
     argo_api_token: Entity<InputState>,
@@ -253,6 +255,7 @@ impl SettingsView {
             argo_api_tests: Default::default(),
             _argo_api_test_tasks: Default::default(),
             argo_api_read: Default::default(),
+            argo_api_generation: 0,
             argo_api_url,
             argo_api_token,
             argo_api_error: None,
@@ -268,6 +271,12 @@ impl SettingsView {
                     let shown = this.update(cx, |this, cx| {
                         if this.section == Section::Requests {
                             cx.notify();
+                        }
+                        // Connect to Argo CD… saved a server: list it.
+                        if this.section == Section::ArgoCd
+                            && this.argo_api_generation != crate::k8s::argo::api::generation()
+                        {
+                            this.reload_argo_api(cx);
                         }
                     });
                     if shown.is_err() {
@@ -294,6 +303,7 @@ impl SettingsView {
     /// Read the Argo CD API servers again (the argocd CLI's config, the tokens file), off the
     /// UI thread; a read again replaces the one running.
     fn reload_argo_api(&mut self, cx: &mut Context<Self>) {
+        self.argo_api_generation = crate::k8s::argo::api::generation();
         let read = cx.background_executor().spawn(async { crate::k8s::argo::api::endpoints() });
         self.argo_api_read.spawn(cx, read, |this, found, cx| {
             this.argo_api = found;
@@ -1145,6 +1155,10 @@ impl SettingsView {
                         Some(Err(why)) => (why.clone(), theme.danger),
                     });
                     let (b_on, b_test, b_rm) = (base.clone(), e.clone(), base.clone());
+                    // A login missing, expired or refused: sign in again from here.
+                    let relogin = e.login.is_err()
+                        || matches!(self.argo_api_tests.get(&base), Some(Some(Err(why))) if why.contains("refused") || why.contains("expired"));
+                    let b_reconnect = (base.clone(), e.insecure);
                     // A token set here, expired or not, can be forgotten (the CLI's is used then).
                     let settings_token = e.settings_token;
                     let b_forget = base.clone();
@@ -1172,6 +1186,18 @@ impl SettingsView {
                                             cx.listener(move |this, _, _, cx| this.test_argo_api(b_test.clone(), cx)),
                                         ),
                                 )
+                                .when(relogin, |d| {
+                                    d.child(
+                                        Button::new(("argo-api-reconnect", i))
+                                            .xsmall()
+                                            .primary()
+                                            .label("Reconnect")
+                                            .tooltip("Sign in again: SSO, a password or a token")
+                                            .on_click(move |_, window, cx| {
+                                                crate::ui::argo_connect::open(Some(b_reconnect.clone()), window, cx);
+                                            }),
+                                    )
+                                })
                                 .when(settings_token, |d| {
                                     d.child(
                                         Button::new(("argo-api-forget", i))
@@ -1221,8 +1247,21 @@ impl SettingsView {
             )))
             .children(self.argo_api.errors.iter().map(|e| div().pb_1().text_xs().text_color(theme.danger).child(e.clone())))
             .children(self.argo_api.notes.iter().map(|n| div().pb_1().text_xs().text_color(muted).child(n.clone())))
+            .child(
+                h_flex().pb_2().child(
+                    Button::new("argo-api-connect")
+                        .small()
+                        .primary()
+                        .icon(Lucide::Plug)
+                        .label("Connect to Argo CD…")
+                        .tooltip("Paste its address and sign in: SSO in the browser, a password or a token")
+                        .on_click(|_, window, cx| crate::ui::argo_connect::open(None, window, cx)),
+                ),
+            )
             .when(self.argo_api.list.is_empty(), |d| {
-                d.child(div().py_2().text_sm().text_color(muted).child("No Argo CD server: add one below, or run `argocd login`."))
+                d.child(div().py_2().text_sm().text_color(muted).child(
+                    "No Argo CD server: connect to one, add one below, or run `argocd login`.",
+                ))
             })
             .children(rows)
             .child(

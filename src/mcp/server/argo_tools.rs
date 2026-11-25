@@ -908,6 +908,7 @@ mod tests {
             login: Err("no login in tests".into()),
             on: true,
             settings_token: false,
+            renewable: false,
         })
     }
 

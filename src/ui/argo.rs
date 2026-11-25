@@ -413,11 +413,13 @@ impl ArgoView {
                     // A new `argocd login`, or a token set: read the servers again.
                     let relogged = exec.spawn(async { api::config_stamp() }).await != stamp;
                     if !shown || relogged || api::generation() != generation {
-                        // Hidden, or the servers changed: the feeds stop unless another page holds them.
-                        // Hidden, the dashboard's read stops too; it reads again once shown.
+                        // Hidden: the feeds stop unless another page holds them, and the dashboard's
+                        // read stops too; it reads again once shown. The servers changed: the
+                        // feeds are held until the new ones are, so a feed whose login was only
+                        // renewed goes on (nothing is listed again).
                         let _ = this.update(cx, |this, cx| {
-                            this.watches.clear();
                             if !shown {
+                                this.watches.clear();
                                 this.dashboard_hidden(cx);
                             }
                         });
@@ -552,6 +554,7 @@ impl ArgoView {
             login: Err("a made-up example".into()),
             on: true,
             settings_token: false,
+            renewable: false,
         });
         let mut state = api::FeedState { listed: true, live: true, ..Default::default() };
         for v in argo::environments::example_apps(now) {
@@ -577,8 +580,18 @@ impl ArgoView {
             .text_color(theme.muted_foreground)
             .child("No Argo CD server is logged in to or set. Argo CD is read only through its API.")
             .child(
-                "Log in with `argocd login <server>` (the argocd CLI's servers are read), or add the server's \
-                 address and a token in Settings → Argo CD.",
+                "Connect to it here (SSO, a password or a token), or log in with `argocd login <server>`: the \
+                 argocd CLI's servers are read.",
+            )
+            .child(
+                h_flex().child(
+                    Button::new("argo-connect")
+                        .small()
+                        .primary()
+                        .icon(Lucide::Plug)
+                        .label("Connect to Argo CD…")
+                        .on_click(|_, window, cx| crate::ui::argo_connect::open(None, window, cx)),
+                ),
             )
             .children(fleet.errors.iter().map(|e| div().text_color(theme.danger).child(e.clone())))
             .into_any_element()
@@ -1492,6 +1505,7 @@ impl ArgoView {
     fn page(&self, body: impl IntoElement, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let errors = self.rows.as_ref().map_or_else(Vec::new, |r| r.fleet.errors.clone());
+        let relogin = self.rows.as_ref().map_or_else(Vec::new, |r| r.fleet.relogin.clone());
         v_flex()
             .size_full()
             .p_2()
@@ -1504,7 +1518,22 @@ impl ArgoView {
                         .text_xs()
                         .text_color(theme.danger)
                         .child("Some Argo CD servers could not be read:")
-                        .children(errors.into_iter().map(|e| div().child(e))),
+                        .children(errors.into_iter().map(|e| div().child(e)))
+                        .when(!relogin.is_empty(), |d| {
+                            d.child(h_flex().gap_1().pt_1().children(relogin.into_iter().enumerate().map(
+                                |(i, (base, insecure))| {
+                                    let name =
+                                        argo::server::Server::parse(&base).map_or_else(|_| base.clone(), |s| s.name());
+                                    Button::new(("argo-reconnect", i))
+                                        .xsmall()
+                                        .outline()
+                                        .label(format!("Reconnect {name}"))
+                                        .on_click(move |_, window, cx| {
+                                            crate::ui::argo_connect::open(Some((base.clone(), insecure)), window, cx);
+                                        })
+                                },
+                            )))
+                        }),
                 )
             })
             .child(div().flex_1().min_h_0().child(body))

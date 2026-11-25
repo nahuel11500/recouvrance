@@ -40,6 +40,7 @@ kubeconfig's login command such as `kubelogin` or `aws eks get-token`) open no c
 | `~/.config/recouvrance/anthropic-key` | The assistant's Anthropic API key, when saved in Settings (mode 0600; `ANTHROPIC_API_KEY` is used otherwise) |
 | `~/.config/recouvrance/argocd-tokens.json` | Read-only Argo CD API tokens set in Settings → Per cluster, by context (mode 0600; see [Argo CD's diff](#argo-cds-diff-argocd_servers)) |
 | `~/.config/recouvrance/argocd-api-tokens.json` | Argo CD API tokens set in Settings → Argo CD, by server address (mode 0600; see [Argo CD by its API](#argo-cd-by-its-api-argocd_api_servers)) |
+| `~/.config/recouvrance/argocd-api-refresh.json` | The refresh tokens of the SSO sign-ins made by *Connect to Argo CD…*, by server address (mode 0600) |
 | `~/.config/recouvrance/main-agent` | The built-in assistant's agent id and token (mode 0600) |
 | `~/.local/share/recouvrance/audit.jsonl` | Agent activity log |
 | `~/.local/share/recouvrance/timeline/<context>-<hash>.jsonl` | Changes recorded per context (mode 0600, see [Timeline](#timeline)) |
@@ -263,6 +264,40 @@ cluster it runs on. Its servers are:
 - those added in Settings → Argo CD: an address, and a token kept in `argocd-api-tokens.json`
   (mode 0600, never shown again; *Forget token* removes it). A token set here wins over the CLI's
   for the same server.
+
+**Connect to Argo CD…** (the command palette, Settings → Argo CD, the Argo CD page when no
+server is read, and *Reconnect* where a login expired or was refused) does it from the app:
+
+1. Paste the address as copied: `argocd.example.com`, a page of its web UI
+   (`https://argocd.example.com/applications/argocd/shop?view=tree`: the page, query and fragment
+   are dropped), with its path when Argo CD is served under one.
+2. `GET /api/v1/settings` (no login) says how it signs in, and only those ways are offered: SSO
+   in the browser when it has Dex connectors or an OIDC provider, as `argocd login --sso` does
+   (authorization code with PKCE S256 and a random `state`, the CLI's client id, the browser
+   coming back to `http://localhost:8085/auth/callback`: a listener on 127.0.0.1 only, which takes
+   the one answer carrying that `state`, then closes, or gives up after 5 minutes; port 8085 in
+   use is said); a local account's username and password (`POST /api/v1/session`, unless
+   `userLoginsDisabled`; the password is never kept nor in a process argument); or a token
+   pasted. An address behind a login proxy (oauth2-proxy and the like: a redirect, or a web
+   page, where the settings should be) is said as such, the redirect not followed: paste the
+   address your team uses for the argocd CLI instead.
+3. The token is checked (who it logs in as), then kept in `argocd-api-tokens.json` and the server
+   in `argocd_api_servers`. A server the argocd CLI is logged in to needs none of this: its login
+   is picked up as above.
+
+An SSO sign-in made here keeps its own refresh token (`argocd-api-refresh.json`, mode 0600; the
+argocd CLI's is never used, as a provider that rotates them would leave the CLI's invalid);
+`offline_access` is asked for when the provider lists it (Dex, Okta, Auth0 give no refresh token
+without it). While a page reads that server, its login is renewed 30 s before it expires and when
+it is refused (at most every 20 s). A renewal keeps the feed: the stream stays open, nothing is
+listed again, the next request sends the new token. Once sent, a renewal runs to its end and
+keeps the rotated refresh token, but only if the login is still the one it started from: a
+Reconnect, a token set or forgotten by hand, or another Recouvrance that renewed first, wins. A
+refresh token the provider refuses ends the renewals until *Reconnect*; a network error is
+tried again from 5 s, doubling to 5 minutes. It says it is renewing only while it is, and it
+has expired only once renewing failed, with why. Setting or forgetting a token by hand forgets
+the refresh token too. An expired token set here gives way to a valid `argocd login` of the
+same server. *Reconnect* keeps the argocd CLI's `--insecure` for that server.
 
 A config that can't be read fails closed: a CLI config that doesn't parse gives no server, and a
 tokens file that doesn't read gives no token at all (not even the CLI's), each said in Settings →

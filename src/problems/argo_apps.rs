@@ -531,6 +531,7 @@ mod tests {
             login: Err("no token".into()),
             on,
             settings_token: false,
+            renewable: false,
         };
         assert!(api_servers(vec![]).is_none());
         assert!(api_servers(vec![endpoint("https://a.example", true), endpoint("https://b.example", false)]).is_none());
