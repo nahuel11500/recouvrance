@@ -1,12 +1,20 @@
 //! Argo CD Applications that need attention, shown under the cluster they deploy to: Degraded,
 //! a failed sync, an error Argo CD reports, a sync running for long, and resources Missing
-//! while auto-sync is on. The Applications are read on their hub, often not a cluster open.
+//! while auto-sync is on. The Applications are read from Argo CD's API (the feeds the Argo CD
+//! page holds, else one list per server a minute), or on their hub when no Argo CD server is
+//! logged in.
+
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use kube::Client;
+use serde::Deserialize as _;
 
 use super::{OnHub, Problem, Scan, Severity};
 use crate::k8s;
-use crate::k8s::argo::{self, LeanApp};
+use crate::k8s::ContextTarget;
+use crate::k8s::argo::{self, LeanApp, api};
 use crate::status::Tone;
 
 /// What a row says the kind is.
@@ -18,18 +26,20 @@ const MESSAGE_CHARS: usize = 200;
 /// The check's name among a scan's checks.
 pub const CHECK: &str = "Argo CD Applications";
 
-/// What a row's reason ends with when the Application's hub is another cluster.
+/// What a row's reason ends with when the Application's Argo CD is another cluster, or a server.
 pub fn hub_note(hub: &str) -> String {
     format!(" (Argo CD on {hub})")
 }
 
 /// Where an Application lives, for an agent to read it there: "Argo CD Application
-/// argocd/web on hub".
+/// argocd/web on hub", or "... on Argo CD at argocd.example.com" when read by Argo CD's API.
 pub fn location(on: &OnHub, name: &str) -> String {
-    format!("{LABEL} {}/{name} on {}", on.namespace, on.context)
+    let at = if on.server.is_some() { "Argo CD at " } else { "" };
+    format!("{LABEL} {}/{name} on {at}{}", on.namespace, on.context)
 }
 
-/// The hub a skipped entry of this check names ("Argo CD Applications on hub (forbidden)").
+/// The hub or server a skipped entry of this check names ("Argo CD Applications on hub
+/// (forbidden)").
 pub fn skipped_hub(entry: &str) -> Option<&str> {
     let rest = entry.strip_prefix(CHECK)?.strip_prefix(" on ")?;
     Some(rest.split_once(" (").map_or(rest, |(hub, _)| hub))
@@ -95,19 +105,34 @@ pub fn judge(app: &LeanApp, now: jiff::Timestamp) -> Option<(Severity, String)> 
     Some((worst?, why.join("; ")))
 }
 
-/// The Applications that need attention among those `hub` holds that deploy to the cluster of
-/// `context`, in `namespaces` (all when empty), each under the namespace it deploys into.
-fn found_on(apps: &[LeanApp], hub: &str, context: &str, namespaces: &[String], now: jiff::Timestamp) -> Vec<Problem> {
-    let targets = argo::targets();
-    let (hub_target, here) = (argo::target(&targets, hub), argo::target(&targets, context));
+/// Where a scan reads Applications: a hub context, or an Argo CD API server.
+#[derive(Clone, Debug)]
+struct Home {
+    /// What a row and a skipped entry name it by: the hub context, or the server's name.
+    name: String,
+    /// The cluster it runs on (`in-cluster`).
+    target: ContextTarget,
+    /// A server's Argo CD (`Endpoint::instance`); None for a hub.
+    server: Option<String>,
+}
+
+/// The Applications that need attention among those `home` holds that deploy to the cluster
+/// of `here`, in `namespaces` (all when empty), each under the namespace it deploys into.
+fn found_on(
+    apps: &[LeanApp],
+    home: &Home,
+    here: &ContextTarget,
+    namespaces: &[String],
+    now: jiff::Timestamp,
+) -> Vec<Problem> {
     apps.iter()
-        .filter(|a| a.deploys_to(&hub_target, &here))
+        .filter(|a| a.deploys_to(&home.target, here))
         .filter(|a| a.dest_namespace().is_none_or(|ns| namespaces.is_empty() || namespaces.iter().any(|n| n == ns)))
         .filter_map(|a| {
             let (severity, mut reason) = judge(a, now)?;
             // The row is under the cluster it deploys to: say where Argo CD is when elsewhere.
-            if hub != context {
-                reason.push_str(&hub_note(hub));
+            if home.server.is_some() || home.name != here.name {
+                reason.push_str(&hub_note(&home.name));
             }
             Some(Problem {
                 severity,
@@ -117,23 +142,121 @@ fn found_on(apps: &[LeanApp], hub: &str, context: &str, namespaces: &[String], n
                 name: a.metadata.name.clone(),
                 reason,
                 age: a.metadata.created.as_deref().and_then(|t| t.parse().ok()),
-                on_hub: Some(OnHub { context: hub.to_string(), namespace: a.metadata.namespace.clone() }),
+                on_hub: Some(OnHub {
+                    context: home.name.clone(),
+                    namespace: a.metadata.namespace.clone(),
+                    server: home.server.clone(),
+                }),
             })
         })
         .collect()
 }
 
+/// How long a scan waits for a server's list of Applications.
+const LIST_DEADLINE: Duration = Duration::from_secs(20);
+
+/// A server's Applications are listed for the Problems scans at most this often when no
+/// feed runs, however many clusters are scanned.
+const LIST_TTL: Duration = Duration::from_secs(60);
+
+type Kept = HashMap<String, (Instant, Result<Arc<Vec<LeanApp>>, String>)>;
+
+/// Each server's Applications as the scans last listed them, or why they could not be, by
+/// feed key (`api::watch_key`), with when.
+static LISTS: LazyLock<Mutex<Kept>> = LazyLock::new(Default::default);
+
+/// The Applications as the scans read them.
+fn leaned<'a>(apps: impl Iterator<Item = &'a Arc<api::ApiApp>>) -> Vec<LeanApp> {
+    apps.filter_map(|a| LeanApp::deserialize(&a.value).ok()).collect()
+}
+
+/// A server's Applications for a scan: its feed's, with no request, when a page holds one
+/// that has listed them; else the list kept under `key` within `LIST_TTL`, failed or not;
+/// else `list`'s answer, kept. Scans asking together wait for one list.
+async fn held_or_listed(
+    key: &str,
+    feed: Option<Arc<Mutex<api::FeedState>>>,
+    list: impl Future<Output = Result<Vec<Arc<api::ApiApp>>, String>>,
+) -> Result<Arc<Vec<LeanApp>>, String> {
+    if let Some(feed) = feed {
+        // Taken out first: the feed isn't held while they are read.
+        let held: Option<Vec<Arc<api::ApiApp>>> = {
+            let state = feed.lock().unwrap_or_else(PoisonError::into_inner);
+            state.listed.then(|| state.apps.values().cloned().collect())
+        };
+        if let Some(apps) = held {
+            return Ok(Arc::new(leaned(apps.iter())));
+        }
+    }
+    static LISTING: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
+    let kept = || {
+        let lists = LISTS.lock().unwrap_or_else(PoisonError::into_inner);
+        lists.get(key).filter(|(at, _)| at.elapsed() < LIST_TTL).map(|(_, l)| l.clone())
+    };
+    let lock = LISTING.lock().unwrap_or_else(PoisonError::into_inner).entry(key.to_string()).or_default().clone();
+    let _one = lock.lock().await;
+    if let Some(answer) = kept() {
+        return answer;
+    }
+    let answer = list.await.map(|apps| Arc::new(leaned(apps.iter())));
+    let mut lists = LISTS.lock().unwrap_or_else(PoisonError::into_inner);
+    // Those of an older login or config are never asked again.
+    lists.retain(|_, (at, _)| at.elapsed() < LIST_TTL);
+    lists.insert(key.to_string(), (Instant::now(), answer.clone()));
+    answer
+}
+
+/// The Applications of the Argo CD API server `endpoint`, for a scan (see `held_or_listed`).
+async fn server_apps(endpoint: &api::Endpoint) -> Result<Arc<Vec<LeanApp>>, String> {
+    let list = api::list_once(endpoint.clone(), LIST_DEADLINE);
+    held_or_listed(&api::watch_key(endpoint), api::running(endpoint), list).await
+}
+
+/// The Argo CD API servers a scan reads: those turned on, when one of them has a login.
+/// None: no Argo CD is read by its API, and the hubs are read instead.
+fn api_servers(endpoints: Vec<api::Endpoint>) -> Option<Vec<api::Endpoint>> {
+    let on: Vec<api::Endpoint> = endpoints.into_iter().filter(|e| e.on).collect();
+    on.iter().any(|e| e.login.is_ok()).then_some(on)
+}
+
 /// The check of a scan of `context` (`client`: its own; `serves`: it serves Applications): the
-/// Applications of every hub known (see `argo::problem_hubs`) that deploy there. A hub that
-/// can't be read is named, and doesn't hide the others.
+/// Applications that deploy there, read from Argo CD's API servers (the argocd CLI's logins
+/// and those set in Settings → Argo CD) when one is logged in; else on every hub known (see
+/// `argo::problem_hubs`). A server or hub that can't be read is named, and doesn't hide the
+/// others.
 pub async fn scan(context: String, client: Client, serves: bool, namespaces: Vec<String>) -> Scan {
+    let now = jiff::Timestamp::now();
+    let targets = argo::targets();
+    let here = argo::target(&targets, &context);
+    let mut scan = Scan::default();
+    if let Some(endpoints) = api_servers(api::endpoints().list) {
+        let servers = crate::settings::with(|s| s.argocd_servers.clone());
+        let reads = futures::future::join_all(endpoints.iter().map(server_apps)).await;
+        for (endpoint, read) in endpoints.iter().zip(reads) {
+            let name = endpoint.name();
+            match read {
+                Ok(apps) => {
+                    let home = Home {
+                        name,
+                        target: argo::server_home(&servers, &endpoint.server.base, &targets),
+                        server: Some(endpoint.instance()),
+                    };
+                    scan.problems.extend(found_on(&apps, &home, &here, &namespaces, now));
+                }
+                Err(why) => scan.skipped.push((format!("{CHECK} on {name}"), anyhow::anyhow!(why))),
+            }
+        }
+        return scan;
+    }
     let hubs = argo::problem_hubs(&context, &client, serves);
     let lists = futures::future::join_all(hubs.iter().map(argo::lean_applications)).await;
-    let now = jiff::Timestamp::now();
-    let mut scan = Scan::default();
     for (hub, list) in hubs.iter().zip(lists) {
         match list {
-            Ok(apps) => scan.problems.extend(found_on(&apps, &hub.context, &context, &namespaces, now)),
+            Ok(apps) => {
+                let home =
+                    Home { name: hub.context.clone(), target: argo::target(&targets, &hub.context), server: None };
+                scan.problems.extend(found_on(&apps, &home, &here, &namespaces, now));
+            }
             // Access to some namespaces of a cluster with Argo CD's CRDs: not an Argo CD of
             // the user's, not a check that failed.
             Err(e) if hub.context == context && k8s::api_status(&e) == Some(403) => {}
@@ -250,8 +373,12 @@ mod tests {
         assert_eq!(skipped_hub("Argo CD Applications on hub-1 (failed: did not answer (x))"), Some("hub-1"));
         assert_eq!(skipped_hub("Argo CD Applications on hub-1"), Some("hub-1"));
         assert_eq!(skipped_hub("Pods (forbidden)"), None);
-        let on = OnHub { context: "hub".into(), namespace: "argocd".into() };
+        let on = OnHub { context: "hub".into(), namespace: "argocd".into(), server: None };
         assert_eq!(location(&on, "web"), "Argo CD Application argocd/web on hub");
+        let on =
+            OnHub { context: "argocd.example.com".into(), server: Some("https://argocd.example.com".into()), ..on };
+        assert_eq!(location(&on, "web"), "Argo CD Application argocd/web on Argo CD at argocd.example.com");
+        assert_eq!(skipped_hub("Argo CD Applications on argocd.example.com (failed: x)"), Some("argocd.example.com"));
     }
 
     #[test]
@@ -260,6 +387,14 @@ mod tests {
         let reason = with_message("Degraded", Some(&long));
         assert_eq!(reason.chars().count(), "Degraded: ".len() + MESSAGE_CHARS);
         assert!(reason.ends_with('…'));
+    }
+
+    fn context(name: &str, server: Option<&str>) -> ContextTarget {
+        ContextTarget { name: name.into(), server: server.map(String::from), ..Default::default() }
+    }
+
+    fn hub(name: &str) -> Home {
+        Home { name: name.into(), target: context(name, None), server: None }
     }
 
     #[test]
@@ -272,15 +407,133 @@ mod tests {
         api["metadata"]["name"] = json!("api");
         api["spec"]["destination"]["namespace"] = json!("api");
         let apps = [app(&of(true, "Degraded", None, &[])), app(&elsewhere), app(&api)];
-        let found = found_on(&apps, "hub", "hub", &[], now);
+        let found = found_on(&apps, &hub("hub"), &context("hub", None), &[], now);
         let names: Vec<(&str, Option<&str>)> =
             found.iter().map(|p| (p.name.as_str(), p.namespace.as_deref())).collect();
         assert_eq!(names, [("web", Some("web")), ("api", Some("api"))]);
-        assert_eq!(found[0].on_hub, Some(OnHub { context: "hub".into(), namespace: "argocd".into() }));
+        assert_eq!(found[0].on_hub, Some(OnHub { context: "hub".into(), namespace: "argocd".into(), server: None }));
         assert_eq!(found[0].label, LABEL);
         assert_eq!(found[0].reason, "Degraded");
-        let found = found_on(&apps, "hub", "hub", &["api".into()], now);
+        let found = found_on(&apps, &hub("hub"), &context("hub", None), &["api".into()], now);
         assert_eq!(found.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["api"]);
+    }
+
+    /// An Application read from an Argo CD API server goes under the context its destination
+    /// maps to, says the server, and is kept as on that server: the agents' rules and the
+    /// page's link go by it.
+    #[test]
+    fn rows_read_from_a_server_go_under_their_destination() {
+        let now = jiff::Timestamp::now();
+        let mut prod = of(true, "Degraded", None, &[]);
+        prod["spec"]["destination"] = json!({"server": "https://prod.example:6443", "namespace": "web"});
+        let mut by_name = of(false, "Healthy", None, &[("ComparisonError", "repo not found")]);
+        by_name["metadata"]["name"] = json!("named");
+        by_name["spec"]["destination"] = json!({"name": "prod", "namespace": "web"});
+        // `in-cluster`: Argo CD's own cluster, unknown here.
+        let mut own = of(true, "Degraded", None, &[]);
+        own["metadata"]["name"] = json!("own");
+        let apps = [app(&prod), app(&by_name), app(&own)];
+        let server = Home {
+            name: "argocd.example.com".into(),
+            target: ContextTarget::default(),
+            server: Some("https://argocd.example.com".into()),
+        };
+        let here = context("prod", Some("https://prod.example:6443"));
+        let found = found_on(&apps, &server, &here, &[], now);
+        assert_eq!(found.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["web", "named"]);
+        assert_eq!(found[0].reason, "Degraded (Argo CD on argocd.example.com)");
+        assert_eq!(
+            found[0].on_hub,
+            Some(OnHub {
+                context: "argocd.example.com".into(),
+                namespace: "argocd".into(),
+                server: Some("https://argocd.example.com".into()),
+            })
+        );
+        assert!(found_on(&apps, &server, &context("staging", Some("https://staging.example")), &[], now).is_empty());
+        // With its cluster known (its hub context's Argo CD server is this one), `in-cluster`
+        // is that cluster.
+        let home = Home { target: context("hub", Some("https://hub.example")), ..server };
+        let found = found_on(&apps, &home, &context("hub", Some("https://hub.example")), &[], now);
+        assert_eq!(found.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["own"]);
+    }
+
+    fn api_app(v: &Value) -> Arc<api::ApiApp> {
+        let value = api::lean(v);
+        Arc::new(api::ApiApp { summary: argo::Summary::of(&value), value })
+    }
+
+    /// What an Application read by the API keeps is what the rules read: its age, and how
+    /// long its sync has run.
+    #[test]
+    fn the_rules_read_what_the_api_keeps() {
+        let now = jiff::Timestamp::now();
+        let mut v = of(true, "Progressing", Some(json!({"phase": "Running", "startedAt": ago(25 * 60 + 30)})), &[]);
+        v["metadata"]["creationTimestamp"] = json!("2026-01-02T03:04:05Z");
+        let apps = leaned([api_app(&v)].iter());
+        assert_eq!(judge(&apps[0], now).map(|(_, r)| r).as_deref(), Some("sync running for 25m"));
+        assert_eq!(apps[0].metadata.created.as_deref(), Some("2026-01-02T03:04:05Z"));
+    }
+
+    /// A feed running (the Argo CD page open) answers a scan with no request; else one list
+    /// serves every scan for `LIST_TTL`, failed or not.
+    #[test]
+    fn a_running_feed_is_read_and_a_list_is_shared() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = AtomicUsize::new(0);
+        let degraded = of(true, "Degraded", None, &[]);
+        let list = |answer: Result<Vec<Arc<api::ApiApp>>, String>| {
+            let asked = &asked;
+            async move {
+                asked.fetch_add(1, Ordering::SeqCst);
+                answer
+            }
+        };
+        let mut state = api::FeedState { listed: true, ..Default::default() };
+        state.apps.insert(("argocd".into(), "web".into()), api_app(&degraded));
+        let feed = Arc::new(Mutex::new(state));
+        let key = "a-running-feed-is-read";
+        futures::executor::block_on(async {
+            let read = held_or_listed(key, Some(feed.clone()), list(Ok(vec![]))).await.unwrap();
+            assert_eq!(read.iter().map(|a| a.metadata.name.as_str()).collect::<Vec<_>>(), ["web"]);
+            assert_eq!(asked.load(Ordering::SeqCst), 0, "a running feed is read, not listed");
+            // A feed that hasn't listed yet: one list, then kept.
+            feed.lock().unwrap().listed = false;
+            for _ in 0..3 {
+                let read = held_or_listed(key, Some(feed.clone()), list(Ok(vec![api_app(&degraded)]))).await;
+                assert_eq!(read.unwrap().len(), 1);
+            }
+            assert_eq!(asked.load(Ordering::SeqCst), 1);
+            // A failure is kept as long, so a down server isn't waited for by every scan.
+            let failed = "a-failed-server-is-kept";
+            for _ in 0..3 {
+                let read = held_or_listed(failed, None, list(Err("did not answer".into()))).await;
+                assert_eq!(read.unwrap_err(), "did not answer");
+            }
+            assert_eq!(asked.load(Ordering::SeqCst), 2);
+            // Past the TTL: listed again.
+            let old = Instant::now().checked_sub(LIST_TTL + Duration::from_secs(1)).unwrap();
+            LISTS.lock().unwrap().get_mut(failed).unwrap().0 = old;
+            assert!(held_or_listed(failed, None, list(Ok(vec![]))).await.unwrap().is_empty());
+            assert_eq!(asked.load(Ordering::SeqCst), 3);
+        });
+    }
+
+    /// The servers are read when one is logged in, off ones never; with none logged in, the
+    /// hubs are.
+    #[test]
+    fn servers_are_read_when_one_is_logged_in() {
+        let endpoint = |url: &str, on: bool| api::Endpoint {
+            server: argo::server::Server::parse(url).unwrap(),
+            cli_context: None,
+            in_settings: true,
+            insecure: false,
+            login: Err("no token".into()),
+            on,
+            settings_token: false,
+        };
+        assert!(api_servers(vec![]).is_none());
+        assert!(api_servers(vec![endpoint("https://a.example", true), endpoint("https://b.example", false)]).is_none());
     }
 
     /// How auto-sync may be off: no sync policy, none automated, or turned off.

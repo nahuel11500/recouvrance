@@ -1459,6 +1459,17 @@ async fn projects(hub: &Hub) -> Result<ProjectWindows, String> {
     read
 }
 
+/// The cluster an Argo CD API server at `base` runs on, which its Applications' `in-cluster`
+/// destination is: the hub context whose Argo CD server it is (`servers`), if one is set;
+/// else none, which no context matches.
+pub fn server_home(
+    servers: &std::collections::BTreeMap<String, String>,
+    base: &str,
+    targets: &[ContextTarget],
+) -> ContextTarget {
+    server::contexts_of(servers, base).next().map_or_else(ContextTarget::default, |c| target(targets, c))
+}
+
 /// What a page has read of one Argo CD API server.
 pub struct ApiRead {
     pub endpoint: Arc<api::Endpoint>,
@@ -1491,10 +1502,7 @@ pub fn add_api(
                 fleet.projects.insert(instance.clone(), p);
             }
         }
-        // Its own cluster (`in-cluster`) is that of the hub whose Argo CD server it is, if set.
-        let hub = server::contexts_of(servers, &endpoint.server.base)
-            .next()
-            .map_or_else(ContextTarget::default, |c| target(targets, c));
+        let hub = server_home(servers, &endpoint.server.base, targets);
         let mut apps: Vec<&Arc<api::ApiApp>> = read.state.apps.values().collect();
         apps.sort_by(|a, b| (&a.summary.namespace, &a.summary.name).cmp(&(&b.summary.namespace, &b.summary.name)));
         let values: Vec<&Value> = apps.iter().map(|a| &a.value).collect();

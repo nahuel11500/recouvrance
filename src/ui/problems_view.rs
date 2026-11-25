@@ -20,6 +20,7 @@ use crate::k8s::lane::Lane;
 use crate::k8s::{self, Kind};
 use crate::problems::shared::{self, Ask, Found, Fresh};
 use crate::problems::{Problem, Severity};
+use crate::ui::argo::OpenArgoApp;
 use crate::ui::page_filter::PageFilter;
 use crate::ui::page_header::{page_header, scope_text};
 
@@ -113,6 +114,7 @@ pub struct ProblemsView {
 
 impl EventEmitter<OpenObject> for ProblemsView {}
 impl EventEmitter<OpenOn> for ProblemsView {}
+impl EventEmitter<OpenArgoApp> for ProblemsView {}
 
 impl ProblemsView {
     pub fn new(
@@ -279,16 +281,22 @@ impl ProblemsView {
             namespace: p.namespace.clone(),
             context: Some(ctx.clone()),
         };
-        // An Argo CD Application opens on its hub, which may not be connected.
-        let on_hub = p.on_hub.as_ref().map(|hub| OpenOn {
-            context: hub.context.clone(),
-            res: Res {
-                group: "argoproj.io".into(),
-                kind: "Application".into(),
-                namespace: hub.namespace.clone(),
-                name: p.name.clone(),
-                version: "v1alpha1".into(),
-            },
+        // An Argo CD Application read by Argo CD's API opens on the Argo CD page; one read on
+        // its hub opens there, which may not be connected.
+        let on_hub = p.on_hub.as_ref().map(|hub| match &hub.server {
+            Some(instance) => {
+                Err(OpenArgoApp { instance: instance.clone(), namespace: hub.namespace.clone(), name: p.name.clone() })
+            }
+            None => Ok(OpenOn {
+                context: hub.context.clone(),
+                res: Res {
+                    group: "argoproj.io".into(),
+                    kind: "Application".into(),
+                    namespace: hub.namespace.clone(),
+                    name: p.name.clone(),
+                    version: "v1alpha1".into(),
+                },
+            }),
         });
         cells(&theme, multi.then_some(ctx.as_str()), p, color)
             .id(("problem", i))
@@ -296,7 +304,8 @@ impl ProblemsView {
             .when(!p.kind.is_empty(), |d| {
                 d.cursor_pointer().hover(|s| s.bg(theme.list_hover)).on_click(cx.listener(move |_, _, _, cx| {
                     match &on_hub {
-                        Some(on) => cx.emit(on.clone()),
+                        Some(Ok(on)) => cx.emit(on.clone()),
+                        Some(Err(app)) => cx.emit(app.clone()),
                         None => cx.emit(ev.clone()),
                     }
                 }))
