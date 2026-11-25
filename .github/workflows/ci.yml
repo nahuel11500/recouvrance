@@ -248,10 +248,7 @@ jobs:
           LOCALAPPDATA: ${{ runner.temp }}\e2e\local
           APPDATA: ${{ runner.temp }}\e2e\roaming
         run: scripts/ci/windows-e2e/serve.ps1
-      - name: The app's window, its MCP server, a login command, its files
-        env:
-          LOCALAPPDATA: ${{ runner.temp }}\e2e\local
-          APPDATA: ${{ runner.temp }}\e2e\roaming
+      - name: The app started from Explorer (window, MCP server, a login command, its files)
         run: scripts/ci/windows-e2e/window.ps1
       - name: Developer tools (smoke checks, headless UI, a plugin through sh)
         env:

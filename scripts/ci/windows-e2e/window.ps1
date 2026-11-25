@@ -1,6 +1,6 @@
-# The app as a user starts it: its window opens and renders, its MCP server answers, the login
-# command of its context runs with no console window that shows, its files are in
-# %LOCALAPPDATA%\recouvrance, and closing the window quits it.
+# The app as a user starts it, from Explorer, in the runner's own profile: its window opens and
+# renders, its MCP server answers, the login command of its context runs with no console window
+# that shows, its files are in %LOCALAPPDATA%\recouvrance, and closing the window quits it.
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\common.ps1"
 Add-Type -AssemblyName System.Drawing
@@ -16,28 +16,33 @@ $probe = Get-Content "$env:E2E\login.log" | Where-Object { $_ -match "^parent=$P
 "probe: $probe"
 if ($probe -notmatch 'visible=True') { '::warning::this session shows no console window: the login command check proves nothing' }
 
-# Started as Explorer starts it (ShellExecute): no standard handles, so the app borrows its hidden
-# console (`console::hidden_for_gui`). Start-Process would hand it this step's pipes, and the app
-# leaves a console alone when its output is redirected.
-$start = [Diagnostics.ProcessStartInfo]::new($env:APP)
-$start.UseShellExecute = $true
-$app = [Diagnostics.Process]::Start($start)
+# Explorer starts the app with its own environment: the defaults, so the kubeconfig goes to
+# ~\.kube\config and the config the earlier steps made (port, agent) to the real %LOCALAPPDATA%.
+$local = [Environment]::GetFolderPath('LocalApplicationData')
+$roaming = [Environment]::GetFolderPath('ApplicationData')
+$root = "$local\recouvrance"
+if (Test-Path $root) { throw "$root exists before the app ever ran" }
+New-Item -ItemType Directory -Force $root, "$env:USERPROFILE\.kube" | Out-Null
+Copy-Item -Recurse "$env:RUNNER_TEMP\e2e\local\recouvrance\config" $root
+Remove-Item "$root\config\agents.lock", "$root\config\main-agent" -ErrorAction SilentlyContinue
+Copy-Item $env:KUBECONFIG "$env:USERPROFILE\.kube\config"
+$before = @(Get-Process recouvrance -ErrorAction SilentlyContinue | ForEach-Object Id)
+explorer.exe $env:APP
 $failed = @()
+$app = $null
 try {
   $deadline = (Get-Date).AddSeconds(90)
   while ($true) {
-    $app.Refresh()
-    if ($app.MainWindowHandle -ne 0) { break }
-    if ($app.HasExited) { throw "the app exited with $($app.ExitCode) without a window" }
+    $app = Get-Process recouvrance -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id } | Select-Object -First 1
+    if ($app -and $app.MainWindowHandle -ne 0) { break }
     if ((Get-Date) -gt $deadline) { throw 'the app opened no window' }
     Start-Sleep 1
   }
-  "window: '$($app.MainWindowTitle)'"
+  "window: '$($app.MainWindowTitle)', parent: $((Get-CimInstance Win32_Process -Filter "ProcessId=$($app.Id)").ParentProcessId)"
   # The console the app borrowed, which the login command shares.
   Start-Process powershell.exe -Wait -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', `
     '-File', "$PSScriptRoot\has-console.ps1", '-Id', $app.Id, '-Out', "$env:E2E\app-console.txt"
   "the app's console: $(Get-Content "$env:E2E\app-console.txt" -ErrorAction SilentlyContinue)"
-  Get-CimInstance Win32_Process -Filter "ParentProcessId=$($app.Id)" | ForEach-Object { "child: $($_.Name) $($_.ProcessId)" }
   Wait-Port $app
   $pods = Invoke-Tool list_resources context=kwok-exec kind=pods namespace=default
   $pods
@@ -57,7 +62,7 @@ try {
   "$($colors.Count) colors in the window"
   if ($colors.Count -lt 20) { $failed += "the window looks blank ($($colors.Count) colors)" }
 } finally {
-  if (-not $app.HasExited) {
+  if ($app -and -not $app.HasExited) {
     $app.CloseMainWindow() | Out-Null
     if (-not $app.WaitForExit(30000)) {
       Stop-Process $app
@@ -65,16 +70,14 @@ try {
     }
   }
 }
-"exit code: $($app.ExitCode)"
 $logins = Get-Logins $app
 $logins
 if (-not $logins) { $failed += 'the app never ran the login command' }
 if ($logins -match 'visible=True') { $failed += 'the login command had a console window that shows' }
 
 # Config and data in %LOCALAPPDATA%\recouvrance; what lands in %APPDATA% is listed.
-$root = "$env:LOCALAPPDATA\recouvrance"
-Get-ChildItem -Recurse -Force $root, $env:APPDATA | Select-Object -ExpandProperty FullName
-foreach ($f in 'config\agents.json', 'data\audit.jsonl') {
+Get-ChildItem -Recurse -Force $root, "$roaming\recouvrance" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+foreach ($f in 'config\settings.json', 'data\audit.jsonl') {
   if (-not (Test-Path "$root\$f")) { $failed += "no $root\$f" }
 }
 if ($failed) { throw ($failed -join '; ') }

@@ -23,4 +23,4 @@ try {
 $logins = Get-Logins $serve
 $logins
 if (-not $logins) { throw 'serve never ran the login command' }
-if ($logins -match 'visible=True') { '::warning::serve ran the login command with a console window that shows' }
+if ($logins -match 'visible=True') { '::warning::#1043: serve ran the login command with a console window that shows' }
