@@ -160,7 +160,7 @@ pub fn shell() -> Result<PathBuf, String> {
 const NO_SH: &str = "plugins run with a POSIX sh, which Windows doesn't have: install Git for Windows \
 (it brings sh.exe) or put an sh.exe on PATH";
 
-/// The first `sh.exe` in `path`'s directories, then in `fallbacks`.
+/// The first `sh.exe` in `path`'s absolute directories, then in `fallbacks`.
 #[cfg(any(windows, test))]
 fn find_sh(
     path: Option<std::ffi::OsString>,
@@ -169,7 +169,9 @@ fn find_sh(
 ) -> Option<PathBuf> {
     path.iter()
         .flat_map(std::env::split_paths)
-        .filter(|d| !d.as_os_str().is_empty())
+        // A relative entry (`.`, an empty one) would find an sh.exe in whatever folder the app
+        // runs from: only absolute folders count.
+        .filter(|d| d.is_absolute())
         .chain(fallbacks)
         .map(|d| d.join("sh.exe"))
         .find(|p| exists(p))
@@ -260,9 +262,10 @@ mod tests {
 
     #[test]
     fn sh_is_found_on_path_then_where_git_installs() {
-        let git = PathBuf::from("git").join("bin");
-        let on_path = PathBuf::from("tools");
-        let path = std::env::join_paths([PathBuf::from("empty"), on_path.clone()]).unwrap();
+        let root = std::env::temp_dir();
+        let git = root.join("git").join("bin");
+        let on_path = root.join("tools");
+        let path = std::env::join_paths([root.join("empty"), on_path.clone()]).unwrap();
         let has = |dirs: Vec<PathBuf>| move |p: &std::path::Path| dirs.iter().any(|d| d.join("sh.exe") == p);
         assert_eq!(
             find_sh(Some(path.clone()), [git.clone()], has(vec![on_path.clone(), git.clone()])),
@@ -270,8 +273,13 @@ mod tests {
         );
         assert_eq!(find_sh(Some(path.clone()), [git.clone()], has(vec![git.clone()])), Some(git.join("sh.exe")));
         assert_eq!(find_sh(None, [git.clone()], has(vec![git.clone()])), Some(git.join("sh.exe")));
-        assert_eq!(find_sh(Some(path), [git], has(vec![])), None);
+        assert_eq!(find_sh(Some(path), [git.clone()], has(vec![])), None);
         assert!(NO_SH.contains("Git for Windows"));
+        // A relative entry on PATH (the current folder) is never used, even with an sh.exe in it.
+        let relative = std::env::join_paths([PathBuf::from("."), PathBuf::from("tools"), PathBuf::new()]).unwrap();
+        let everywhere = |_: &std::path::Path| true;
+        assert_eq!(find_sh(Some(relative.clone()), [git.clone()], everywhere), Some(git.join("sh.exe")));
+        assert_eq!(find_sh(Some(relative), Vec::new(), everywhere), None);
     }
 
     /// Hostile values are data: they are never run, wherever the shorthand stands.
