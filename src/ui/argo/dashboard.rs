@@ -23,6 +23,7 @@ use crate::details::ArgoAction;
 use crate::k8s;
 use crate::k8s::argo::dashboard::{self, Cards, Commit, Problem};
 use crate::k8s::argo::diagnosis::{Res, span_text};
+use crate::k8s::argo::grouped_diff::AppDiff;
 use crate::k8s::argo::sync_diff::{self, Entry};
 use crate::k8s::argo::{self, api, short_revision};
 use crate::smartdiff::{self, ObjectKey, ResourceChange, SmartDiff};
@@ -45,6 +46,8 @@ const RUNNING_EVERY: Duration = Duration::from_secs(3);
 const PROBLEMS_IN_TILE: usize = 3;
 /// Names listed per kind of change in the Sync diff card.
 const NAMES_SHOWN: usize = 4;
+/// Changes listed in the Sync diff card.
+const CHANGES_IN_TILE: usize = 3;
 /// Lines of one resource's diff shown, at most.
 const DIFF_LINES: usize = 400;
 /// Lines of a summary shown, at most.
@@ -69,6 +72,23 @@ struct Compare {
     noise: bool,
     /// The resources whose diff is unfolded.
     open: HashSet<ObjectKey>,
+}
+
+/// Where a smart diff shows on the dashboard: the comparison of two deployments, or what a
+/// sync would change. Each has its own noise switch and resources unfolded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffAt {
+    Compare,
+    Sync,
+}
+
+impl DiffAt {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Compare => "argo-dash-cmp",
+            Self::Sync => "argo-dash-sync",
+        }
+    }
 }
 
 /// The dashboard open on the page.
@@ -97,6 +117,9 @@ pub(super) struct Dashboard {
     /// The parts unfolded: "why", "steps", "diff", "history", "pods", "problems",
     /// `"why-<resource>"`.
     open: HashSet<String>,
+    /// The Sync diff's noise shown, and its resources whose YAML diff is unfolded.
+    sync_noise: bool,
+    sync_open: HashSet<ObjectKey>,
     /// Made-up environments and their cards (the developer tools' example): nothing is read.
     example: Option<Vec<(String, Arc<Cards>)>>,
     /// A deployment picked, waiting for a second to compare it with.
@@ -128,6 +151,8 @@ impl Dashboard {
             load: Default::default(),
             tick: None,
             open: HashSet::new(),
+            sync_noise: false,
+            sync_open: HashSet::new(),
             example: None,
             picked: None,
             compare: None,
@@ -281,6 +306,7 @@ impl ArgoView {
         d.tab = tab;
         d.failed = None;
         d.open.clear();
+        d.sync_open.clear();
         d.close_compare();
         d.tick = None;
         d.dirty = false;
@@ -462,9 +488,23 @@ impl ArgoView {
         cx.notify();
     }
 
-    fn update_compare(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Compare)) {
-        if let Some(c) = self.dashboard.as_mut().and_then(|d| d.compare.as_mut()) {
-            f(c);
+    /// Show or hide the noise of the smart diff `at` (`key` None), or unfold or fold the diff of
+    /// its resource `key`.
+    fn toggle_smart(&mut self, at: DiffAt, key: Option<ObjectKey>, cx: &mut Context<Self>) {
+        let Some(d) = &mut self.dashboard else { return };
+        let state = match at {
+            DiffAt::Compare => d.compare.as_mut().map(|c| (&mut c.noise, &mut c.open)),
+            DiffAt::Sync => Some((&mut d.sync_noise, &mut d.sync_open)),
+        };
+        if let Some((noise, open)) = state {
+            match key {
+                None => *noise = !*noise,
+                Some(k) => {
+                    if !open.remove(&k) {
+                        open.insert(k);
+                    }
+                }
+            }
         }
         cx.notify();
     }
@@ -880,10 +920,28 @@ impl ArgoView {
             })
         };
         let changed: Vec<Res> = diff.changed.iter().chain(&diff.unknown).cloned().collect();
-        let lines: Vec<String> = [names("~", &changed[..]), names("+", &diff.added[..]), names("–", &diff.pruned[..])]
-            .into_iter()
-            .flatten()
-            .collect();
+        // What changes, images first, when the smart diff has it; else which resources.
+        let lines: Vec<String> = match c.smart.as_ref().filter(|s| !s.diff.groups.is_empty()) {
+            Some(s) => {
+                let groups = &s.diff.groups;
+                let mut lines: Vec<String> = groups
+                    .iter()
+                    .take(CHANGES_IN_TILE)
+                    .map(|g| match g.resources.len() {
+                        1 => g.text(),
+                        n => format!("{} ({n})", g.text()),
+                    })
+                    .collect();
+                if groups.len() > CHANGES_IN_TILE {
+                    lines.push(format!("+{}", crate::plural::count(groups.len() - CHANGES_IN_TILE, "more change")));
+                }
+                lines
+            }
+            None => [names("~", &changed[..]), names("+", &diff.added[..]), names("–", &diff.pruned[..])]
+                .into_iter()
+                .flatten()
+                .collect(),
+        };
         let tone = if c.summary.automated { Tone::Busy } else { Tone::Done };
         let show = self.toggle_link("diff", "diff", "show", d, cx);
         tile("Sync diff", Some(tone), cx)
@@ -1025,8 +1083,9 @@ impl ArgoView {
         if d.is_open("diff") && c.diff.total() > 0 {
             let diff = &c.diff;
             let panel = self.panel("Sync diff", "diff", d, cx);
-            out.push(match &c.git_diff {
-                Some(Ok(g)) => panel.children(g.changed.iter().map(|r| {
+            out.push(match (&c.smart, &c.git_diff) {
+                (Some(smart), _) => panel.child(self.sync_diff_view(d, smart, cx)),
+                (None, Some(Ok(g))) => panel.children(g.changed.iter().map(|r| {
                     v_flex()
                         .gap_0p5()
                         .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(selectable(format!(
@@ -1063,6 +1122,44 @@ impl ArgoView {
             )));
         }
         out
+    }
+
+    /// What a sync would change, read with the smart diff: what changes first (images first,
+    /// each change once with where), then a row per resource with what changes in it, its YAML
+    /// diff unfolded on demand; what Argo CD says differs where no change shows; hooks left out.
+    fn sync_diff_view(&self, d: &Dashboard, smart: &AppDiff, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme().clone();
+        let shown = Smart {
+            at: DiffAt::Sync,
+            intro: Some(
+                "The live objects against what a sync would leave (Argo CD's managed resources). Unfold a \
+                 resource for its YAML diff.",
+            ),
+            empty: "A sync would change nothing.",
+            same: smart.same,
+            noise: d.sync_noise,
+            open: &d.sync_open,
+        };
+        let unexplained = (!smart.unexplained.is_empty()).then(|| {
+            let which: Vec<String> = smart.unexplained.iter().take(NAMES_SHOWN).map(ObjectKey::label).collect();
+            let more = smart.unexplained.len().saturating_sub(NAMES_SHOWN);
+            let more = if more > 0 { format!(" +{more} more") } else { String::new() };
+            format!(
+                "Argo CD says these differ where no change shows (its normalization, or noise only): {}{more}",
+                which.join(", ")
+            )
+        });
+        let hooks = (smart.hooks > 0).then(|| {
+            format!(
+                "{} left out: they run during a sync rather than being kept in sync.",
+                crate::plural::count(smart.hooks, "hook")
+            )
+        });
+        v_flex()
+            .gap_1()
+            .child(self.smart_view(&shown, &smart.diff, cx))
+            .children(unexplained.map(|u| div().text_xs().text_color(theme.warning).child(selectable(u))))
+            .children(hooks.map(|h| div().text_xs().text_color(theme.muted_foreground).child(h)))
     }
 
     /// A part unfolded, full width, with its title and a link to fold it.
@@ -1443,13 +1540,30 @@ impl ArgoView {
             .into_any_element()
     }
 
-    /// The manifests' smart diff: the summary (each change once, with where), the noise hidden
-    /// and counted, then a row per resource that unfolds its diff.
+    /// The manifests' smart diff of a comparison.
     fn manifests_view(&self, c: &Compare, m: &SmartDiff, cx: &mut Context<Self>) -> AnyElement {
+        let shown = Smart {
+            at: DiffAt::Compare,
+            intro: Some(
+                "Argo CD renders both from the Application's sources as they are now, at each deployment's \
+                 revision: a change of its own parameters shows under Sources.",
+            ),
+            empty: "Same rendered manifests at both revisions.",
+            same: m.unchanged,
+            noise: c.noise,
+            open: &c.open,
+        };
+        self.smart_view(&shown, m, cx)
+    }
+
+    /// A smart diff: the summary (each change once, with where, images first), the noise hidden
+    /// and counted, then a row per resource with what changes in it, that unfolds its diff.
+    fn smart_view(&self, v: &Smart, m: &SmartDiff, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
+        let at = v.at;
         let noise = m.noise();
         let empty = if m.is_empty() {
-            Some("Same rendered manifests at both revisions.")
+            Some(v.empty)
         } else if m.groups.is_empty() {
             Some("Only noise changed.")
         } else {
@@ -1459,24 +1573,21 @@ impl ArgoView {
         let noise_line = format!(
             "{} {} ({})",
             crate::plural::count(noise, "noise change"),
-            if c.noise { "shown" } else { "hidden" },
+            if v.noise { "shown" } else { "hidden" },
             by_rule.join(", ")
         );
-        let rows: Vec<&ResourceChange> = m.resources.iter().filter(|r| c.noise || !r.facts.is_empty()).collect();
+        let rows: Vec<&ResourceChange> = m.resources.iter().filter(|r| v.noise || !r.facts.is_empty()).collect();
         let more_rows = rows.len().saturating_sub(ROWS_SHOWN);
         let more_groups = m.groups.len().saturating_sub(GROUPS_SHOWN);
         let changed = m.resources.iter().filter(|r| !r.facts.is_empty()).count();
         let counts = format!(
             "{} changed, {} the same or noise only",
             crate::plural::count(changed, "resource"),
-            m.unchanged + m.resources.len() - changed
+            v.same + m.resources.len() - changed
         );
         v_flex()
             .gap_1()
-            .child(div().text_xs().text_color(muted).child(
-                "Argo CD renders both from the Application's sources as they are now, at each deployment's \
-                 revision: a change of its own parameters shows under Sources.",
-            ))
+            .children(v.intro.map(|i| div().text_xs().text_color(muted).child(i)))
             .children(empty.map(|e| div().text_sm().text_color(muted).child(e)))
             .children(m.groups.iter().take(GROUPS_SHOWN).map(|g| {
                 h_flex()
@@ -1493,18 +1604,25 @@ impl ArgoView {
                 )
             })
             .when(!m.is_empty(), |v| v.child(div().text_xs().text_color(muted).child(counts)))
-            .when(noise > 0, |v| {
-                v.child(
+            .when(noise > 0, |w| {
+                w.child(
                     h_flex().gap_2().text_xs().text_color(muted).child(selectable(noise_line)).child(
-                        link("argo-dash-noise", if c.noise { "hide" } else { "show" }, cx)
-                            .on_click(cx.listener(|this, _, _, cx| this.update_compare(cx, |c| c.noise = !c.noise))),
+                        link(
+                            SharedString::from(format!("{}-noise", at.id())),
+                            if v.noise { "hide" } else { "show" },
+                            cx,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_smart(at, None, cx))),
                     ),
                 )
             })
             .children(rows.into_iter().take(ROWS_SHOWN).enumerate().map(|(i, r)| {
-                let open = c.open.contains(&r.key);
+                let open = v.open.contains(&r.key);
                 let key = r.key.clone();
-                let mut what: Vec<String> = r.facts.iter().take(3).map(smartdiff::Fact::text).collect();
+                // Images first.
+                let mut facts: Vec<&smartdiff::Fact> = r.facts.iter().collect();
+                facts.sort_by_key(|f| f.rank());
+                let mut what: Vec<String> = facts.iter().take(3).map(|f| f.text()).collect();
                 if r.facts.len() > 3 {
                     what.push(format!("+{} more", r.facts.len() - 3));
                 }
@@ -1518,19 +1636,12 @@ impl ArgoView {
                         h_flex()
                             .gap_1p5()
                             .text_xs()
-                            .child(link(("argo-dash-res", i), &label, cx).on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    let key = key.clone();
-                                    this.update_compare(cx, move |c| {
-                                        if !c.open.remove(&key) {
-                                            c.open.insert(key);
-                                        }
-                                    });
-                                },
-                            )))
+                            .child(link(SharedString::from(format!("{}-res-{i}", at.id())), &label, cx).on_click(
+                                cx.listener(move |this, _, _, cx| this.toggle_smart(at, Some(key.clone()), cx)),
+                            ))
                             .child(div().text_color(muted).child(selectable(what.join("; ")))),
                     )
-                    .when(open, |v| v.child(lines_block(r.lines(c.noise), cx)))
+                    .when(open, |w| w.child(lines_block(r.lines(v.noise), cx)))
             }))
             .when(more_rows > 0, |v| {
                 v.child(
@@ -1542,6 +1653,18 @@ impl ArgoView {
             })
             .into_any_element()
     }
+}
+
+/// A smart diff as shown (see `ArgoView::smart_view`).
+struct Smart<'a> {
+    at: DiffAt,
+    intro: Option<&'static str>,
+    /// Said when nothing differs.
+    empty: &'static str,
+    /// Resources the same on both sides, beside those the diff holds.
+    same: usize,
+    noise: bool,
+    open: &'a HashSet<ObjectKey>,
 }
 
 /// Some resources by kind and name, the first few.

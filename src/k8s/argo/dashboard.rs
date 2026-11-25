@@ -4,7 +4,7 @@
 //! deploys are read by Argo CD's API ([`super::api::dashboard`]). The cards are pure functions of what was read, worked out off the UI thread.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use jiff::Timestamp;
 use serde_json::Value;
@@ -896,6 +896,8 @@ pub struct Read {
     pub tree: Option<Result<Value, String>>,
     /// Argo CD's diff; None when it can't be asked.
     pub diff: Option<Result<GitDiff, String>>,
+    /// Argo CD's managed resources, as read: what the smart diff is worked out from.
+    pub managed: Option<Value>,
     /// The commit of each source deployed (see [`deployed`]); None when it can't be asked.
     pub commits: Vec<Option<Result<Commit, String>>>,
     /// Why the Application couldn't be read now (one line), when it is a list's copy: its
@@ -912,7 +914,7 @@ impl Read {
     /// The Application as a feed holds it (its list's copy), when reading it failed with `why`:
     /// its tree, diff and commits aren't asked, and the note says why in one line.
     pub fn held(app: Value, why: &str) -> Self {
-        Self { app, tree: None, diff: None, commits: Vec::new(), note: Some(first_line(why)) }
+        Self { app, tree: None, diff: None, managed: None, commits: Vec::new(), note: Some(first_line(why)) }
     }
 }
 
@@ -932,6 +934,9 @@ pub struct Cards {
     pub diff: DiffSummary,
     /// Argo CD's diff, to show whole; or why it couldn't be read.
     pub git_diff: Option<Result<GitDiff, String>>,
+    /// What a sync would change, read with the smart diff (facts, noise folded, a Secret's
+    /// values masked), from the managed resources; None when they weren't read.
+    pub smart: Option<Arc<super::grouped_diff::AppDiff>>,
     pub history: History,
     pub note: Option<String>,
     /// A selective sync newer than the newest deployment.
@@ -968,6 +973,8 @@ impl Cards {
             last_sync: last_sync(app),
             diff,
             git_diff: read.diff,
+            // Worked out here, off the UI thread, with every line.
+            smart: read.managed.as_ref().map(|m| Arc::new(super::grouped_diff::AppDiff::of(m))),
             history: history(app, HISTORY_DOTS),
             note: read.note,
             partial: partial(app),
