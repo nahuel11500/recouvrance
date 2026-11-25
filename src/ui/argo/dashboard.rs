@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::Input;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -836,20 +837,24 @@ impl ArgoView {
             })));
         }
         if let Some(s) = c.last_sync.as_ref().filter(|s| d.is_open("steps") && !s.steps.is_empty()) {
-            out.push(self.panel("Sync steps", "steps", d, cx).children(s.steps.iter().map(|st| {
-                v_flex()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .text_xs()
-                            .child(chip(if st.status.is_empty() { "Waiting" } else { st.status.as_str() }, st.tone, cx))
-                            .child(selectable(st.res.label()))
-                            .when(st.hook, |h| h.child(div().text_color(muted).child("hook"))),
-                    )
-                    .when_some(st.message.clone(), |v, m| {
-                        v.child(div().pl_2().text_xs().text_color(muted).child(selectable(m)))
-                    })
-            })));
+            let is_open = |key: &str| d.is_open(&format!("steps-{key}"));
+            let toggle: super::journal::StepsToggle =
+                std::rc::Rc::new(|this, key, cx| this.toggle_part(format!("steps-{key}"), cx));
+            let of = super::journal::StepsOf {
+                id: "argo-dash-steps".into(),
+                steps: &s.steps,
+                summary: &s.summary,
+                seen: &[],
+                running: s.running,
+                ended: s.finished.map(Timestamp::as_second),
+                query: &self.steps_query,
+                is_open: &is_open,
+            };
+            out.push(
+                self.panel("Sync steps", "steps", d, cx)
+                    .child(div().w(px(260.)).child(Input::new(&self.steps_search).small().cleanable(true)))
+                    .child(self.steps_view(&of, toggle, Timestamp::now(), cx)),
+            );
         }
         if d.is_open("diff") && c.diff.total() > 0 {
             let diff = &c.diff;

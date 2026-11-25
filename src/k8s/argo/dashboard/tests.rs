@@ -199,7 +199,8 @@ fn the_last_sync_says_its_steps_and_how_long_it_took() {
     assert_eq!(s.seconds(now()), Some(40));
     assert_eq!(s.by.as_deref(), Some("dev-user"));
     assert_eq!(s.steps.len(), 2);
-    assert_eq!((s.steps[1].status.as_str(), s.steps[1].tone), ("SyncFailed", Tone::Bad));
+    assert_eq!((s.steps[1].result(), crate::k8s::argo::steps::tone(&s.steps[1])), ("SyncFailed", Tone::Bad));
+    assert_eq!(s.summary.cause.len(), 1, "the failed step leads");
     assert_eq!(s.done, 2);
     // A sync running: its hook still running is not done, and it lasts until now.
     let mut running = app("example-staging");
@@ -216,7 +217,8 @@ fn the_last_sync_says_its_steps_and_how_long_it_took() {
     let s = last_sync(&running).unwrap();
     assert!(s.running);
     assert_eq!((s.done, s.steps.len(), s.seconds(now())), (1, 2, Some(75)));
-    assert!(s.steps[0].hook);
+    assert!(s.steps[0].is_hook());
+    assert_eq!(s.summary.current.as_deref(), Some("PreSync"));
     assert_eq!(s.message.as_deref(), Some("waiting for completion of hook batch/Job/db-migrate…"));
     assert_eq!(s.by.as_deref(), Some("autosync"));
 }
