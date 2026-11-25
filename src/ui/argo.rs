@@ -554,6 +554,7 @@ impl ArgoView {
             login: Err("a made-up example".into()),
             on: true,
             settings_token: false,
+            renewable: false,
         });
         let mut state = api::FeedState { listed: true, live: true, ..Default::default() };
         for v in argo::environments::example_apps(now) {

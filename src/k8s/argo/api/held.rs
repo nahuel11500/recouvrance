@@ -190,6 +190,7 @@ mod tests {
             login: Ok((Token("t".into()), Login::Cli)),
             on: true,
             settings_token: true,
+            renewable: false,
         })
     }
 
