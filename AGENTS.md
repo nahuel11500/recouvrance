@@ -2,12 +2,13 @@
 
 ## Building
 
-- **Don't build unless you have to.** CI is free. A pull request gets the quick checks (format,
-  spelling, licenses, clippy) in about two minutes; the tests, the end-to-end run on kind and the
-  Windows check run on `main` after the merge (a merge queue needs an organization-owned
-  repository). Read the code instead of compiling to find out; when you change logic, run its
-  module's tests locally with the narrowest command (`cargo test <module>::`) before merging.
-  When a run on `main` fails, fixing it comes before anything else.
+- **Don't build unless you have to.** CI is free and runs the tests on every PR (with format,
+  spelling, licenses and clippy, in about four minutes), so it is the check for them: read the
+  code instead of compiling to find out, and build locally only when CI's log is not enough,
+  with the narrowest command (one test) and `--profile ci` (no debug info). Worktrees share one
+  target dir, so touch `src/main.rs` first or cargo may run another worktree's build. The
+  end-to-end run on kind and the Windows check run on `main` after the merge; when a run on
+  `main` fails, fixing it comes before anything else.
 - **Push through the pre-push hook.** Once per checkout: `git config core.hooksPath scripts/hooks`.
   Before each push it runs what CI fails on most: `cargo fmt --check`, `typos`, `cargo deny`,
   then clippy (with and without `dev`) in the main checkout's target dir, one at a time across
