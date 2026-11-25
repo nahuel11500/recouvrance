@@ -327,6 +327,9 @@ pub struct ArgoView {
     show_reviews: bool,
     /// The overview of what the filter keeps, worked out with the lines.
     overview: Option<overview::Overview>,
+    /// Reads the commits of the overview's tags from their git host, and which it reads.
+    commits_load: crate::latest::Latest,
+    commits_asked: Vec<(String, String)>,
     _subs: Vec<Subscription>,
 }
 
@@ -471,6 +474,8 @@ impl ArgoView {
             list_shown: page.list,
             show_reviews: false,
             overview: None,
+            commits_load: Default::default(),
+            commits_asked: Vec::new(),
             _subs: subs,
         }
     }
@@ -536,6 +541,7 @@ impl ArgoView {
         self.build.spawn(cx, work, |this, rows, cx| {
             this.rows = Some(rows);
             this.refilter(cx);
+            this.ask_commits(cx);
             this.dashboard_changed(cx);
             this.open_asked(cx);
             cx.notify();
@@ -563,6 +569,29 @@ impl ArgoView {
         }
         let fleet = argo::from_api(vec![ApiRead { endpoint, state }], &[], &[], &Default::default());
         let types = crate::settings::with(|s| s.argocd_env_types.clone());
+        // Made-up commits for the product's tags that hold one.
+        for (n, v) in argo::environments::example_apps(now).iter().enumerate() {
+            for image in v.pointer("/status/summary/images").and_then(serde_json::Value::as_array).into_iter().flatten()
+            {
+                let Some((repo, tag)) = image.as_str().and_then(|i| i.rsplit_once(':')) else { continue };
+                let Some(sha) = crate::git_host::sha_of(tag) else { continue };
+                let titles =
+                    ["feat(cart): pay in three times", "fix(api): a timeout on slow searches", "chore: bump deps"];
+                crate::git_host::pretend(
+                    repo,
+                    tag,
+                    crate::git_host::Commit {
+                        sha: sha.to_string(),
+                        title: titles[n % titles.len()].to_string(),
+                        author: "Ann Example".into(),
+                        date: Some(
+                            jiff::Timestamp::from_second(now.as_second() - 86_400 * (1 + n as i64 % 5)).unwrap_or(now),
+                        ),
+                        url: format!("https://git.example.com/{repo}/-/commit/{sha}"),
+                    },
+                );
+            }
+        }
         self.example = true;
         self.list_shown = list;
         self.rows = Some(Rows::new(fleet, Arc::new(EnvTypes::parse(&types)), &mut Planner::new(now)));
@@ -669,6 +698,7 @@ impl ArgoView {
     /// The filter, grouping or a fold changed: show it, and remember it.
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.refilter(cx);
+        self.ask_commits(cx);
         self.remember();
         cx.notify();
     }
@@ -1498,6 +1528,7 @@ impl ArgoView {
     fn show_list(&mut self, list: bool, cx: &mut Context<Self>) {
         self.list_shown = list;
         self.remember();
+        self.ask_commits(cx);
         cx.notify();
     }
 

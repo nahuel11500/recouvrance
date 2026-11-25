@@ -115,17 +115,24 @@ pub fn environments(
         .iter()
         .map(|m| environments::images(m.iter().flat_map(|(i, _)| apps[*i].app.images.iter().map(String::as_str))))
         .collect();
-    // The product's images: those whose tags differ between the project's environments.
+    // The product's images: those whose tags differ between the project's environments, and
+    // those named after the project.
     let mut by_project: HashMap<&str, Vec<usize>> = HashMap::new();
     for (e, m) in groups.iter().enumerate() {
         by_project.entry(apps[m[0].0].app.project.as_str()).or_default().push(e);
     }
     let mut product: Vec<HashSet<String>> = vec![HashSet::new(); groups.len()];
-    for envs in by_project.values() {
+    for (project, envs) in &by_project {
         let all: Vec<&[EnvImage]> = envs.iter().map(|&e| images[e].as_slice()).collect();
-        let differing = environments::differing(&all);
+        let mut own = environments::differing(&all);
+        own.extend(
+            all.iter()
+                .flat_map(|i| i.iter())
+                .filter(|i| environments::named_after(&i.repo, project))
+                .map(|i| i.repo.clone()),
+        );
         for &e in envs {
-            product[e].clone_from(&differing);
+            product[e].clone_from(&own);
         }
     }
     groups

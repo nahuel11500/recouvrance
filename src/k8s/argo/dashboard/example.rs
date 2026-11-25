@@ -2,7 +2,7 @@
 //! developer tools' snapshots show its dashboard (`RECOUVRANCE_ACT=page:argo,argo-example`),
 //! and the tests read its cards.
 //!
-//! - `example-staging`: synced and healthy, deployed by auto-sync; ten images, most of them
+//! - `example-staging`: synced and healthy, deployed by auto-sync; twelve images (two third-party), most of them
 //!   tagged by branch and commit (`main-<sha>`), as CI often tags them;
 //! - `example-prod`: out of sync (auto-sync off), Degraded: a worker crash-loops, another's
 //!   pod is Pending, an autoscaler has no metric; the last deployment bumped two images;
@@ -33,6 +33,15 @@ const STAGING_EXTRA: [(&str, &str); 7] = [
     ("payments-gateway", "main-9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807"),
     ("frontend", "feature-new-basket-1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c"),
 ];
+
+/// Third-party images staging runs too: not the product's.
+const THIRD_PARTY: [&str; 2] = ["docker.io/library/redis:7.2", "quay.io/prometheus/statsd-exporter:v0.26.0"];
+
+/// The images of the example whose tag holds a commit: (repository, tag).
+#[cfg(feature = "dev")]
+pub fn commits() -> Vec<(String, String)> {
+    STAGING_EXTRA.iter().map(|(c, t)| (format!("{REGISTRY}/{c}"), (*t).to_string())).collect()
+}
 
 fn at(now: Timestamp, secs_ago: i64) -> String {
     Timestamp::from_second(now.as_second() - secs_ago).unwrap_or(now).to_string()
@@ -141,6 +150,7 @@ pub fn app(env: &str, now: Timestamp) -> Value {
     let mut images = vec![image("api", TAG), image("worker", TAG), image("worker-mail", MAIL_TAG)];
     if env == "example-staging" {
         images.extend(STAGING_EXTRA.iter().map(|(c, t)| image(c, t)));
+        images.extend(THIRD_PARTY.iter().map(ToString::to_string));
     }
     json!({
         "metadata": {"name": env, "namespace": "argocd", "resourceVersion": "4242",

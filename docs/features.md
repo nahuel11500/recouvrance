@@ -344,7 +344,8 @@
   sync running for over 10 minutes, out of sync with auto-sync on), production first; per
   project, the version each type runs of the product's images (the tag most of its
   environments run, `prod 1.4.2 · preprod 1.5.0-rc.1 · staging main-77b324b`) and the
-  environments on another tag, named (components on the same tags everywhere on one line); and
+  environments on another tag, named (components on the same tags everywhere on one line), each
+  tag's commit title beside it when the git host says it (see *Versions* below); and
   the last operation of each environment (when, the Application, the
   result, who started it, the revision). Review environments of other people (the type
   `review` whose name doesn't hold the login of the Argo CD token as a word) are left out
@@ -359,7 +360,8 @@
   worst color of its Applications, its name and how many Applications, what is wrong as badges
   (*Sync failed*, *Degraded*, *OutOfSync*, *Syncing*), the images it runs with their tag (a
   commit sha cut to 7: `main-77b324b`), the product's first (the images whose tag differs between
-  the project's environments; a database or exporter every environment runs alike comes after,
+  the project's environments, or whose path names the project: `shop/api`, `team/shop-web`; a
+  database or exporter every environment runs alike comes after,
   all of them on hover), when its last sync ended, and where it deploys (Argo CD's name of the
   cluster, from the Application or Argo CD's cluster list, and the namespace) when that differs
   between rows: a column with the same value on 95% of the rows is left out, and the Argo CD
@@ -416,8 +418,17 @@
   first. *Updated at* and *Refresh*, and cards. *State*: the sync in big (*Synced*, *OutOfSync*, *Sync Failed* or
   *Syncing*), the health, the resources Degraded (`worker Degraded +1`) and *Why?* (the diagnosis
   below), the card tinted green, amber or red. *Versions*: a chip per component's image (the
-  repository's last part and its tag), red with `1.4.1 → 1.5.0` when it changed since the
-  deployment before (from the images seen running under it, else those its sources pinned:
+  repository's last part and its tag), the product's first and the others folded under *+24
+  others*; under them, for each of the product's images whose tag holds a commit sha
+  (`main-<sha>`, `26-8-4-<sha>`), that commit's title, author and age, a link to it on its git
+  host. The commit is read from GitLab or GitHub with a token the user already has: the `glab`
+  CLI's `config.yml` (each host's token, `https` only, its registry domains telling which
+  GitLab an image is from) and the `gh` CLI's `hosts.yml`, or `GITLAB_TOKEN`, `GH_TOKEN` /
+  `GITHUB_TOKEN`; only read, never written, and never in an error. A token kept in the system
+  keyring isn't read: with none, nothing is shown. The image's path is its project
+  (`registry.example.com/shop/api` → `shop/api` on GitLab, else `shop`; `ghcr.io/owner/repo`
+  on GitHub). Each answer is kept for the session; the page never waits for it. Chips red
+  with `1.4.1 → 1.5.0` when it changed since the deployment before (from the images seen running under it, else those its sources pinned:
   kustomize images, Helm `*repository`/`*tag` parameters), who released it and when (`autosync`
   for auto-sync), what ran before, and *Roll back* to the deployment before (auto-sync off, as
   Argo CD requires; confirmed, write mode applies). *In cluster*: the revision of each source

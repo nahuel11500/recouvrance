@@ -107,6 +107,8 @@ pub(super) struct Dashboard {
     sources_load: crate::latest::Latest,
     /// Their manifests, read when the comparison opens.
     manifests_load: crate::latest::Latest,
+    /// Reads the commits of the product's images from their git host.
+    commits_load: crate::latest::Latest,
 }
 
 impl Dashboard {
@@ -131,6 +133,7 @@ impl Dashboard {
             compare: None,
             sources_load: Default::default(),
             manifests_load: Default::default(),
+            commits_load: Default::default(),
         }
     }
 
@@ -338,6 +341,8 @@ impl ArgoView {
         let Some(d) = &mut self.dashboard else { return };
         let next = d.take_read(k, cards, Timestamp::now());
         cx.notify();
+        self.ask_image_commits(cx);
+        let Some(d) = &mut self.dashboard else { return };
         match next {
             Next::Stale | Next::Rest => {}
             Next::Reload => self.load_dashboard(cx),
@@ -476,6 +481,23 @@ impl ArgoView {
             .zip([example::ENVIRONMENTS[1], example::ENVIRONMENTS[0], example::ENVIRONMENTS[2]])
             .map(|(name, env)| (name.to_string(), Arc::new(Cards::of(example::read(env, now), None, now))))
             .collect();
+        // Made-up commits for the images whose tag holds one.
+        for (n, (repo, tag)) in example::commits().into_iter().enumerate() {
+            let Some(sha) = crate::git_host::sha_of(&tag) else { continue };
+            let titles =
+                ["feat(cart): pay in three times", "fix(search): a timeout on slow queries", "chore: bump deps"];
+            crate::git_host::pretend(
+                &repo,
+                &tag,
+                crate::git_host::Commit {
+                    sha: sha.to_string(),
+                    title: titles[n % titles.len()].to_string(),
+                    author: "Ann Example".into(),
+                    date: Timestamp::from_second(now.as_second() - 3600 * (2 + n as i64 * 7)).ok(),
+                    url: format!("https://git.example.com/shop/{n}/-/commit/{sha}"),
+                },
+            );
+        }
         let mut d = Dashboard::new("shop-prod-acme (example, no real data)".into(), Vec::new(), 0);
         d.kind = "prod".into();
         d.server = "argocd.example.com".into();
@@ -1079,13 +1101,109 @@ impl ArgoView {
         )
     }
 
-    /// The images running, the commit each source deploys, and who released it.
+    /// The product's images of the Application `k` (see `envs::environments`): those of its
+    /// environment whose tags differ between the project's environments or that are named
+    /// after the project, and those named after the environment's product (its name's first
+    /// word).
+    fn own_images(&self, k: &Key) -> HashSet<String> {
+        let Some(rows) = &self.rows else { return HashSet::new() };
+        let Some(env) = rows.fleet.apps.iter().position(|a| key(a) == *k).and_then(|i| rows.envs.get(rows.env_of[i]))
+        else {
+            return HashSet::new();
+        };
+        let product = env.name.split('-').next().unwrap_or_default();
+        env.images
+            .iter()
+            .filter(|(own, i)| *own || argo::environments::named_after(&i.repo, product))
+            .map(|(_, i)| i.repo.clone())
+            .collect()
+    }
+
+    /// Read from their git host the commits the product's images of the tab shown were built
+    /// from (those not known yet); the page is drawn again once they are.
+    fn ask_image_commits(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = &self.dashboard else { return };
+        let Some((k, Ok(cards))) = &d.cards else { return };
+        let own = self.own_images(k);
+        let mut wanted: Vec<(String, String)> = cards
+            .versions
+            .images
+            .iter()
+            .filter(|i| own.contains(&i.repo) && crate::git_host::sha_of(&i.tag).is_some())
+            .filter(|i| crate::git_host::known(&i.repo, &i.tag).is_none())
+            .map(|i| (i.repo.clone(), i.tag.clone()))
+            .collect();
+        wanted.dedup();
+        if wanted.is_empty() {
+            return;
+        }
+        let Some(d) = &mut self.dashboard else { return };
+        d.commits_load.spawn(cx, crate::git_host::read(wanted), |_, _, cx| cx.notify());
+    }
+
+    /// The images running (the product's first, the others folded), the commit each of the
+    /// product's was built from, the commit each source deploys, and who released it.
     fn versions_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
         let v = &c.versions;
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let chips =
-            h_flex().flex_wrap().gap_1p5().children(v.images.iter().enumerate().map(|(i, img)| image_chip(i, img, cx)));
+        // Not listed (the example): those named after the environment's product.
+        let own = d.current().map_or_else(
+            || {
+                let product = d.title.split('-').next().unwrap_or_default();
+                v.images
+                    .iter()
+                    .filter(|i| argo::environments::named_after(&i.repo, product))
+                    .map(|i| i.repo.clone())
+                    .collect()
+            },
+            |k| self.own_images(k),
+        );
+        type Numbered<'a> = Vec<(usize, &'a dashboard::Image)>;
+        let (mine, others): (Numbered, Numbered) =
+            v.images.iter().enumerate().partition(|(_, i)| own.contains(&i.repo));
+        // Nothing known as the product's: every image, as Argo CD lists them.
+        let folded = !mine.is_empty() && !others.is_empty() && !d.is_open("images");
+        let shown: Vec<(usize, &dashboard::Image)> =
+            if folded { mine.clone() } else { mine.iter().chain(&others).copied().collect() };
+        let chips = h_flex()
+            .flex_wrap()
+            .gap_1p5()
+            .children(shown.into_iter().map(|(i, img)| image_chip(i, img, cx)))
+            .when(!mine.is_empty() && !others.is_empty(), |row| {
+                let label = format!("+{} others", others.len());
+                row.child(self.toggle_link("images", "images", &label, d, cx))
+            });
+        let commits: Vec<(usize, &dashboard::Image, crate::git_host::Commit)> = mine
+            .iter()
+            .filter_map(|(i, img)| match crate::git_host::known(&img.repo, &img.tag) {
+                Some(crate::git_host::Lookup::Found(c)) => Some((*i, *img, c)),
+                _ => None,
+            })
+            .collect();
+        let commit_rows = commits.into_iter().map(|(i, img, commit)| {
+            let mut by = vec![commit.author.clone()];
+            if let Some(t) = commit.date {
+                by.push(format!("{} ago", k8s::age(t)));
+            }
+            let url = commit.url.clone();
+            h_flex()
+                .gap_2()
+                .text_xs()
+                .min_w_0()
+                .child(div().flex_none().text_color(muted).child(img.component.clone()))
+                .child(
+                    with_tip(("argo-dash-image-commit", i), super::overview::commit_text(&commit))
+                        .min_w_0()
+                        .truncate()
+                        .text_color(if url.is_empty() { theme.foreground } else { theme.blue })
+                        .when(!url.is_empty(), |d| {
+                            d.cursor_pointer().hover(Styled::underline).on_click(move |_, _, cx| cx.open_url(&url))
+                        })
+                        .child(commit.title.clone()),
+                )
+                .child(div().flex_none().text_color(muted).child(by.join(", ")))
+        });
         let mut released = Vec::new();
         if let Some(t) = v.released {
             released.push(format!("Released {} ago", k8s::age(t)));
@@ -1127,6 +1245,7 @@ impl ArgoView {
             } else {
                 chips.into_any_element()
             })
+            .children(commit_rows)
             .when_some(v.previous.clone(), |c, p| {
                 c.child(div().text_xs().text_color(muted).child(selectable(format!("Before: {}", short_revision(&p)))))
             })

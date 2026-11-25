@@ -448,7 +448,7 @@ pub(super) struct Failure {
     pub text: String,
 }
 
-type HttpClient = hyper_util::client::legacy::Client<
+pub(crate) type HttpClient = hyper_util::client::legacy::Client<
     hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     Full<Bytes>,
 >;
@@ -495,7 +495,7 @@ impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
 
 /// The client for servers whose certificate is checked, or not (`insecure`): made once, its
 /// connections kept for the next requests (each server's own).
-pub(super) fn http_client(insecure: bool) -> anyhow::Result<HttpClient> {
+pub(crate) fn http_client(insecure: bool) -> anyhow::Result<HttpClient> {
     static CLIENTS: LazyLock<Mutex<HashMap<bool, HttpClient>>> = LazyLock::new(Default::default);
     let mut clients = CLIENTS.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(c) = clients.get(&insecure) {
