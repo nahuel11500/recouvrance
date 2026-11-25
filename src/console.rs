@@ -63,20 +63,39 @@ pub fn hidden_for_gui() {}
 /// Attach to a new console that has no window.
 #[cfg(all(windows, any(test, not(feature = "dev"))))]
 fn attach_windowless() -> std::io::Result<()> {
+    use std::io::{BufRead as _, Write as _};
     use std::process::Stdio;
     let shell = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
     // `/k` keeps cmd running, reading commands from stdin, until stdin is closed.
     let mut host = crate::process::command(shell)
         .args(["/d", "/q", "/k"])
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    let attached = winsafe::AttachConsole(winsafe::PidParent::Pid(host.id()));
+    // Its console is made as cmd starts, after `spawn` returns: wait until cmd answers (at most
+    // 3 seconds, the app's start is waiting), then attach while it still runs.
+    let mut stdin = host.stdin.take();
+    let stdout = host.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(stdout) = stdout {
+        let _ = std::thread::Builder::new().name("console".into()).spawn(move || {
+            let ready = std::io::BufReader::new(stdout).lines().any(|l| l.is_ok_and(|l| l.trim() == "ready"));
+            let _ = tx.send(ready);
+        });
+    }
+    let asked = stdin.as_mut().is_some_and(|i| i.write_all(b"echo ready\r\n").and_then(|()| i.flush()).is_ok());
+    let ready = asked && rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap_or(false);
+    let attached = if ready {
+        winsafe::AttachConsole(winsafe::PidParent::Pid(host.id())).map_err(std::io::Error::other)
+    } else {
+        let _ = host.kill();
+        Err(std::io::Error::other("cmd did not answer"))
+    };
     // Closing its stdin ends cmd; the console stays while the app is attached to it.
-    drop(host.stdin.take());
+    drop(stdin);
     let _ = std::thread::Builder::new().name("reap".into()).spawn(move || host.wait());
-    attached.map_err(std::io::Error::other)
+    attached
 }
 
 #[cfg(test)]
