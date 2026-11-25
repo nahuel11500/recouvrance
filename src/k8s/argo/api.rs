@@ -2382,7 +2382,7 @@ users:
         );
         assert_eq!(args("localhost:8080"), "account get-user-info --server localhost:8080 --plaintext");
         for x in &e.list {
-            let all = x.cli.as_ref().map(super::CliArgs::renew_args).unwrap_or_default().join(" ");
+            let all = x.cli.as_ref().map_or_default(super::CliArgs::renew_args).join(" ");
             assert!(!all.contains("token-secret"), "{all}");
         }
     }
