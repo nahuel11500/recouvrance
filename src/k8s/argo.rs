@@ -1761,7 +1761,7 @@ mod tests {
         listed.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
         let pending = ApiRead { endpoint: one.clone(), state: api::FeedState::default() };
         let fleet = from_api(vec![ApiRead { endpoint: two, state: listed }, pending], &[], &[], &Default::default());
-        assert_eq!((fleet.apps.len(), fleet.reading.clone()), (1, vec![one.name()]));
+        assert_eq!((fleet.apps.len(), fleet.reading), (1, vec![one.name()]));
     }
 
     #[test]
