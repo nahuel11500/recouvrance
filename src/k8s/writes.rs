@@ -761,21 +761,7 @@ pub async fn argo_operation(
     name: String,
     op: super::argo::ops::Op,
 ) -> Result<String> {
-    argo_operation_with(client, kind, ns, name, op, true).await.map(|(said, _)| said)
-}
-
-/// [`argo_operation`], returning once the operation is written: a dry run's result is not
-/// waited for (a grouped sync follows each Application's operation itself). Also gives when
-/// the Application's last operation started, as read right before the write: the one written
-/// is a later one.
-pub async fn argo_start(
-    client: Client,
-    kind: Kind,
-    ns: Option<String>,
-    name: String,
-    op: super::argo::ops::Op,
-) -> Result<(String, Option<String>)> {
-    argo_operation_with(client, kind, ns, name, op, false).await
+    argo_operation_with(client, kind, ns, name, op).await.map(|(said, _)| said)
 }
 
 async fn argo_operation_with(
@@ -784,7 +770,6 @@ async fn argo_operation_with(
     ns: Option<String>,
     name: String,
     op: super::argo::ops::Op,
-    wait_dry_run: bool,
 ) -> Result<(String, Option<String>)> {
     use super::argo::ops::{self, Op};
     run(async move {
@@ -814,7 +799,7 @@ async fn argo_operation_with(
         }
         let mut out = ops::started(&app, &op, &name);
         let before = super::argo::grouped_sync::started_at(&app);
-        if op.dry_run() && wait_dry_run {
+        if op.dry_run() {
             for _ in 0..DRY_RUN_WAIT_SECS {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 let now = serde_json::to_value(api.get(&name).await?)?;
