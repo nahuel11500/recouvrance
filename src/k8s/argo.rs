@@ -528,6 +528,86 @@ pub fn attention(app: &Summary) -> Tone {
     }
 }
 
+/// What makes Applications need a look, the one rule of the Argo CD page's *Needs a look*
+/// (its filter, its headings' and types' counts, its Overview) and of the agents'
+/// `problems_only`: a failed sync, an error Argo CD reports, Degraded (or Missing with
+/// auto-sync on), a sync running for over 10 minutes (`diagnosis::STUCK_AFTER`), or out of
+/// sync with auto-sync on. Out of sync or Missing with auto-sync off is how an Application
+/// synced by hand waits for its next sync, and a sync running is on its way: neither counts.
+/// Several Applications' (an environment's) add up with `add`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Look {
+    pub failed: bool,
+    pub error: bool,
+    pub degraded: bool,
+    pub missing: bool,
+    /// When the oldest sync still running started, in seconds.
+    pub running_since: Option<i64>,
+    pub auto_out_of_sync: bool,
+}
+
+impl Look {
+    pub fn of(app: &Summary) -> Self {
+        let health = listed_health_tone(&app.health, app.automated) == Tone::Bad;
+        let running = app.operation.as_ref().is_some_and(|(phase, _, _)| operation_tone(phase) == Tone::Busy);
+        Self {
+            failed: sync_failed(app),
+            error: app.conditions.iter().any(|(ty, _)| ty.ends_with("Error")),
+            degraded: health && app.health != "Missing",
+            missing: health && app.health == "Missing",
+            running_since: app
+                .operation_started
+                .as_deref()
+                .filter(|_| running)
+                .and_then(|t| t.parse::<jiff::Timestamp>().ok())
+                .map(|t| t.as_second()),
+            auto_out_of_sync: app.automated && app.sync == "OutOfSync",
+        }
+    }
+
+    /// Both together: an environment's from its Applications'.
+    #[must_use]
+    pub fn add(self, other: Self) -> Self {
+        Self {
+            failed: self.failed || other.failed,
+            error: self.error || other.error,
+            degraded: self.degraded || other.degraded,
+            missing: self.missing || other.missing,
+            running_since: match (self.running_since, other.running_since) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            auto_out_of_sync: self.auto_out_of_sync || other.auto_out_of_sync,
+        }
+    }
+
+    /// Why it needs a look at `now`, worst first; empty when it doesn't.
+    pub fn why(self, now: jiff::Timestamp) -> Vec<(String, Tone)> {
+        let mut out = Vec::new();
+        for (on, text) in [
+            (self.failed, "Sync failed"),
+            (self.error, "Error"),
+            (self.degraded, "Degraded"),
+            (self.missing, "Missing"),
+        ] {
+            if on {
+                out.push((text.to_string(), Tone::Bad));
+            }
+        }
+        if let Some(secs) = self.running_since.map(|t| now.as_second() - t).filter(|&s| s >= diagnosis::STUCK_AFTER) {
+            out.push((format!("Syncing for {}", super::duration_text(secs)), Tone::Busy));
+        }
+        if self.auto_out_of_sync {
+            out.push(("Out of sync, auto-sync on".to_string(), Tone::Busy));
+        }
+        out
+    }
+
+    pub fn needs_a_look(self, now: jiff::Timestamp) -> bool {
+        !self.why(now).is_empty()
+    }
+}
+
 // MARK: Contexts
 
 /// What the kubeconfig's contexts point to, read again only when the files change.

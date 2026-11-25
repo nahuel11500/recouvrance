@@ -121,31 +121,9 @@ pub fn mine(name: &str, user: Option<&str>) -> bool {
     format!("-{}-", name.to_lowercase()).contains(&format!("-{user}-"))
 }
 
-/// Why `env` needs a look at `now`, worst first: a sync that failed, Degraded, a sync running
-/// for long, out of sync with auto-sync on (by hand, out of sync is how it waits for a sync).
-pub fn why(env: &Env, apps: &[FleetApp], now: jiff::Timestamp) -> Vec<(String, Tone)> {
-    let mut out = Vec::new();
-    if env.state.failed {
-        out.push(("Sync failed".to_string(), Tone::Bad));
-    }
-    if env.state.degraded {
-        out.push(("Degraded".to_string(), Tone::Bad));
-    }
-    let longest = env
-        .members
-        .iter()
-        .filter_map(|(i, _)| Some(&apps.get(*i)?.app))
-        .filter(|a| a.operation.as_ref().is_some_and(|(p, _, _)| operation_tone(p) == Tone::Busy))
-        .filter_map(|a| a.operation_started.as_deref()?.parse::<jiff::Timestamp>().ok())
-        .map(|t| now.as_second() - t.as_second())
-        .max();
-    if let Some(secs) = longest.filter(|&s| s >= k8s::argo::diagnosis::STUCK_AFTER) {
-        out.push((format!("Syncing for {}", k8s::duration_text(secs)), Tone::Busy));
-    }
-    if env.members.iter().filter_map(|(i, _)| apps.get(*i)).any(|a| a.app.automated && a.app.sync == "OutOfSync") {
-        out.push(("Out of sync, auto-sync on".to_string(), Tone::Busy));
-    }
-    out
+/// Why `env` needs a look at `now`, worst first: the page's one rule (`argo::Look`).
+pub fn why(env: &Env, now: jiff::Timestamp) -> Vec<(String, Tone)> {
+    env.state.look.why(now)
 }
 
 /// The name of an environment without its project's: `prod-acme` for `shop-prod-acme`.
@@ -189,7 +167,7 @@ pub fn overview(
         c.failed += usize::from(s.failed);
         c.running += usize::from(s.running);
         c.fine += usize::from(!s.out_of_sync && !s.degraded && !s.failed && !s.running);
-        let why = why(env, apps, now);
+        let why = why(env, now);
         let t = by_type.entry(env.kind).or_default();
         t.0 += 1;
         t.1 += usize::from(!why.is_empty());
@@ -752,6 +730,57 @@ mod tests {
         let fleet = argo::from_api(vec![ApiRead { endpoint, state }], &[], &[]);
         let mut plan = argo::windows::Planner::new(now);
         super::super::Rows::new(fleet, Arc::new(EnvTypes::default()), &mut plan)
+    }
+
+    /// The filter chip's count, the headings' "to look at", the Overview's per-type counts and
+    /// its list, and the agents' rule (`argo::Look` per Application) all count the same
+    /// environments: one rule. The example has an environment out of sync with auto-sync off,
+    /// which none counts.
+    #[test]
+    fn every_needs_a_look_counts_the_same_environments() {
+        use crate::k8s::argo;
+        use std::collections::{BTreeSet, HashSet};
+        let now = jiff::Timestamp::now();
+        let rows = example(now);
+        let n = rows.envs.len();
+        let keep = vec![true; n];
+        // Every review shown, as in the list.
+        let o = overview(&rows.fleet.apps, &rows.envs, &keep, &rows.types, &rows.users, true, now);
+        let overview_envs: BTreeSet<usize> = o.looks.iter().map(|l| l.env).collect();
+        assert_eq!(o.types.iter().map(|t| t.looks).sum::<usize>(), overview_envs.len());
+        assert!(!overview_envs.is_empty());
+
+        let chip = rows.counts[0];
+        let look = envs::Filter { needs_look: true, ..Default::default() };
+        let filtered: BTreeSet<usize> = (0..n)
+            .filter(|&e| {
+                let labels: Vec<&(String, String)> = rows.labels[e].iter().collect();
+                look.keeps(&rows.envs[e], rows.types.name(rows.envs[e].kind), false, &labels, rows.now)
+            })
+            .collect();
+        let listed = rows.listed(envs::GroupBy::Project, |_| false);
+        let (_, headings) = envs::lines(
+            &listed,
+            &keep,
+            &HashSet::new(),
+            |_| None,
+            |e| rows.envs[e].state.needs_look(rows.now),
+            |_| Tone::Good,
+        );
+        let headed: usize = headings.iter().filter(|h| h.depth == 0).map(|h| h.looks).sum();
+        let agents: BTreeSet<usize> = rows
+            .fleet
+            .apps
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| argo::Look::of(&a.app).needs_a_look(now))
+            .map(|(i, _)| rows.env_of[i])
+            .collect();
+        assert_eq!(filtered, overview_envs);
+        assert_eq!(agents, overview_envs);
+        assert_eq!((chip, headed), (overview_envs.len(), overview_envs.len()));
+        let hand = rows.envs.iter().position(|e| e.name == "shop-prod-globex").expect("shop-prod-globex");
+        assert!(rows.envs[hand].state.out_of_sync && !filtered.contains(&hand), "waits for a sync by hand");
     }
 
     #[test]

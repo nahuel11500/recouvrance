@@ -200,7 +200,7 @@ impl Rows {
         kinds.dedup();
         let count = |f: &dyn Fn(&Env) -> bool| envs.iter().filter(|e| f(e)).count();
         let counts = [
-            count(&|e| e.state.needs_look()),
+            count(&|e| e.state.needs_look(now)),
             count(&|e| e.state.out_of_sync),
             count(&|e| e.state.degraded || e.state.failed),
             count(&|e| e.state.running),
@@ -667,7 +667,7 @@ impl ArgoView {
             .enumerate()
             .map(|(e, env)| {
                 let labels: Vec<&(String, String)> = rows.labels[e].iter().collect();
-                self.filter.keeps(env, rows.types.name(env.kind), env_starred(e), &labels)
+                self.filter.keeps(env, rows.types.name(env.kind), env_starred(e), &labels, rows.now)
             })
             .collect();
         self.kept = env_keeps.iter().filter(|k| **k).count();
@@ -681,7 +681,7 @@ impl ArgoView {
                 let env = &rows.envs[e];
                 (env.members.len() > 1 && expanded.contains(&key(&apps[env.root()]))).then_some(env.members.len())
             },
-            |e| rows.envs[e].state.needs_look(),
+            |e| rows.envs[e].state.needs_look(rows.now),
             |e| rows.envs[e].tone,
         );
         (self.lines, self.headings) = (lines, headings);
@@ -694,7 +694,7 @@ impl ArgoView {
             &rows.types,
             &rows.users,
             self.show_reviews,
-            jiff::Timestamp::now(),
+            rows.now,
         ));
         self.env_keeps = env_keeps;
         self.recount_picked();
