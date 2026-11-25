@@ -420,7 +420,7 @@ fn id_token_of(status: u16, body: &[u8]) -> Result<String, String> {
     let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     if !(200..300).contains(&status) {
         let error = text_at(&v, "error").unwrap_or("an error");
-        let why = text_at(&v, "error_description").map(|d| format!(": {}", shown(d))).unwrap_or_default();
+        let why = text_at(&v, "error_description").map_or_default(|d| format!(": {}", shown(d)));
         return Err(format!("The identity provider refused the sign-in ({}{why}; HTTP {status})", shown(error)));
     }
     text_at(&v, "id_token").map(str::to_string).ok_or_else(|| "The identity provider's answer has no id_token".into())
@@ -529,7 +529,7 @@ impl Callback {
         }
         self.done = true;
         if let Some(error) = param("error") {
-            let why = param("error_description").map(|d| format!(": {}", shown(&d))).unwrap_or_default();
+            let why = param("error_description").map_or_default(|d| format!(": {}", shown(&d)));
             return (reply(400, PAGE_FAILED), Some(Err(format!("The sign-in was refused ({}{why})", shown(&error)))));
         }
         match param("code").filter(|c| !c.is_empty()) {
@@ -825,14 +825,14 @@ mod tests {
         ) {
             prop_assume!(root.iter().all(|s| !UI_ROUTES.contains(&s.as_str())));
             let shown_host = if upper { host.to_uppercase() } else { host.clone() };
-            let port_text = port.map(|p| format!(":{p}")).unwrap_or_default();
+            let port_text = port.map_or_default(|p| format!(":{p}"));
             let root_path: String = root.iter().flat_map(|s| ["/", s.as_str()]).collect();
             let mut text = format!("{}{shown_host}{port_text}{root_path}{}", if scheme { "https://" } else { "" }, page.unwrap_or(""));
             if slash { text.push('/'); }
             if let Some(q) = &query { text.push('?'); text.push_str(q); }
             if let Some(f) = &fragment { text.push('#'); text.push_str(f); }
             let pasted = format!("{pad}{}{text}{}{pad}", wrap.0, wrap.1);
-            let kept_port = port.filter(|p| *p != 443).map(|p| format!(":{p}")).unwrap_or_default();
+            let kept_port = port.filter(|p| *p != 443).map_or_default(|p| format!(":{p}"));
             let expected = format!("https://{host}{kept_port}{root_path}");
             prop_assert_eq!(normalize(&pasted).map(|s| s.base), Ok(expected));
         }
