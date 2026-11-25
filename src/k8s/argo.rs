@@ -1456,6 +1456,24 @@ pub fn parents<V: Borrow<Value>>(apps: &[V]) -> Vec<Option<usize>> {
         .collect()
 }
 
+/// Where an object's Application was read (`Found`): on a hub's Kubernetes API, or Argo CD's
+/// own. The Applications page reads only the API (`FleetApp::server`).
+#[derive(Clone)]
+pub enum Source {
+    Hub(Hub),
+    Api(Arc<api::Endpoint>),
+}
+
+impl Source {
+    /// The hub context, or the API server's name.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Hub(h) => h.context.clone(),
+            Self::Api(e) => e.name(),
+        }
+    }
+}
+
 /// Each project's sync windows, by project name.
 pub type ProjectWindows = Arc<std::collections::BTreeMap<String, Vec<windows::SyncWindow>>>;
 
