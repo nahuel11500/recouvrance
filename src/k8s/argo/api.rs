@@ -30,7 +30,8 @@ use super::server::{self, Login, Server, encode, scrub};
 use super::windows::{self, SyncWindow};
 use super::{DEFAULT_NAMESPACE, Summary, TRACKING_ID};
 
-#[cfg(test)]
+/// For the end-to-end tests (`e2e`).
+#[cfg(all(test, feature = "dev"))]
 pub(crate) mod fake;
 mod held;
 pub use held::{held_apps, held_states};

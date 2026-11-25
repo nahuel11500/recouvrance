@@ -2480,9 +2480,8 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
 
         // The window's grouped sync, out of sync only: the Application's resources out of sync
         // named, the one in sync and the one to prune (prune off) left out, no hooks.
-        let endpoint = Arc::new(
-            k8s::argo::api::endpoints().list.into_iter().find(|e| e.server.base == base).context("set")?,
-        );
+        let endpoint =
+            Arc::new(k8s::argo::api::endpoints().list.into_iter().find(|e| e.server.base == base).context("set")?);
         let checked = k8s::argo::grouped_sync::check(
             &fake.get(name).context("the Application")?,
             &k8s::argo::windows::NextSync::NoWindow,
