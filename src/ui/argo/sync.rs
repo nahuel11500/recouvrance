@@ -118,6 +118,57 @@ impl Row {
     }
 }
 
+/// What one Application's check found, before the sync, line by line (and whether each is
+/// a warning): whether it is synced (`synced`: it has a sync to send with `opts`), then what
+/// the sync applies, the hooks it runs or skips and what prune deletes. One left as it is
+/// says so in one line: none of its hooks is skipped, nothing of it is pruned.
+fn checked_lines(checked: &Checked, synced: bool, opts: Options, production: Option<&str>) -> Vec<(String, bool)> {
+    let lead = match (synced, opts.hooks) {
+        (true, _) => "Ready",
+        (false, true) => "Nothing to sync",
+        (false, false) => "Nothing out of sync: not synced",
+    };
+    let mut facts = vec![lead.to_string()];
+    if checked.auto_sync {
+        facts.push("auto-sync on".into());
+    }
+    if let Some(rev) = &checked.revision {
+        facts.push(format!("revision {}", short_revision(rev)));
+    }
+    if let Some(t) = production {
+        facts.push(format!("{t} environment"));
+    }
+    let mut lines = vec![(facts.join(" · "), false)];
+    if !synced {
+        return lines;
+    }
+    if !opts.hooks {
+        let text = if checked.out_of_sync.is_empty() {
+            "Nothing out of sync but what prune deletes.".to_string()
+        } else {
+            format!(
+                "{} out of sync: {}",
+                crate::plural::count(checked.out_of_sync.len(), "resource"),
+                some_named(checked.out_of_sync.iter().map(Res::label))
+            )
+        };
+        lines.push((text, false));
+    }
+    if !checked.hooks.is_empty() {
+        let what = if opts.hooks { "Hooks that run" } else { "Hooks skipped" };
+        lines.push((format!("{what}: {}", some_named(checked.hooks.iter().cloned())), !opts.hooks));
+    }
+    if opts.prune {
+        let text = if checked.pruned.is_empty() {
+            "Nothing to prune.".to_string()
+        } else {
+            format!("Prune deletes {}", all_named(&checked.pruned))
+        };
+        lines.push((text, !checked.pruned.is_empty()));
+    }
+    lines
+}
+
 /// The sync of the picked Applications, open on the page.
 pub(super) struct GroupedSync {
     rows: Vec<Row>,
@@ -950,43 +1001,9 @@ impl ArgoView {
             return out.child(line(format!("Left out: {why}"), theme.warning));
         }
         if !sent || !r.in_sync {
-            let mut facts = vec![if r.request(opts).is_some() { "Ready" } else { "Nothing to sync" }.to_string()];
-            if checked.auto_sync {
-                facts.push("auto-sync on".into());
-            }
-            if let Some(rev) = &checked.revision {
-                facts.push(format!("revision {}", short_revision(rev)));
-            }
-            if let Some(t) = &r.production {
-                facts.push(format!("{t} environment"));
-            }
-            out = out.child(line(facts.join(" · "), muted));
-            if !opts.hooks {
-                let text = if r.request(opts).is_none() {
-                    "Nothing out of sync: not synced.".to_string()
-                } else if checked.out_of_sync.is_empty() {
-                    "Nothing out of sync but what prune deletes.".to_string()
-                } else {
-                    format!(
-                        "{} out of sync: {}",
-                        crate::plural::count(checked.out_of_sync.len(), "resource"),
-                        some_named(checked.out_of_sync.iter().map(Res::label))
-                    )
-                };
-                out = out.child(line(text, muted));
-            }
-            if !checked.hooks.is_empty() {
-                let (what, color) =
-                    if opts.hooks { ("Hooks that run", muted) } else { ("Hooks skipped", theme.warning) };
-                out = out.child(line(format!("{what}: {}", some_named(checked.hooks.iter().cloned())), color));
-            }
-            if opts.prune {
-                let text = if checked.pruned.is_empty() {
-                    "Nothing to prune.".to_string()
-                } else {
-                    format!("Prune deletes {}", all_named(&checked.pruned))
-                };
-                out = out.child(line(text, if checked.pruned.is_empty() { muted } else { theme.warning }));
+            let synced = r.request(opts).is_some();
+            for (text, warn) in checked_lines(checked, synced, opts, r.production.as_deref()) {
+                out = out.child(line(text, if warn { theme.warning } else { muted }));
             }
             return out;
         }
@@ -1037,5 +1054,42 @@ impl ArgoView {
             out = out.child(line(note.clone(), muted));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Checked, Options, Res, checked_lines};
+
+    /// An Application left as it is says so in one line: no hook is skipped and nothing is
+    /// pruned on it. One synced says what is applied and the hooks it skips or runs.
+    #[test]
+    fn hooks_are_skipped_only_where_something_is_synced() {
+        let hooks = vec!["PreSync Job shop/db-migrate".to_string()];
+        let checked = Checked { hooks, auto_sync: true, ..Default::default() };
+        let without = Options { hooks: false, prune: true, dry_run: false };
+        assert_eq!(
+            checked_lines(&checked, false, without, None),
+            [("Nothing out of sync: not synced · auto-sync on".to_string(), false)]
+        );
+        let res = Res { kind: "Deployment".into(), namespace: "shop".into(), name: "web".into(), ..Default::default() };
+        let synced = Checked { out_of_sync: vec![res], ..checked };
+        assert_eq!(
+            checked_lines(&synced, true, without, Some("production")),
+            [
+                ("Ready · auto-sync on · production environment".to_string(), false),
+                ("1 resource out of sync: Deployment shop/web".to_string(), false),
+                ("Hooks skipped: PreSync Job shop/db-migrate".to_string(), true),
+                ("Nothing to prune.".to_string(), false),
+            ]
+        );
+        let whole = Options { hooks: true, prune: false, dry_run: false };
+        assert_eq!(
+            checked_lines(&synced, true, whole, None),
+            [
+                ("Ready · auto-sync on".to_string(), false),
+                ("Hooks that run: PreSync Job shop/db-migrate".to_string(), false),
+            ]
+        );
     }
 }
