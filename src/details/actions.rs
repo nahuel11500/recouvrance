@@ -130,7 +130,7 @@ impl DetailPanel {
             "Suspend" => patch(serde_json::json!({"spec": {"suspend": true}})),
             "Resume" => patch(serde_json::json!({"spec": {"suspend": false}})),
             "Reconcile" => format!("annotate {kind} {name} --overwrite reconcile.fluxcd.io/requestedAt=$(date +%s)"),
-            "Refresh" => super::argo::refresh_args(&kind, &self.obj.name, false),
+            "Refresh" => format!("annotate {kind} {name} --overwrite argocd.argoproj.io/refresh=normal"),
             "Restart" => format!("rollout restart {kind}/{name}"),
             "Scale" => format!("scale {kind}/{name} --replicas=…"),
             "Delete" => format!("delete {kind} {name}"),

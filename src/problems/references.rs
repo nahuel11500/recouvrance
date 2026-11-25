@@ -889,7 +889,7 @@ fn problem(kind: &Kind, meta: &Meta, severity: Severity, reason: String) -> Opti
         name: meta.name()?.to_string(),
         reason,
         age: meta.created(),
-        on_hub: None,
+        on_argo: None,
     })
 }
 

@@ -178,10 +178,6 @@ impl AppView {
             this.show_detail_with(own_context.clone(), own_client.clone(), obj, window, cx);
         })
         .detach();
-        cx.subscribe_in(&panel, window, |this, _, ev: &crate::details::OpenOnContext, window, cx| {
-            this.show_detail_on(ev.context.clone(), ev.client.clone(), ev.obj.clone(), window, cx);
-        })
-        .detach();
         cx.subscribe_in(&panel, window, |this, _, ev: &crate::ui::argo::OpenArgoApp, window, cx| {
             this.show_argo_app(ev, window, cx);
         })
@@ -249,20 +245,14 @@ impl AppView {
         });
     }
 
-    /// Open an Argo CD Application from the Problems page: one read by Argo CD's API on the
-    /// Argo CD page's dashboard; one read on its hub there, with the client the hub was found
-    /// with, else connected anew (released with the page).
-    pub(super) fn follow_hub_links(
+    /// Open an Argo CD Application from the Problems page, on the Argo CD page's dashboard
+    /// (released with the page).
+    pub(super) fn follow_argo_links(
         &mut self,
         page: &Entity<crate::ui::problems_view::ProblemsView>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        cx.subscribe_in(page, window, |this, page, ev: &crate::details::OpenOn, window, cx| {
-            let own = k8s::argo::known_client(&ev.context).map(|client| (ev.context.clone(), client));
-            this.open_on(ev.context.clone(), ev.res.clone(), own, page.entity_id(), window, cx);
-        })
-        .detach();
         cx.subscribe_in(page, window, |this, _, ev: &crate::ui::argo::OpenArgoApp, window, cx| {
             this.show_argo_app(ev, window, cx);
         })

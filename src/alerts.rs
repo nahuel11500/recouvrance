@@ -516,7 +516,7 @@ pub fn problems(alerts: &[Alert], namespaces: &[String]) -> Vec<Problem> {
                 name: name.to_string(),
                 reason,
                 age: since,
-                on_hub: None,
+                on_argo: None,
             }
         })
         .collect()

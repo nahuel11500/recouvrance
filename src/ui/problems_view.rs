@@ -14,8 +14,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
-use crate::details::{OpenObject, OpenOn};
-use crate::k8s::argo::diagnosis::Res;
+use crate::details::OpenObject;
 use crate::k8s::lane::Lane;
 use crate::k8s::{self, Kind};
 use crate::problems::shared::{self, Ask, Found, Fresh};
@@ -113,7 +112,6 @@ pub struct ProblemsView {
 }
 
 impl EventEmitter<OpenObject> for ProblemsView {}
-impl EventEmitter<OpenOn> for ProblemsView {}
 impl EventEmitter<OpenArgoApp> for ProblemsView {}
 
 impl ProblemsView {
@@ -281,31 +279,19 @@ impl ProblemsView {
             namespace: p.namespace.clone(),
             context: Some(ctx.clone()),
         };
-        // An Argo CD Application read by Argo CD's API opens on the Argo CD page; one read on
-        // its hub opens there, which may not be connected.
-        let on_hub = p.on_hub.as_ref().map(|hub| match &hub.server {
-            Some(instance) => {
-                Err(OpenArgoApp { instance: instance.clone(), namespace: hub.namespace.clone(), name: p.name.clone() })
-            }
-            None => Ok(OpenOn {
-                context: hub.context.clone(),
-                res: Res {
-                    group: "argoproj.io".into(),
-                    kind: "Application".into(),
-                    namespace: hub.namespace.clone(),
-                    name: p.name.clone(),
-                    version: "v1alpha1".into(),
-                },
-            }),
+        // An Argo CD Application opens on the Argo CD page's dashboard.
+        let on_argo = p.on_argo.as_ref().map(|on| OpenArgoApp {
+            instance: on.instance.clone(),
+            namespace: on.namespace.clone(),
+            name: p.name.clone(),
         });
         cells(&theme, multi.then_some(ctx.as_str()), p, color)
             .id(("problem", i))
             // An alert about no object in particular has nothing to open.
             .when(!p.kind.is_empty(), |d| {
                 d.cursor_pointer().hover(|s| s.bg(theme.list_hover)).on_click(cx.listener(move |_, _, _, cx| {
-                    match &on_hub {
-                        Some(Ok(on)) => cx.emit(on.clone()),
-                        Some(Err(app)) => cx.emit(app.clone()),
+                    match &on_argo {
+                        Some(app) => cx.emit(app.clone()),
                         None => cx.emit(ev.clone()),
                     }
                 }))
@@ -580,7 +566,7 @@ mod tests {
             name: name.into(),
             reason: reason.into(),
             age: None,
-            on_hub: None,
+            on_argo: None,
         };
         let alert = p(Severity::Warning, "Pod alert", "pods", "monitoring", "prom-0", "NodeMemoryMajorPagesFaults");
         let svc = p(Severity::Warning, "Service", "services", "monitoring", "nginx", "selects no pod");
@@ -652,7 +638,7 @@ mod tests {
             name: name.into(),
             reason: "CrashLoopBackOff".into(),
             age: None,
-            on_hub: None,
+            on_argo: None,
         };
         let (found, errors) = super::merge(vec![
             ("one".into(), vec![problem(Severity::Warning, "w")], Some("Nodes (forbidden)".into())),
@@ -689,7 +675,7 @@ mod layout_tests {
                 name: "fraud-check-b668cf779-k6km9".into(),
                 reason: "0 of 1 replicas available".into(),
                 age: None,
-                on_hub: None,
+                on_argo: None,
             };
             let ctx = self.several.then_some("kind-staging");
             div().w(px(self.width)).child(super::cells(&theme, ctx, &p, theme.warning))
