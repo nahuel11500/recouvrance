@@ -76,9 +76,10 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nahuel11500/recouvrance
 recouvrance-update      # later: installs the latest release
 ```
 
-Windows (x86_64) is a preview: it is built and unit-tested in CI but not yet tried end to end
-([#1021](https://github.com/nahuel11500/recouvrance/issues/1021)), and the link below works from the
-first release that includes Windows. Plugins need an `sh`, such as Git for Windows'. In PowerShell:
+Windows (x86_64) is experimental: it is built and tested in CI, but nobody has used it on a real
+Windows machine yet. If you do, please say what works and what doesn't in
+[#1021](https://github.com/nahuel11500/recouvrance/issues/1021). The link below works from the first
+release that includes Windows. Plugins need an `sh`, such as Git for Windows'. In PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/nahuel11500/recouvrance/releases/latest/download/recouvrance-installer.ps1 | iex"
