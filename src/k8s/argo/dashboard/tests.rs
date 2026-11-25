@@ -8,6 +8,7 @@ use super::{
     managed_path, problems_from_status, problems_from_tree, remember, revision_path, source_images, split_image, state,
     tree_path, versions, who,
 };
+use crate::k8s::argo::server::Login;
 use crate::status::Tone;
 
 fn now() -> Timestamp {
@@ -341,6 +342,43 @@ fn deployed_names_each_source_with_its_revision() {
     let (sources, version) = deployed(&fresh);
     assert_eq!((sources.len(), version), (1, None));
     assert_eq!(sources[0].repo, "https://git.example.com/shop/deploy.git");
+}
+
+/// Argo CD's API sends `"source": {"repoURL": ""}` next to `sources` on an Application with
+/// several: the chart's version is still known as one, and no commit is asked for it (#1071).
+#[test]
+fn a_chart_version_among_several_sources_is_never_asked_for_its_commit() {
+    let sources = json!([
+        {"repoURL": "https://git.example.com/config.git", "targetRevision": "HEAD", "ref": "configs"},
+        {"repoURL": "https://charts.example.com", "targetRevision": "0.35.0", "chart": "web"},
+    ]);
+    let mut a = app("example-staging");
+    a["status"]["history"] = json!([{
+        "id": 3, "revisions": ["abc123", "0.35.0"], "source": {"repoURL": ""}, "sources": sources,
+    }]);
+    let (got, _) = deployed(&a);
+    let charts: Vec<(&str, Option<&str>)> = got.iter().map(|d| (d.revision.as_str(), d.chart.as_deref())).collect();
+    assert_eq!(charts, [("abc123", None), ("0.35.0", Some("web"))]);
+    // Nothing deployed yet: the spec has the same empty `source`.
+    let mut fresh = app("example-staging");
+    fresh["status"]["history"] = json!([]);
+    fresh["spec"]["source"] = json!({"repoURL": ""});
+    fresh["spec"]["sources"] = sources;
+    fresh["status"]["sync"] = json!({"revisions": ["abc123", "0.35.0"]});
+    let (got, _) = deployed(&fresh);
+    assert_eq!(got.iter().map(|d| d.chart.as_deref()).collect::<Vec<_>>(), [None, Some("web")]);
+
+    let asked = std::sync::Mutex::new(Vec::new());
+    let get = |path: String| {
+        asked.lock().unwrap().push(path);
+        async { Ok::<_, String>(json!({"message": "a commit"})) }
+    };
+    let diff_of = |v: &Value| crate::k8s::argo::server::diffs(v, "argocd.example.com".into(), Login::Cli);
+    let read = futures::executor::block_on(super::extras("argocd.example.com", "argocd", "web-1071", a, get, diff_of));
+    let revisions: Vec<String> =
+        asked.into_inner().unwrap().into_iter().filter(|p| p.contains("/revisions/")).collect();
+    assert_eq!(revisions, [revision_path("argocd", "web-1071", "abc123", Some(0), Some(3))]);
+    assert!(read.commits[0].is_some() && read.commits[1].is_none());
 }
 
 #[test]
