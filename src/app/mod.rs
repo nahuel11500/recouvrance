@@ -517,7 +517,8 @@ pub struct AppView {
     conn: conn::ConnStates,
     /// What the bar above the list says of the connect besides each context's state (a
     /// namespace list that failed, the kubeconfig that can't be read).
-    connect_notes: Option<SharedString>,
+    /// Kept with full names: the status line names each context as the screen does.
+    connect_notes: Vec<String>,
     /// The add-on API groups a connected cluster couldn't read (`k8s::SkippedGroup`), until
     /// the next connect: by cluster, for the status line, and their names.
     skipped: Vec<(String, Vec<k8s::SkippedGroup>)>,
@@ -562,7 +563,7 @@ impl AppView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (contexts, current, status) = match k8s::load_contexts() {
             Ok(c) => (c.names, dev_var("RECOUVRANCE_CONTEXT").or(c.current), None),
-            Err(e) => (Vec::new(), None, Some(format!("{e:#}").into())),
+            Err(e) => (Vec::new(), None, Some(SharedString::from(format!("{e:#}")))),
         };
         // One store for every window: a window never saves over the stars of another.
         let favorites = crate::favorites::shared(cx);
@@ -806,7 +807,7 @@ impl AppView {
             forwards_open: false,
             table,
             // A kubeconfig that can't be read shows where connect errors do.
-            connect_notes: status.clone(),
+            connect_notes: status.iter().map(SharedString::to_string).collect(),
             connect_errors: status,
             conn: conn::ConnStates::default(),
             skipped_groups: HashSet::new(),
@@ -988,13 +989,30 @@ fn notify_desktop(title: &str, body: &str) {
     if body.chars().count() > 200 {
         body = body.chars().take(200).collect::<String>() + "…";
     }
+    #[cfg(windows)]
+    {
+        // A native toast. Recouvrance has no registered AppUserModelID (it is not installed
+        // through an MSIX package), so the toast is shown under PowerShell's, which Windows
+        // always knows; PowerShell itself is not started. The text is set through the XML DOM,
+        // so an agent's text cannot change the toast's markup. Showing it is a blocking WinRT
+        // call: it runs off the UI thread.
+        let title = title.to_string();
+        std::thread::spawn(move || {
+            use tauri_winrt_notification::{Duration, Toast};
+            if let Err(e) =
+                Toast::new(Toast::POWERSHELL_APP_ID).title(&title).text1(&body).duration(Duration::Long).show()
+            {
+                eprintln!("recouvrance: desktop notification failed: {e}");
+            }
+        });
+    }
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut cmd = std::process::Command::new("osascript");
         cmd.args(osascript_args(title, &body));
         cmd
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let mut cmd = {
         let mut cmd = std::process::Command::new("notify-send");
         // `--`: a title or body starting with '-' (an agent's text) is never read as an option.
@@ -1008,6 +1026,7 @@ fn notify_desktop(title: &str, body: &str) {
         ]);
         cmd
     };
+    #[cfg(not(windows))]
     crate::forwards::spawn_reaped(cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()));
 }
 

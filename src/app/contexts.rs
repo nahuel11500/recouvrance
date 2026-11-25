@@ -79,7 +79,7 @@ impl AppView {
         self.search_index.clear();
         // Each context says it is connecting where the list goes (see `render_connect`).
         self.connect_errors = None;
-        self.connect_notes = None;
+        self.connect_notes = Vec::new();
         self.conn = super::conn::ConnStates::connecting(&contexts);
         self.conn_changed(cx);
         self.skipped.clear();
@@ -317,7 +317,7 @@ impl AppView {
                         // Each context says why it failed where the list goes; one that has
                         // no reason of its own (it served no API) takes the connect's.
                         this.conn.give_up(&contexts, &k8s::short_error(&e));
-                        this.connect_notes = None;
+                        this.connect_notes = Vec::new();
                         if let Some(favorite) = this.after_connect.take() {
                             window.push_notification(
                                 Notification::warning(format!(
@@ -564,19 +564,25 @@ fn merge_kinds(
 
 /// What the status line says of the add-on APIs that couldn't be read: their types may be
 /// missing from the sidebar (or listed as last known), for now, not gone. Each is named with
-/// its cluster whenever more than one is `connected`, even when only one skipped some.
-pub(super) fn skipped_notice(skipped: &[(String, Vec<k8s::SkippedGroup>)], connected: usize) -> Option<SharedString> {
+/// its cluster whenever more than one is `connected`, even when only one skipped some, by
+/// `name`: its short name on screen, as the other per-context lines say it, the full one in
+/// the hover.
+pub(super) fn skipped_notice(
+    skipped: &[(String, Vec<k8s::SkippedGroup>)],
+    connected: usize,
+    name: &dyn Fn(&str) -> String,
+) -> Option<String> {
     if skipped.is_empty() {
         return None;
     }
     let parts: Vec<String> = (skipped.iter())
-        .map(|(name, groups)| {
+        .map(|(ctx, groups)| {
             let groups = k8s::describe_skipped(groups);
-            if connected > 1 { format!("{name}: {groups}") } else { groups }
+            if connected > 1 { format!("{}: {groups}", name(ctx)) } else { groups }
         })
         .collect();
     let parts = parts.join("; ");
-    Some(format!("Add-on APIs that couldn't be read, their types may be missing or out of date: {parts}").into())
+    Some(format!("Add-on APIs that couldn't be read, their types may be missing or out of date: {parts}"))
 }
 
 /// The kinds the cluster at `ix` serves added to `kinds`, and where each exists: a cluster
@@ -706,18 +712,35 @@ mod tests {
         let argo = SkippedGroup { group: "argoproj.io".into(), error: "argoproj.io/v1alpha1: 503".into() };
         let skipped = vec![("staging".to_string(), vec![argo])];
         // One cluster connected: no name needed.
-        let notice = skipped_notice(&skipped, 1).unwrap();
+        let full = |c: &str| c.to_string();
+        let notice = skipped_notice(&skipped, 1, &full).unwrap();
         assert!(notice.contains("argoproj.io (argoproj.io/v1alpha1: 503)"), "{notice}");
         assert!(!notice.contains("staging:"), "{notice}");
         // prod and staging connected, only staging skipped: staging is named.
-        let notice = skipped_notice(&skipped, 2).unwrap();
+        let notice = skipped_notice(&skipped, 2, &full).unwrap();
         assert!(notice.contains("staging: argoproj.io"), "{notice}");
         assert!(!notice.contains("prod"), "{notice}");
         // Both skipped: each named.
         let two = [skipped[0].clone(), ("prod".to_string(), skipped[0].1.clone())];
-        let notice = skipped_notice(&two, 2).unwrap();
+        let notice = skipped_notice(&two, 2, &full).unwrap();
         assert!(notice.contains("staging: argoproj.io") && notice.contains("prod: argoproj.io"), "{notice}");
-        assert!(skipped_notice(&[], 2).is_none());
+        assert!(skipped_notice(&[], 2, &full).is_none());
+    }
+
+    /// Each cluster is named as `name` says (its short name on screen), not by its full name.
+    #[test]
+    fn skipped_groups_name_clusters_by_their_short_name() {
+        use crate::k8s::SkippedGroup;
+        let eks = "arn:aws:eks:eu-west-1:111111111111:cluster/shop";
+        let gke = "gke_proj-a_europe-west1-b_shop";
+        let broken = SkippedGroup { group: "broken.qa.example.com".into(), error: "503".into() };
+        let skipped = vec![(eks.to_string(), vec![broken.clone()]), (gke.to_string(), vec![broken])];
+        let short = crate::k8s::short_names::short_names(&[eks.to_string(), gke.to_string()]);
+        let name = |c: &str| short.get(c).cloned().unwrap_or_else(|| c.to_string());
+        let notice = skipped_notice(&skipped, 2, &name).unwrap();
+        assert!(notice.contains("shop (eu-west-1): broken.qa.example.com"), "{notice}");
+        assert!(notice.contains("shop (europe-west1-b): broken.qa.example.com"), "{notice}");
+        assert!(!notice.contains("arn:aws") && !notice.contains("gke_"), "{notice}");
     }
 
     /// A live tab on a type of a group that stops answering (a reconnect of the same set, no
