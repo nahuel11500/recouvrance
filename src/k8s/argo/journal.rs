@@ -131,7 +131,7 @@ pub struct Record {
     /// When this state was seen, in seconds (not part of the state).
     #[serde(default)]
     pub seen: i64,
-    /// Its Argo CD (`grouping::hub_instance` or `server_instance`).
+    /// Its Argo CD (`grouping::server_instance`).
     #[serde(default)]
     pub instance: String,
     #[serde(default)]

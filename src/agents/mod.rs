@@ -748,12 +748,9 @@ impl Render for AgentsView {
     }
 }
 
-/// Where Argo CD itself is, for the rule editor's flag: the servers set or logged in to, and
-/// the hub contexts named in Settings (Argo CD contexts, each context's Argo CD server).
+/// Where Argo CD itself is, for the rule editor's flag: the servers set or logged in to.
 fn argo_homes() -> Vec<String> {
-    let mut homes: Vec<String> =
-        crate::settings::with(|s| s.argocd_contexts.iter().cloned().chain(s.argocd_servers.keys().cloned()).collect());
-    homes.extend(k8s::argo::api::endpoints().list.iter().map(k8s::argo::api::Endpoint::name));
+    let mut homes: Vec<String> = k8s::argo::api::endpoints().list.iter().map(k8s::argo::api::Endpoint::name).collect();
     homes.sort();
     homes.dedup();
     homes

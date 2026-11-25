@@ -133,7 +133,7 @@ impl Endpoint {
         self.login.as_ref().ok().and_then(|(t, _)| server::token_user(&t.0))
     }
 
-    /// The same Argo CD as a hub whose server is this one (see `grouping::hub_instance`).
+    /// Its Argo CD, as Applications and favorites are keyed (`grouping::server_instance`).
     pub fn instance(&self) -> String {
         super::grouping::server_instance(&self.server.base)
     }
@@ -1665,13 +1665,12 @@ fn sync_body(mut body: Value, req: &super::ops::SyncRequest) -> Value {
     body
 }
 
-/// The context whose read-only setting refuses a write to `endpoint`, if one does: a hub
-/// context tied to this server (Settings → Per cluster) is the same Argo CD, so its setting
-/// counts though the write goes through the API; else the server's name, as its protection
-/// is keyed.
+/// The name whose read-only setting refuses a write to `endpoint`, if it does: the server's
+/// own, as its protection is keyed (a hub context's, set read-only before, was carried over
+/// to its server when the settings were read; see `settings::carry_argo_read_only`).
 pub fn read_only(endpoint: &Endpoint) -> Option<String> {
-    let servers = crate::settings::with(|s| s.argocd_servers.clone());
-    server::read_only_context(&servers, &endpoint.server.base, &endpoint.name(), crate::settings::is_read_only)
+    let name = endpoint.name();
+    crate::settings::is_read_only(&name).then_some(name)
 }
 
 /// Ask Argo CD for `action` on the Application `namespace/name`, by its API, with the
@@ -1753,12 +1752,7 @@ const DRY_RUN_WAIT: Duration = Duration::from_secs(30);
 /// hub context tied to it) is set read-only. Write mode is the window's: it doesn't gate
 /// agents, whose rules decide.
 pub fn agent_refusal(endpoint: &Endpoint) -> Option<String> {
-    let name = endpoint.name();
-    match read_only(endpoint) {
-        Some(c) => Some(crate::k8s::gate::read_only_refusal(&c)),
-        None if crate::settings::is_read_only(&name) => Some(crate::k8s::gate::read_only_refusal(&name)),
-        None => None,
-    }
+    read_only(endpoint).map(|name| crate::k8s::gate::read_only_refusal(&name))
 }
 
 /// An agent's `action` on the Application `namespace/name`, by Argo CD's API with the

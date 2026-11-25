@@ -446,13 +446,6 @@ pub struct Settings {
     pub clusters: std::collections::HashMap<String, ClusterSettings>,
     /// Folders whose kubeconfig files are all merged (watched for changes).
     pub kubeconfig_folders: Vec<String>,
-    /// Contexts Argo CD's Applications are read from. Empty: found on their own, among the
-    /// connected clusters first, then the kubeconfig's other contexts.
-    pub argocd_contexts: Vec<String>,
-    /// The Argo CD API server of a hub context (`https://argocd.example.com`), to read Argo
-    /// CD's own diff from. None set: that diff is off, nothing is sent to Argo CD.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "string_entries")]
-    pub argocd_servers: std::collections::BTreeMap<String, String>,
     /// Argo CD API servers read on the Argo CD page with no kubeconfig for their cluster,
     /// added in Settings → Argo CD (`https://argocd.example.com`); their tokens are kept in
     /// `argocd-api-tokens.json`. The argocd CLI's servers are read too.
@@ -703,8 +696,6 @@ impl Default for Settings {
             extra_namespaces: Default::default(),
             clusters: Default::default(),
             kubeconfig_folders: Vec::new(),
-            argocd_contexts: Vec::new(),
-            argocd_servers: Default::default(),
             argocd_api_servers: Vec::new(),
             argocd_api_off: Vec::new(),
             argocd_env_types: Vec::new(),
@@ -783,6 +774,33 @@ fn load_from(p: &Path) -> (Settings, Option<String>) {
 /// protection choices were lost with it. Read-only choices lost with it set
 /// `read_only_unset`, so every context without one is read-only.
 fn from_bytes(bytes: &[u8]) -> (Settings, Option<serde_json::Error>, bool) {
+    let (mut settings, error, lost) = read_bytes(bytes);
+    carry_argo_read_only(&mut settings, bytes);
+    (settings, error, lost)
+}
+
+/// A hub context set read-only protected the Argo CD server set for it (the old
+/// `argocd_servers`, Settings → Per cluster), whose writes went through the hub. Argo CD is
+/// now written only through its API, where a server's own protection counts (by its name):
+/// each server of an entry whose hub is read-only (or whose protection is unknown) is made
+/// read-only, never the other way. An entry that doesn't read is left alone, as it was
+/// ignored before. The old key is not written again: it goes at the next save, the servers
+/// made read-only with it.
+fn carry_argo_read_only(s: &mut Settings, bytes: &[u8]) {
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice::<serde_json::Value>(bytes) else { return };
+    let Some(servers) = fields.get("argocd_servers").and_then(serde_json::Value::as_object) else { return };
+    for (hub, text) in servers {
+        let Some(server) = text.as_str().and_then(|t| crate::k8s::argo::server::Server::parse(t).ok()) else {
+            continue;
+        };
+        if read_only_in(s, hub, false) {
+            s.read_only.insert(server.name(), true);
+        }
+    }
+}
+
+/// Settings from the file's bytes as they read, the old keys aside (see [`from_bytes`]).
+fn read_bytes(bytes: &[u8]) -> (Settings, Option<serde_json::Error>, bool) {
     match serde_json::from_slice(bytes) {
         Ok(v) => (v, None, false),
         Err(e) => {
@@ -1837,7 +1855,51 @@ mod properties {
         })
     }
 
+    /// An old `argocd_servers` value: an address, or one that doesn't read.
+    fn old_server() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            "[a-c]".prop_map(|h| json!(format!("https://argocd-{h}.example.com"))),
+            Just(json!("http://far.example.com")),
+            Just(json!(7)),
+            Just(json!(null)),
+        ]
+    }
+
     proptest! {
+        /// The old per-cluster Argo CD servers are read once: a server whose hub is
+        /// read-only (or whose protection is unknown) becomes read-only, one already
+        /// read-only stays so, one that doesn't read changes nothing, and nothing else is
+        /// less protected than before. The old keys are never written back.
+        #[test]
+        fn a_read_only_hub_s_argo_cd_server_stays_read_only(
+            read_only in prop::collection::btree_map("[a-c]|argocd-[a-c]\\.example\\.com", any::<bool>(), 0..6),
+            servers in prop::collection::btree_map("[a-c]", old_server(), 0..4),
+            unset in any::<bool>(),
+            contexts in prop::collection::vec("[a-c]", 0..3),
+        ) {
+            let mut text = json!({"read_only": read_only, "argocd_servers": servers, "argocd_contexts": contexts});
+            if unset {
+                text["read_only"] = json!("spoiled");
+            }
+            let bytes = serde_json::to_vec(&text).unwrap();
+            let (before, _, _) = super::read_bytes(&bytes);
+            let (after, _, _) = from_bytes(&bytes);
+            let ro = |s: &Settings, c: &str| super::read_only_in(s, c, false);
+            for (hub, v) in &servers {
+                let Some(name) = v.as_str().and_then(|t| crate::k8s::argo::server::Server::parse(t).ok()).map(|s| s.name()) else { continue };
+                if ro(&before, hub) {
+                    prop_assert!(ro(&after, &name), "{hub} is read-only, {name} isn't");
+                }
+            }
+            for c in ["a", "b", "c", "argocd-a.example.com", "argocd-b.example.com", "argocd-c.example.com", "far.example.com"] {
+                prop_assert!(!ro(&before, c) || ro(&after, c), "{c} lost its protection");
+                let made = servers.iter().any(|(hub, v)| ro(&before, hub) && v.as_str().is_some_and(|t| t.contains(c)) && c.starts_with("argocd-"));
+                prop_assert_eq!(ro(&after, c), ro(&before, c) || made, "{}", c);
+            }
+            let saved = serde_json::to_value(&after).unwrap();
+            prop_assert!(saved.get("argocd_servers").is_none() && saved.get("argocd_contexts").is_none());
+        }
+
         /// Spoiling some fields keeps every other one as it was, protection included.
         #[test]
         fn a_bad_field_costs_only_itself(

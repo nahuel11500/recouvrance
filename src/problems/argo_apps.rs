@@ -230,17 +230,12 @@ pub async fn scan(context: String, client: Client, serves: bool, namespaces: Vec
     let here = argo::target(&targets, &context);
     let mut scan = Scan::default();
     if let Some(endpoints) = api_servers(api::endpoints().list) {
-        let servers = crate::settings::with(|s| s.argocd_servers.clone());
         let reads = futures::future::join_all(endpoints.iter().map(server_apps)).await;
         for (endpoint, read) in endpoints.iter().zip(reads) {
             let name = endpoint.name();
             match read {
                 Ok(apps) => {
-                    let home = Home {
-                        name,
-                        target: argo::server_home(&servers, &endpoint.server.base, &targets),
-                        server: Some(endpoint.instance()),
-                    };
+                    let home = Home { name, target: ContextTarget::default(), server: Some(endpoint.instance()) };
                     scan.problems.extend(found_on(&apps, &home, &here, &namespaces, now));
                 }
                 Err(why) => scan.skipped.push((format!("{CHECK} on {name}"), anyhow::anyhow!(why))),

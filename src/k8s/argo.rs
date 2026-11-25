@@ -714,10 +714,6 @@ pub async fn hubs(connected: Vec<(String, Client)>) -> Hubs {
     static SEARCH: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
     super::run(async move {
         let _one = SEARCH.lock().await;
-        let chosen = crate::settings::with(|s| s.argocd_contexts.clone());
-        if !chosen.is_empty() {
-            return Ok(hubs_of(probe_all(chosen, &connected).await, &connected));
-        }
         let names: Vec<String> = connected.iter().map(|(n, _)| n.clone()).collect();
         let open = hubs_of(probe_all(names.clone(), &connected).await, &connected);
         if !open.found.is_empty() {
@@ -962,21 +958,16 @@ pub fn problem_hubs(context: &str, client: &Client, serves: bool) -> Vec<Hub> {
     if serves || known_client(context).is_some() {
         found.push(Hub { context: context.to_string(), client: client.clone() });
     }
-    let (chosen, servers) = crate::settings::with(|s| (s.argocd_contexts.clone(), s.argocd_servers.clone()));
-    if !chosen.is_empty() {
-        found.retain(|h| chosen.contains(&h.context));
-    }
     if found.is_empty() {
         return found;
     }
     // The cluster scanned first, with its own client.
     found.sort_by_cached_key(|h| (h.context != context, h.context.clone()));
     let targets = targets();
-    let (mut instances, mut clusters) = (std::collections::HashSet::new(), Vec::<ContextTarget>::new());
+    let mut clusters = Vec::<ContextTarget>::new();
     found.retain(|h| {
         let t = target(&targets, &h.context);
-        let new = !clusters.iter().any(|c| same_cluster(c, &t))
-            && instances.insert(grouping::hub_instance(&h.context, &servers));
+        let new = !clusters.iter().any(|c| same_cluster(c, &t));
         clusters.push(t);
         new
     });
@@ -1145,11 +1136,10 @@ pub async fn api_candidates(
     let name = obj.pointer("/metadata/name").and_then(Value::as_str).unwrap_or_default();
     let targets = targets();
     let here = target(&targets, here);
-    let servers = crate::settings::with(|s| s.argocd_servers.clone());
-    let at = |e: &api::Endpoint| server_home(&servers, &e.server.base, &targets);
+    let at = |_: &api::Endpoint| &*API_HOME;
     let held = api::held_apps(use_server, start, API_WAIT, |e, a| {
         names_app(by, &a.summary)
-            && (matches!(by, TrackedBy::Id(_)) || app_deploys_to(&a.value, &at(e), &here) != Some(false))
+            && (matches!(by, TrackedBy::Id(_)) || app_deploys_to(&a.value, at(e), &here) != Some(false))
     })
     .await;
     if held.is_empty() {
@@ -1191,7 +1181,7 @@ pub async fn api_candidates(
                 held.value.clone()
             }
         };
-        let here = app_deploys_to(&app, &at(&endpoint), &here);
+        let here = app_deploys_to(&app, at(&endpoint), &here);
         let tracks = resource_of(&app, group, kind, ns, name).is_some();
         found.push(ApiCandidate { endpoint, app, here, tracks });
     }
@@ -1342,15 +1332,11 @@ pub async fn for_namespace(connected: Vec<(String, Client)>, here: String, ns: S
 async fn api_namespace_lookup(here: &str, ns: &str) -> Option<Lookup> {
     let targets = targets();
     let here = target(&targets, here);
-    let servers = crate::settings::with(|s| s.argocd_servers.clone());
     let held = api::held_apps(
         |_| true,
         true,
         API_WAIT,
-        |e, a| {
-            targets_namespace(&a.value, ns)
-                && targets_cluster(&a.value, &server_home(&servers, &e.server.base, &targets), &here)
-        },
+        |_, a| targets_namespace(&a.value, ns) && targets_cluster(&a.value, &API_HOME, &here),
     )
     .await;
     if held.is_empty() {
@@ -1577,25 +1563,16 @@ impl Fleet {
     }
 }
 
-/// The cluster an Argo CD API server at `base` runs on, which its Applications' `in-cluster`
-/// destination is: the hub context whose Argo CD server it is (`servers`), if one is set;
-/// else none, which no context matches.
-pub fn server_home(
-    servers: &std::collections::BTreeMap<String, String>,
-    base: &str,
-    targets: &[ContextTarget],
-) -> ContextTarget {
-    server::contexts_of(servers, base).next().map_or_else(ContextTarget::default, |c| target(targets, c))
+/// The contexts among `targets` that reach the destination of `app`, read by Argo CD's API.
+/// Its `in-cluster` is the cluster Argo CD runs on, which no context is known to be.
+pub fn api_contexts(app: &Summary, targets: &[ContextTarget]) -> Vec<String> {
+    let (server, name) = (Some(app.dest_server.as_str()), Some(app.dest_name.as_str()));
+    targets.iter().filter(|t| deploys_to(server, name, &API_HOME, t)).map(|t| t.name.clone()).collect()
 }
 
-/// The contexts among `targets` that reach the destination of `app`, read from `endpoint`:
-/// its `in-cluster` is the cluster that server runs on, when known (`server_home`).
-pub fn api_contexts(endpoint: &api::Endpoint, app: &Summary, targets: &[ContextTarget]) -> Vec<String> {
-    let servers = crate::settings::with(|s| s.argocd_servers.clone());
-    let home = server_home(&servers, &endpoint.server.base, targets);
-    let (server, name) = (Some(app.dest_server.as_str()), Some(app.dest_name.as_str()));
-    targets.iter().filter(|t| deploys_to(server, name, &home, t)).map(|t| t.name.clone()).collect()
-}
+/// The cluster an Argo CD read by its API runs on, as its `in-cluster` destination: not known
+/// to be any context of the kubeconfig, so it matches none.
+static API_HOME: LazyLock<ContextTarget> = LazyLock::new(ContextTarget::default);
 
 /// What a page has read of one Argo CD API server.
 pub struct ApiRead {
@@ -1641,14 +1618,8 @@ fn named_contexts(
 }
 
 /// Every Application read by Argo CD's API, each server's under the app of apps that made it.
-/// `targets` are the kubeconfig's contexts, `connected` those connected, `servers` each hub
-/// context's Argo CD server (`argocd_servers`), which says the cluster `in-cluster` is.
-pub fn from_api(
-    reads: Vec<ApiRead>,
-    targets: &[ContextTarget],
-    connected: &[String],
-    servers: &std::collections::BTreeMap<String, String>,
-) -> Fleet {
+/// `targets` are the kubeconfig's contexts, `connected` those connected.
+pub fn from_api(reads: Vec<ApiRead>, targets: &[ContextTarget], connected: &[String]) -> Fleet {
     let mut fleet = Fleet::default();
     for read in reads {
         let endpoint = read.endpoint;
@@ -1667,13 +1638,13 @@ pub fn from_api(
         if let Some(p) = read.state.projects {
             fleet.projects.insert(instance.clone(), p);
         }
-        let hub = server_home(servers, &endpoint.server.base, targets);
+        let hub = &*API_HOME;
         let mut apps: Vec<&Arc<api::ApiApp>> = read.state.apps.values().collect();
         apps.sort_by(|a, b| (&a.summary.namespace, &a.summary.name).cmp(&(&b.summary.namespace, &b.summary.name)));
         let values: Vec<&Value> = apps.iter().map(|a| &a.value).collect();
         let base = fleet.apps.len();
         for (a, parent) in apps.iter().zip(parents(values.as_slice())) {
-            let mut dest = destination(&a.value, &hub, targets);
+            let mut dest = destination(&a.value, hub, targets);
             let cluster = cluster_name(&a.summary.dest_name, &a.summary.dest_server, &read.state.clusters);
             if dest.contexts.is_empty() {
                 dest.contexts = named_contexts(&a.summary.dest_server, &read.state.clusters, targets);
@@ -1813,7 +1784,7 @@ mod tests {
                 state: feed(vec![api_app("argocd", "root", None), api_app("argocd", "zchild", Some("root"))], None),
             },
         ];
-        let fleet = from_api(reads, &[], &[], &Default::default());
+        let fleet = from_api(reads, &[], &[]);
         let names: Vec<(&str, Option<usize>)> = fleet.apps.iter().map(|a| (a.app.name.as_str(), a.parent)).collect();
         assert_eq!(names, [("child", Some(2)), ("leaf", Some(0)), ("root", None), ("root", None), ("zchild", Some(3))]);
         assert_eq!(fleet.servers.len(), 2);
@@ -1854,7 +1825,7 @@ mod tests {
                 exec: None,
             },
         ];
-        let fleet = from_api(vec![ApiRead { endpoint: source, state }], &targets, &[], &Default::default());
+        let fleet = from_api(vec![ApiRead { endpoint: source, state }], &targets, &[]);
         let rows: Vec<(&str, &str, Option<&str>)> =
             fleet.apps.iter().map(|a| (a.app.name.as_str(), a.cluster.as_str(), a.on.as_deref())).collect();
         assert_eq!(rows, [("a", "prod", Some("prod")), ("b", "in-cluster", None), ("c", "other.example", None)]);
@@ -1866,8 +1837,7 @@ mod tests {
         let (one, two) = (endpoint("https://argocd.example.com"), endpoint("https://argocd.example.org"));
         let pending = ApiRead { endpoint: one.clone(), state: api::FeedState::default() };
         let failed = api::FeedState { error: Some("HTTP 401".into()), ..Default::default() };
-        let fleet =
-            from_api(vec![pending, ApiRead { endpoint: two.clone(), state: failed }], &[], &[], &Default::default());
+        let fleet = from_api(vec![pending, ApiRead { endpoint: two.clone(), state: failed }], &[], &[]);
         // The one that failed says why instead.
         assert_eq!(fleet.reading, [one.name()]);
 
@@ -1876,7 +1846,7 @@ mod tests {
         let a = api_app("argocd", "web", None);
         listed.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
         let pending = ApiRead { endpoint: one.clone(), state: api::FeedState::default() };
-        let fleet = from_api(vec![ApiRead { endpoint: two, state: listed }, pending], &[], &[], &Default::default());
+        let fleet = from_api(vec![ApiRead { endpoint: two, state: listed }, pending], &[], &[]);
         assert_eq!((fleet.apps.len(), fleet.reading), (1, vec![one.name()]));
     }
 

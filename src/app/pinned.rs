@@ -22,8 +22,11 @@ pub(super) enum Standing {
     /// Its context isn't connected: an object or Application opens on it without connecting
     /// it, a namespace adds it to the contexts connected.
     Elsewhere,
-    /// An Application known only by its Argo CD API server: it opens on the Argo CD page.
+    /// An Argo CD Application: it opens on the Argo CD page's dashboard.
     ArgoApi,
+    /// An Application starred by its hub context that no connected Argo CD server lists yet:
+    /// it is kept, and takes the server's name once exactly one lists it.
+    ArgoUnresolved,
     /// Its context is no longer in the kubeconfig.
     ContextGone,
     /// A namespace its connected contexts don't list (it may be one they can't list).
@@ -37,6 +40,7 @@ impl Standing {
             Self::Here => None,
             Self::Elsewhere => Some("not connected"),
             Self::ArgoApi => Some("through Argo CD's API"),
+            Self::ArgoUnresolved => Some("not found on a connected Argo CD"),
             Self::ContextGone => Some("context gone from the kubeconfig"),
             Self::NamespaceGone => Some("namespace not listed"),
         }
@@ -51,6 +55,9 @@ impl Standing {
 /// Where `favorite` stands, given the contexts of the kubeconfig (`all`), those connected and
 /// the namespaces they list (`namespaces`, listed or added by hand).
 pub(super) fn standing(favorite: &Favorite, all: &[String], connected: &[String], namespaces: &[String]) -> Standing {
+    if let Favorite::Application(a) = favorite {
+        return if a.unresolved() { Standing::ArgoUnresolved } else { Standing::ArgoApi };
+    }
     let Some(context) = favorite.context() else { return Standing::ArgoApi };
     if !all.iter().any(|c| c == context) {
         return Standing::ContextGone;
@@ -101,15 +108,10 @@ impl AppView {
             window.push_notification(Notification::warning(text), cx);
         };
         let standing = self.favorite_standings(std::slice::from_ref(&favorite), cx)[0];
-        let Some(context) = favorite.context().map(String::from) else {
-            // Read through Argo CD's API only: the Argo CD page lists it, its favorites first.
-            window.push_notification(
-                Notification::info(format!("{title} is read through Argo CD's API: it is on the Argo CD page")),
-                cx,
-            );
-            self.open_argo(window, cx);
-            return;
-        };
+        if let Favorite::Application(app) = favorite {
+            return self.open_favorite_app(app, window, cx);
+        }
+        let Some(context) = favorite.context().map(String::from) else { return };
         if standing == Standing::ContextGone {
             return warn(format!("{title}: the context {context} is no longer in the kubeconfig"), window, cx);
         }
@@ -139,15 +141,7 @@ impl AppView {
                 // Set after `connect_many`, which drops one left by an earlier connect.
                 self.after_connect = Some(favorite);
             }
-            Favorite::Application(app) => {
-                let kind = k8s::argo::application_kind();
-                if let Some(ix) = at {
-                    let obj = ObjectRef { kind, name: app.name, namespace: Some(app.namespace), uid: String::new() };
-                    self.show_detail_in(ix, obj, window, cx);
-                } else {
-                    self.open_elsewhere(context, Ok(kind), app.name, Some(app.namespace), window, cx);
-                }
-            }
+            Favorite::Application(_) => {}
             Favorite::Object(o) => {
                 let Some(ix) = at else {
                     // Its kind as that context serves it: looked up there once connected.
@@ -159,6 +153,70 @@ impl AppView {
                 self.open_object_in(ix, &o.kind, o.name, o.namespace, window, cx);
             }
         }
+    }
+
+    /// Open a starred Application on the Argo CD page's dashboard, through Argo CD's API. One
+    /// starred by its hub context is first looked for in the servers' feeds: the one server
+    /// that lists it becomes its name (the favorite is rewritten, see `favorites::adopted`);
+    /// none or several is said, and the favorite stays as it is.
+    fn open_favorite_app(&mut self, app: crate::favorites::FavApp, window: &mut Window, cx: &mut Context<Self>) {
+        let open = |this: &mut Self,
+                    instance: String,
+                    app: &crate::favorites::FavApp,
+                    window: &mut Window,
+                    cx: &mut Context<Self>| {
+            let ev =
+                crate::ui::argo::OpenArgoApp { instance, namespace: app.namespace.clone(), name: app.name.clone() };
+            this.show_argo_app(&ev, window, cx);
+        };
+        if !app.unresolved() {
+            return open(self, app.argocd.clone(), &app, window, cx);
+        }
+        let (ns, name) = (app.namespace.clone(), app.name.clone());
+        // Off the UI thread, on the runtime the feeds run on (it reads the servers' config).
+        let work = async move {
+            let found = k8s::run(async move {
+                let held = k8s::argo::api::held_apps(
+                    |_| true,
+                    true,
+                    std::time::Duration::from_secs(10),
+                    |_, a| a.summary.namespace == ns && a.summary.name == name,
+                )
+                .await;
+                let mut on: Vec<String> = held
+                    .iter()
+                    .filter(|h| h.apps.as_ref().is_ok_and(|a| !a.is_empty()))
+                    .map(|h| h.endpoint.instance())
+                    .collect();
+                on.sort();
+                on.dedup();
+                Ok(on)
+            });
+            found.await.unwrap_or_default()
+        };
+        self.context_open.spawn_in(window, cx, work, move |this, on, window, cx| {
+            // Only this Application's entries: the others were not looked for.
+            let (found, ns, name) = (on.clone(), app.namespace.clone(), app.name.clone());
+            let of_it = move |n: &str, a: &str| if n == ns && a == name { found.clone() } else { Vec::new() };
+            crate::favorites::shared(cx).update(cx, |f, cx| f.adopt_apps(of_it, cx));
+            match on.as_slice() {
+                [one] => open(this, one.clone(), &app, window, cx),
+                [] => window.push_notification(
+                    Notification::warning(format!(
+                        "{}: not found on a connected Argo CD (Settings → Argo CD); the favorite is kept",
+                        app.name
+                    )),
+                    cx,
+                ),
+                _ => window.push_notification(
+                    Notification::warning(format!(
+                        "{}: several connected Argo CD servers have it; open it from the Argo CD page",
+                        app.name
+                    )),
+                    cx,
+                ),
+            }
+        });
     }
 
     /// Open an object on `context`, which isn't connected, with a client of its own: the
@@ -296,9 +354,12 @@ mod tests {
                 context: hub.map(Into::into),
             })
         };
-        assert_eq!(at(&app("context:hub", None)), Standing::Elsewhere);
-        assert_eq!(at(&app("https://argocd.example.com", Some("hub"))), Standing::Elsewhere);
-        assert_eq!(at(&app("context:old-hub", None)), Standing::ContextGone);
+        // An Application opens on the Argo CD page; one starred by its hub, not found on a
+        // connected Argo CD yet, is kept and said so (never "context gone").
+        assert_eq!(at(&app("context:hub", None)), Standing::ArgoUnresolved);
+        assert_eq!(at(&app("context:old-hub", None)), Standing::ArgoUnresolved);
+        assert!(!Standing::ArgoUnresolved.gone());
+        assert_eq!(at(&app("https://argocd.example.com", Some("hub"))), Standing::ArgoApi);
         assert_eq!(at(&app("https://argocd.example.com", None)), Standing::ArgoApi);
         let obj = |c: &str| {
             Favorite::Object(FavObject {

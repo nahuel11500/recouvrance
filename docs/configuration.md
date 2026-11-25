@@ -38,7 +38,7 @@ kubeconfig's login command such as `kubelogin` or `aws eks get-token`) open no c
 | `~/.config/recouvrance/favorites.json`, `columns.json`, `custom-columns.json`, `column-widths.json` | Favorites and saved views (see [favorites.json](#favoritesjson)), column choices and widths |
 | `~/.config/recouvrance/theme`, `zoom` | Light or dark choice (absent: follow the desktop), UI zoom (0.7 to 2.0) |
 | `~/.config/recouvrance/anthropic-key` | The assistant's Anthropic API key, when saved in Settings (mode 0600; `ANTHROPIC_API_KEY` is used otherwise) |
-| `~/.config/recouvrance/argocd-tokens.json` | Read-only Argo CD API tokens set in Settings → Per cluster, by context (mode 0600; see [Argo CD's diff](#argo-cds-diff-argocd_servers)) |
+| `~/.config/recouvrance/argocd-tokens.json` | No longer read: the per-context tokens of before v0.13 (see [Argo CD before v0.13](#argo-cd-before-v013-argocd_contexts-argocd_servers)); it can be deleted |
 | `~/.config/recouvrance/argocd-api-tokens.json` | Argo CD API tokens set in Settings → Argo CD, by server address (mode 0600; see [Argo CD by its API](#argo-cd-by-its-api-argocd_api_servers)) |
 | `~/.config/recouvrance/argocd-api-refresh.json` | The refresh tokens of the SSO sign-ins made by *Connect to Argo CD…*, by server address (mode 0600) |
 | `~/.config/recouvrance/main-agent` | The built-in assistant's agent id and token (mode 0600) |
@@ -104,16 +104,14 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `context_colors` | | `{ "prod-eu": "#ef4444" }`: a colored strip per context |
 | `protection` | guessed | `{ "prod-eu": true, "kind-dev": false }`: contexts where writes, shells and plugins need the context name typed (or a wait, see `confirm_style`). Contexts not listed are guessed from the context, user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`); a context the kubeconfig doesn't have now, or any context while the kubeconfig can't be read, counts as protected. An older `protected_contexts` list is read once: its contexts become `true` |
 | `protect_unset` | `false` | Set when the protection choices could not be read: contexts not listed in `protection` are protected instead of guessed. *Guess them again* in Settings → Contexts turns it off |
-| `read_only` | | `{ "prod-eu": true }`: contexts the window never writes to, whatever write mode says (writes that aren't dry runs, shells, attach, Helm changes, Argo CD actions and writing plugins are refused when sent; the local kubectl terminal doesn't open), and agents never write to, whatever their rules say (every call with a write verb, dry runs too, is refused as final). Reads, logs, port-forwards and the window's dry runs still work. Argo CD actions follow the hub context tied to the server in `argocd_servers` (else the server's name), not the Application's destination cluster. `recouvrance serve` reads changes to it from the file within seconds. An entry that isn't `true` or `false` counts as read-only; contexts not listed aren't |
+| `read_only` | | `{ "prod-eu": true }`: contexts the window never writes to, whatever write mode says (writes that aren't dry runs, shells, attach, Helm changes, Argo CD actions and writing plugins are refused when sent; the local kubectl terminal doesn't open), and agents never write to, whatever their rules say (every call with a write verb, dry runs too, is refused as final). Reads, logs, port-forwards and the window's dry runs still work. Argo CD actions follow the Argo CD server's own entry (its name, `argocd.example.com`), and an agent's also the contexts the Application deploys to. `recouvrance serve` reads changes to it from the file within seconds. An entry that isn't `true` or `false` counts as read-only; contexts not listed aren't |
 | `read_only_unset` | `false` | Set when the read-only choices could not be read: contexts not listed in `read_only` are read-only. *Make them writable* in Settings → Contexts turns it off |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
 | `clusters` | | Per-cluster settings (below) |
-| `argocd_servers` | `{}` | `{ "argocd-hub": "https://argocd.example.com" }`: the Argo CD API server of a hub context, to read Argo CD's own diff from (see below). None: off. An entry that doesn't read is dropped. Settings → Per cluster |
 | `argocd_api_servers` | `[]` | `["https://argocd.example.com"]`: Argo CD API servers read on the Argo CD page, besides the argocd CLI's (see below). Settings → Argo CD |
 | `argocd_api_off` | `[]` | Argo CD API servers (their address) not read, whether set here or the argocd CLI's. Settings → Argo CD, the switch of each |
 | `argocd_env_types` | `[]` | `["prod = -prod(-\|$)", "staging = -staging(-\|$)"]`: the Argo CD page's environment types, in the order shown, each `type = pattern` (a regular expression of the environment's root Application's name; the match that starts first wins, ties go to the earlier line) or `type = tag:other` (an environment of type `other` whose product images all carry a version tag). A line that doesn't read is named on the page and types nothing; no match is `other`. Empty: prod, preprod, acc on a tag, acc, staging, review, platform. Settings → Argo CD |
 | `argocd_page` | `{}` | How the Argo CD page was last left, restored when it opens: `filter` (`needs_look`, `out_of_sync`, `degraded`, `running`, `favorites`, `project`, `kind`, `on_tag`, `query`), `group_by` (`Type`, `Project` or `None`), `folded` (headings, `project / type`) and `expanded` (environments, by their root). Set by the page; one that doesn't read opens the page as new |
-| `argocd_contexts` | `[]` | `["argocd-hub"]`: the contexts Argo CD's Applications are read from (see below). Empty: found on their own. A value that doesn't read is empty. Settings → Contexts, *Argo CD* |
 | `extra_namespaces` | | Namespaces added by hand, per context |
 | `metrics_enabled` | true | Read metrics-server and Prometheus at all |
 | `accent` | `"brass"` | Accent color: `brass`, `harbour`, `sea`, `kelp`, `signal` or `violet` |
@@ -207,59 +205,30 @@ go in an HTTP header) counts as none without costing the cluster's other setting
 `settings.json` can't be read no identity is offered. Your own role needs the `impersonate` verb
 on that user and those groups.
 
-### Argo CD hub (`argocd_contexts`)
+### Argo CD before v0.13 (`argocd_contexts`, `argocd_servers`)
 
-The Argo CD panel on namespace and object pages, and the Argo CD page, read Applications from the cluster Argo CD runs
-on (the hub). With `argocd_contexts` empty, the hub is found on its own: the connected clusters
-first; only if none serves Applications, the kubeconfig's other contexts that can be asked without
-a login prompt (no exec plugin, or the same exec command line as a connected context).
+Argo CD is read and written only through its API (below). The keys that read it through a hub
+context are no longer read: `argocd_contexts` (the contexts Argo CD ran in) and
+`argocd_servers` (each hub context's Argo CD server, Settings → Per cluster). They stay in the
+file until settings are next saved, then go. Before they do, once: the server of each
+`argocd_servers` entry whose hub context is read-only (or whose protection can't be read)
+becomes read-only too, by its name in `read_only`, so a protected hub's Argo CD stays protected
+now that writes go through its API. An entry that doesn't read changes nothing, as before.
 
-When the hub isn't connected and its kubeconfig user logs in with an exec plugin whose command
-line differs from the connected contexts' (kubelogin with one OIDC client id per cluster, for
-example), it is not asked on its own. The Argo CD page then lists those contexts, the ones named
-like a hub first (`argo`, then `hub`, `meta`, `mgmt`, `platform`...): click the one Argo CD runs
-on and it is asked (its login may run); if it serves Applications, it is kept here. Or tick
-*Argo CD* on it in Settings → Contexts, or set it by hand:
-
-```json
-"argocd_contexts": ["eu-platform-meta"]
-```
-
-Only the named contexts are asked then (their login may run). Connecting the hub as well works too.
-Agents never read Argo CD on these contexts: their Argo CD tools go through Argo CD's API only
-(see [agents](agents.md)).
-
-### Argo CD's diff (`argocd_servers`)
-
-No longer used by an Application's page, which opens on the Argo CD page instead (see
-[features](features.md)). Before, it could show what a sync would change, as Argo CD renders it from git: set the
-Argo CD API server of the hub context in Settings → Per cluster (`https://argocd.example.com`,
-with a path when Argo CD is served under one). Plain `http://` is only taken for this machine (a
-port-forward to argocd-server), so a token never crosses the network in clear.
-
-*Show Argo CD's diff* then sends one request, `GET /api/v1/applications/{name}/managed-resources`,
-to that server only, and only on that click. It logs in with, in this order:
-
-- the token set in Settings → Per cluster (kept in `argocd-tokens.json`, mode 0600, never shown
-  again; *Forget* removes it). A project role or local account limited to `applications, get` is
-  enough;
-- the argocd CLI's login to that server: the token `argocd login` saved in its config file
-  (`$ARGOCD_CONFIG_DIR/config`, else `~/.argocd/config` when that folder exists, else
-  `~/.config/argocd/config`). Recouvrance only reads it; when it has expired, run
-  `argocd login <server> --sso` again. The CLI's `--core` and port-forward modes have no address
-  to ask.
-
-Errors never show the token. Secret values are masked by Recouvrance itself, whatever Argo CD
-sends (its own masking leaked predicted Secret states before 3.2.12, 3.3.10 and 3.4.2).
+`argocd-tokens.json` (the per-context tokens of Settings → Per cluster) is no longer read: delete
+it, and set the token again in Settings → Argo CD (by server, in `argocd-api-tokens.json`) or use
+the argocd CLI's login.
 
 ### Argo CD by its API (`argocd_api_servers`)
 
 The Argo CD page also reads Argo CD by its own API, for when you may use Argo CD but not the
 cluster it runs on. Its servers are:
 
-- those the argocd CLI is logged in to: each context of its config file (found as above) with a
+- those the argocd CLI is logged in to: each context of its config file
+  (`$ARGOCD_CONFIG_DIR/config`, else `~/.argocd/config` when that folder exists, else
+  `~/.config/argocd/config`; read only, never written) with a
   token, one per server, the current context's first. Its `--insecure` (the certificate is not
-  checked), `--plaintext` (taken only for this machine, as above) and `--grpc-web-root-path`
+  checked), `--plaintext` (taken only for this machine, a port-forward: a token never crosses the network in clear) and `--grpc-web-root-path`
   (Argo CD served under a path) are honoured; `--grpc-web` makes no difference to the REST API;
   a `--core` context has no server;
 - those added in Settings → Argo CD: an address, and a token kept in `argocd-api-tokens.json`
@@ -325,11 +294,6 @@ the server's login as the config has it then, and not at all to a server removed
 since the list was drawn. When settings.json can't be read, every server is off (which were
 turned off is unknown).
 
-An Application read by the API and by its hub is the same one when the hub's Argo CD server set
-in Settings → Per cluster (`argocd_servers`) is that API server, and its namespace and name are
-the same: it shows once, as read on the hub (whose page it opens). Without that setting, the two
-are kept apart.
-
 ## favorites.json
 
 Every favorite and saved view, in one file the app writes when a star changes. Every window
@@ -359,13 +323,14 @@ shares the same favorites, so one never saves over another's:
 | `views` | name | Saved table views |
 
 An Application's `argocd` is its Argo CD instance, as the Argo CD page keys it: the Argo CD
-server's address (scheme and host in lowercase, without a default port) when Argo CD is read
-through its API or its hub context has its server set (Settings → Per cluster), else
-`context:<hub context>`. `context` is the hub context it was starred on, when read from one:
-`context:<context>` is another name of the same instance, and its page opens on that context.
-An Application is one favorite through any of these names: starred through one, it shows as
-starred and is unstarred through the other, every entry naming it removed. One known only by an
-API server (no `context`) opens the Argo CD page. An Application starred from its page or a table
+server's address (scheme and host in lowercase, without a default port). It opens on the Argo CD
+page's dashboard. One starred by its hub context (`context:<hub context>`, before v0.13, or on an
+Application's own page) is rewritten to the server's address once exactly one connected Argo CD
+server lists an Application of that namespace and name (when the Argo CD page reads them, or when
+it is opened); until then the sidebar says *not found on a connected Argo CD*, and it is never
+dropped. `context` is the hub context it was starred on: `context:<context>` is another name of
+the same instance. An Application is one favorite through any of these names: starred through
+one, it shows as starred and is unstarred through the other, every entry naming it removed. An Application starred from its page or a table
 of Applications is kept here, not under `objects`; one an older version kept under `objects`
 moves here when the file is read.
 
