@@ -1325,11 +1325,27 @@ pub struct Fleet {
     pub not_asked: Vec<String>,
     /// The Argo CD API servers read (see `api`), by name.
     pub servers: Vec<String>,
+    /// Those of `servers` whose first list is still being read (none failed yet), by name.
+    pub reading: Vec<String>,
     /// Each Argo CD's projects' sync windows (by `instance`), or why they couldn't be read.
     pub projects: HashMap<String, Result<ProjectWindows, String>>,
 }
 
 impl Fleet {
+    /// The line above the list: how many Applications (`kept` of them, when filtered), and
+    /// which servers are still being read. Never `0 Applications` while one is.
+    pub fn summary(&self, kept: Option<usize>) -> String {
+        let count = crate::plural::count(self.apps.len(), "Application");
+        let reading = format!("Reading Applications from {}…", self.reading.join(", "));
+        match kept {
+            _ if self.apps.is_empty() && !self.reading.is_empty() => reading,
+            Some(kept) if self.reading.is_empty() => format!("{kept} of {count}"),
+            Some(kept) => format!("{kept} of {count} · {reading}"),
+            None if self.reading.is_empty() => count,
+            None => format!("{count} · {reading}"),
+        }
+    }
+
     /// When the next sync of `a` can start, from `now`, under its project's sync windows.
     pub fn next_sync(&self, a: &FleetApp, plan: &mut windows::Planner) -> windows::NextSync {
         // Auto-sync is held by every window; a manual sync goes through those that allow it.
@@ -1492,6 +1508,9 @@ pub fn add_api(
         let instance = endpoint.instance();
         let name = endpoint.name();
         fleet.servers.push(name.clone());
+        if !read.state.listed && read.state.error.is_none() {
+            fleet.reading.push(name.clone());
+        }
         if let Some(e) = read.state.error.as_ref().filter(|_| !read.state.live) {
             fleet.errors.push(format!("{name}: {e}"));
         }
@@ -1633,6 +1652,42 @@ mod tests {
         assert_eq!(fleet.apps[1].parent, Some(0));
         assert_eq!(fleet.apps[2].parent, Some(1));
         assert!(fleet.projects[&instance].is_ok());
+    }
+
+    /// #1076: while a server's first list is being read, the page says so, never `0 Applications`.
+    #[test]
+    fn a_server_whose_first_list_is_not_in_yet_is_said_to_be_read() {
+        let (one, two) = (endpoint("https://argocd.example.com"), endpoint("https://argocd.example.org"));
+        let mut fleet = Fleet::default();
+        let pending = ApiRead { endpoint: one.clone(), state: api::FeedState::default() };
+        let failed = api::FeedState { error: Some("HTTP 401".into()), ..Default::default() };
+        add_api(
+            &mut fleet,
+            vec![pending, ApiRead { endpoint: two.clone(), state: failed }],
+            &[],
+            &[],
+            &Default::default(),
+        );
+        // The one that failed says why instead.
+        assert_eq!(fleet.reading, [one.name()]);
+        assert_eq!(fleet.summary(None), format!("Reading Applications from {}…", one.name()));
+        assert_eq!(fleet.summary(Some(0)), fleet.summary(None));
+
+        // One listed, the other still read: both said.
+        let mut fleet = Fleet::default();
+        let mut listed = api::FeedState { listed: true, ..Default::default() };
+        let a = api_app("argocd", "web", None);
+        listed.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
+        let pending = ApiRead { endpoint: one.clone(), state: api::FeedState::default() };
+        add_api(&mut fleet, vec![ApiRead { endpoint: two, state: listed }, pending], &[], &[], &Default::default());
+        let reading = format!("Reading Applications from {}…", one.name());
+        assert_eq!(fleet.summary(None), format!("1 Application · {reading}"));
+        assert_eq!(fleet.summary(Some(0)), format!("0 of 1 Application · {reading}"));
+
+        // Every list in: the count alone.
+        fleet.reading.clear();
+        assert_eq!(fleet.summary(None), "1 Application");
+        assert_eq!(fleet.summary(Some(1)), "1 of 1 Application");
     }
 
     #[test]

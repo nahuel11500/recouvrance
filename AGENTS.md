@@ -2,9 +2,12 @@
 
 ## Building
 
-- **Don't build unless you have to.** CI is free and runs the tests on every PR, so it is the
-  check for them: read the code instead of compiling to find out, and build locally only when
-  CI's log is not enough, with the narrowest command (one test).
+- **Don't build unless you have to.** CI is free. A pull request gets the quick checks (format,
+  spelling, licenses, clippy) in about two minutes; the tests, the end-to-end run on kind and the
+  Windows check run on `main` after the merge (a merge queue needs an organization-owned
+  repository). Read the code instead of compiling to find out; when you change logic, run its
+  module's tests locally with the narrowest command (`cargo test <module>::`) before merging.
+  When a run on `main` fails, fixing it comes before anything else.
 - **Push through the pre-push hook.** Once per checkout: `git config core.hooksPath scripts/hooks`.
   Before each push it runs what CI fails on most: `cargo fmt --check`, `typos`, `cargo deny`,
   then clippy (with and without `dev`) in the main checkout's target dir, one at a time across
@@ -44,10 +47,11 @@
 - Review the change, not the codebase: each PR's diff is reviewed as it lands, fixes
   included. Whole-codebase audits are not repeated; bug reports from users set the
   priorities for the long tail.
-- Merge without asking: once the diff has been reviewed, squash merge it as soon as
-  `CI result` passes (`gh pr checks <n> --watch`, then `gh pr merge <n> --squash`). A failing
-  CI is fixed on the branch, never merged around. Dependabot's PRs merge the same way once
-  their CI passes on the current `main`.
+- Merge without asking: once the diff has been reviewed, squash merge it as soon as `CI result`
+  passes (`gh pr checks <n> --watch`, then `gh pr merge <n> --squash`; check with
+  `gh pr view <n> --json state`). A failing CI is fixed on the branch, never merged around.
+  Then watch the run on `main`: if it fails, fix it right away in a new PR. Dependabot's PRs
+  merge the same way once their CI passes on the current `main`.
 - Nothing is tried in the running app before merging; the test before a release is (see
   below).
 - `gh pr edit` fails on this repository (Projects classic); change a PR's title or body with
@@ -139,7 +143,7 @@ copy; if one doesn't fit, extend it.
   `#[cfg(all(test, feature = "dev"))]`.
 - The write guards are tested against a real cluster in `src/e2e.rs` (write mode, an agent's
   rules through the MCP server, the kill switch during a drain); CI's kind job runs them on
-  every PR. Extend them when you add a write path. Locally, against a kind cluster:
+  every push to `main`. Extend them when you add a write path. Locally, against a kind cluster:
   `RECOUVRANCE_E2E_CONTEXT=kind-x XDG_CONFIG_HOME=$(mktemp -d) cargo test --features dev -- --ignored --test-threads 1 e2e::`.
 - Rules that must hold for every input get a `proptest!`. The subsystems that broke again and
   again have them; extend them when you change those, and add a case before fixing a bug there:
