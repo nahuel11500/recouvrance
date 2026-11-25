@@ -497,9 +497,12 @@
   already syncing, being deleted, or whose sync windows deny a manual sync now (*can sync in 2h*)
   is left out, saying why; auto-sync on is said, not a reason. When its sync windows aren't known
   (its project can't be read), argocd-server refuses a sync a window denies and says so. Windows are worked out again as of
-  the moment *Sync…* is clicked. Options: *With hooks* (Argo CD's hook strategy, its own Sync:
-  PreSync, Sync and PostSync hooks run) or *Without hooks* (the apply strategy: only the
-  manifests are applied, a secret refresh or a migration hook is skipped; for a simple change);
+  the moment *Sync…* is clicked. Options: *Full, with hooks* (Argo CD's hook strategy, its own
+  Sync: the whole Application, PreSync, Sync and PostSync hooks run, listed under each as its
+  last sync ran them) or *Out of sync only, without hooks* (the apply strategy on each
+  Application's resources out of sync, named in the sync: what is in sync is not applied
+  again, one with nothing out of sync is left as it is, and the hooks skipped, a secret refresh
+  or a migration, are listed under each and in the confirmation; for a simple change);
   *Prune*, off by default, lists under each Application every resource it deletes (its managed
   resources that require pruning), and a sync is refused if Argo CD's last comparison then
   shows more to prune; *Dry run* applies nothing. With auto-sync off and one source, the sync is
@@ -508,6 +511,9 @@
   does, the Application's sync options and retry policy go with the operation, and prune and dry
   run are always said (false too, so Argo CD's manual sync defaults don't fill them). *Read
   what a sync of each would change* shows the grouped diff, whose summary then shows above.
+  With Applications of production environments among them (the types `prod`, `preprod`, `acc
+  on a tag`, `platform`, or one named with `prod`), they are named above the list and *Sync…*
+  asks a second click (*Confirm: 3 production Applications…*) before the confirmation.
   *Sync…* asks for the count of Applications typed (or the wait set in Settings → General),
   names them, and lists everything prune deletes; the syncs are then sent 4 at a time, write mode
   and the server's protection checked as each is sent. Each Application is read every 2 s (every 10 s while the page is

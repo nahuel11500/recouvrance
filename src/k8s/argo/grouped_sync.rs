@@ -7,9 +7,11 @@
 //! most [`PARALLEL`] at a time; each Application is then read again until its operation ends,
 //! and its progress told from `status.operationState` ([`progress`]).
 //!
-//! Options: with hooks (Argo CD's hook strategy, its default) or without (the apply strategy:
-//! the manifests are applied, `PreSync`/`Sync`/`PostSync` hooks such as a secret refresh or a
-//! migration are skipped), prune (off by default; never deleting more than was shown), and
+//! Options: the full sync with hooks (Argo CD's hook strategy, its own Sync) or the resources
+//! out of sync only, without hooks (the apply strategy on the resources each Application
+//! has out of sync, named in the sync: what is in sync is not applied again, and the
+//! `PreSync`/`Sync`/`PostSync` hooks such as a secret refresh or a migration, listed per
+//! Application, are skipped), prune (off by default; never deleting more than was shown), and
 //! dry run (Argo CD applies nothing and says what it would do).
 
 use std::future::Future;
@@ -30,7 +32,8 @@ pub const PARALLEL: usize = 4;
 /// What the sync of the picked Applications asks of each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
-    /// Run the hooks (the hook strategy); off: the apply strategy, without hooks.
+    /// The whole Application with its hooks (the hook strategy); off: its resources out of
+    /// sync only, with the apply strategy, without hooks.
     pub hooks: bool,
     pub prune: bool,
     pub dry_run: bool,
@@ -43,23 +46,38 @@ impl Default for Options {
 }
 
 impl Options {
-    /// The sync of one whole Application as `checked` found it: what prune deletes on it as
-    /// shown (if Argo CD's comparison then shows more, the sync of it is refused), and the
-    /// revision shown when it can be pinned (so git moving on can't bring more).
-    pub fn request(&self, checked: &Checked) -> SyncRequest {
-        SyncRequest {
-            resources: Vec::new(),
+    /// The sync of one Application as `checked` found it: the whole of it, or its resources
+    /// out of sync (and, with prune, those to prune) named one by one. What prune deletes on it
+    /// as shown (if Argo CD's comparison then shows more, the sync of it is refused), and the
+    /// revision shown when it can be pinned (so git moving on can't bring more). None when
+    /// the sync is of its resources out of sync and it has none: nothing to sync (an empty
+    /// list would sync it whole).
+    pub fn request(&self, checked: &Checked) -> Option<SyncRequest> {
+        let resources = if self.hooks {
+            Vec::new()
+        } else {
+            let mut picked = checked.out_of_sync.clone();
+            if self.prune {
+                picked.extend(checked.pruned.iter().cloned());
+            }
+            if picked.is_empty() {
+                return None;
+            }
+            picked
+        };
+        Some(SyncRequest {
+            resources,
             prune: self.prune,
             dry_run: self.dry_run,
             apply: !self.hooks,
             revision: checked.revision.clone(),
             prune_shown: self.prune.then(|| checked.pruned.clone()),
-        }
+        })
     }
 
     /// `with hooks, prune, dry run`: what the confirmation says.
     pub fn text(&self) -> String {
-        let mut parts = vec![if self.hooks { "with hooks" } else { "without hooks" }];
+        let mut parts = vec![if self.hooks { "full, with hooks" } else { "out of sync only, without hooks" }];
         if self.prune {
             parts.push("prune");
         }
@@ -77,6 +95,11 @@ pub struct Checked {
     pub refused: Option<String>,
     /// What prune would delete on it (when prune is on).
     pub pruned: Vec<Res>,
+    /// Its resources out of sync that a sync applies (hooks and those to prune left out):
+    /// what the sync of the resources out of sync names.
+    pub out_of_sync: Vec<Res>,
+    /// Its hooks (`PreSync Job shop/migrate`): run by the full sync, skipped by the other.
+    pub hooks: Vec<String>,
     pub auto_sync: bool,
     /// When its last operation started, as read for the page (the sync follows the operation
     /// after the one read right before it is written).
@@ -109,13 +132,39 @@ pub fn check(app: &Value, window: &NextSync, now: jiff::Timestamp) -> Checked {
     } else {
         ops::refusal(app, &Op::Sync(SyncRequest::default())).or_else(|| window_refusal(window, now))
     };
+    let pruned = ops::pruned(app, &[]);
     Checked {
         refused,
-        pruned: ops::pruned(app, &[]),
+        out_of_sync: ops::out_of_sync(app).into_iter().filter(|r| !pruned.iter().any(|p| p.same(r))).collect(),
+        pruned,
+        hooks: hooks(app),
         auto_sync: super::auto_sync(app),
         before: started_at(app),
         revision: ops::shown_revision(app),
     }
+}
+
+/// The hooks of `app`, each as `PreSync Job shop/migrate`: those its managed resources list,
+/// and those its last sync ran (Argo CD keeps no other list of them; one that has never run
+/// may be missing).
+pub fn hooks(app: &Value) -> Vec<String> {
+    let mut found: Vec<(Res, String)> = Vec::new();
+    let ran = app.pointer("/status/operationState/syncResult/resources").and_then(Value::as_array);
+    let listed = app.pointer("/status/resources").and_then(Value::as_array);
+    let typed = ran.into_iter().flatten().filter(|r| r["hookType"].as_str().is_some_and(|t| !t.is_empty()));
+    let marked = listed.into_iter().flatten().filter(|r| r["hook"] == true);
+    for r in typed.chain(marked) {
+        let Some(res) = Res::of(r) else { continue };
+        if found.iter().any(|(f, _)| f.same(&res)) {
+            continue;
+        }
+        let label = match r["hookType"].as_str().filter(|t| !t.is_empty()) {
+            Some(t) => format!("{t} {}", res.label()),
+            None => res.label(),
+        };
+        found.push((res, label));
+    }
+    found.into_iter().map(|(_, l)| l).collect()
 }
 
 /// An Application to sync: the Argo CD API server it is read from, its Argo CD, its
@@ -265,17 +314,129 @@ mod tests {
     fn each_option_is_in_the_request() {
         let pruned =
             vec![Res { kind: "ConfigMap".into(), namespace: "shop".into(), name: "old".into(), ..Default::default() }];
-        let checked = Checked { pruned: pruned.clone(), ..Default::default() };
-        let plain = Options::default().request(&checked);
-        assert_eq!(plain, SyncRequest::default(), "with hooks, no prune, no dry run: Argo CD's own Sync");
+        let web = Res {
+            group: "apps".into(),
+            kind: "Deployment".into(),
+            namespace: "shop".into(),
+            name: "web".into(),
+            ..Default::default()
+        };
+        let checked = Checked { pruned: pruned.clone(), out_of_sync: vec![web.clone()], ..Default::default() };
+        let plain = Options::default().request(&checked).unwrap();
+        assert_eq!(plain, SyncRequest::default(), "full, no prune, no dry run: Argo CD's own Sync");
         let pinned = Checked { revision: Some("abc".into()), ..checked };
-        let r = Options { hooks: false, prune: true, dry_run: true }.request(&pinned);
-        assert!(r.apply && r.prune && r.dry_run && r.resources.is_empty());
+        let r = Options { hooks: false, prune: true, dry_run: true }.request(&pinned).unwrap();
+        assert!(r.apply && r.prune && r.dry_run);
+        assert_eq!(r.resources, [web.clone(), pruned[0].clone()], "what is out of sync, and what prune deletes");
         assert_eq!(r.prune_shown, Some(pruned), "prune deletes no more than was shown");
         assert_eq!(r.revision.as_deref(), Some("abc"), "pinned to the revision shown");
         assert_eq!(ops::sync_patch(&r)["operation"]["sync"]["syncStrategy"], json!({"apply": {}}));
-        assert_eq!(Options { hooks: false, prune: true, dry_run: true }.text(), "without hooks, prune, dry run");
-        assert_eq!(Options::default().text(), "with hooks");
+        let r = Options { hooks: false, prune: false, dry_run: false }.request(&pinned).unwrap();
+        assert_eq!(r.resources, [web], "without prune, what is to prune is not named");
+        assert_eq!(
+            Options { hooks: false, prune: true, dry_run: true }.text(),
+            "out of sync only, without hooks, prune, dry run"
+        );
+        assert_eq!(Options::default().text(), "full, with hooks");
+    }
+
+    /// An Application with nothing out of sync is not synced at all without hooks: an empty
+    /// list of resources would sync it whole.
+    #[test]
+    fn nothing_out_of_sync_is_nothing_to_sync() {
+        let synced = Checked::default();
+        let oos = Options { hooks: false, ..Default::default() };
+        assert_eq!(oos.request(&synced), None);
+        assert_eq!(Options { prune: true, ..oos }.request(&synced), None);
+        let only_prune = Checked {
+            pruned: vec![Res { kind: "ConfigMap".into(), name: "old".into(), ..Default::default() }],
+            ..synced
+        };
+        assert_eq!(oos.request(&only_prune), None, "prune off: nothing to apply");
+        assert_eq!(Options { prune: true, ..oos }.request(&only_prune).unwrap().resources.len(), 1);
+        assert!(Options::default().request(&Checked::default()).is_some(), "the full sync always goes");
+    }
+
+    #[test]
+    fn hooks_are_listed_once_with_their_type() {
+        let mut a = app();
+        a["status"]["resources"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"group": "batch", "kind": "Job", "namespace": "shop", "name": "migrate", "hook": true}));
+        a["status"]["resources"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"group": "batch", "kind": "Job", "namespace": "shop", "name": "smoke", "hook": true}));
+        a["status"]["operationState"]["syncResult"] = json!({"resources": [
+            {"kind": "ConfigMap", "namespace": "shop", "name": "a", "status": "Synced"},
+            {"group": "batch", "kind": "Job", "namespace": "shop", "name": "migrate", "hookType": "PreSync", "hookPhase": "Succeeded"}
+        ]});
+        assert_eq!(hooks(&a), ["PreSync Job shop/migrate", "Job shop/smoke"]);
+        let c = check(&a, &NextSync::NoWindow, now());
+        assert_eq!(c.hooks.len(), 2);
+        assert_eq!(c.out_of_sync.iter().map(Res::label).collect::<Vec<_>>(), ["Deployment shop/web"]);
+    }
+
+    /// An entry of `status.resources`, any of its fields left out.
+    fn entry() -> impl proptest::strategy::Strategy<Value = Value> {
+        use proptest::prelude::*;
+        let word = |words: Vec<&'static str>| proptest::sample::select(words);
+        (
+            word(vec!["", "apps", "batch"]),
+            word(vec!["Deployment", "Job", "ConfigMap"]),
+            word(vec!["", "shop"]),
+            word(vec!["a", "b", "c"]),
+            proptest::option::of(word(vec!["Synced", "OutOfSync", "Unknown"])),
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(|(group, kind, namespace, name, sync, prune, hook)| {
+                let mut e = json!({"group": group, "kind": kind, "namespace": namespace, "name": name});
+                if let Some(sync) = sync {
+                    e["status"] = json!(sync);
+                }
+                if prune {
+                    e["requiresPruning"] = json!(true);
+                }
+                if hook {
+                    e["hook"] = json!(true);
+                }
+                e
+            })
+    }
+
+    proptest::proptest! {
+        /// Without hooks, the sync names resources, never none (which would sync the whole
+        /// Application, hooks run by none but applied), and only resources out of sync that
+        /// are not hooks: to prune only with prune on, and then all those shown.
+        #[test]
+        fn out_of_sync_only_names_what_is_out_of_sync(
+            entries in proptest::collection::vec(entry(), 0..12),
+            prune: bool,
+            dry_run: bool,
+        ) {
+            let mut a = app();
+            a["status"]["resources"] = json!(entries);
+            let c = check(&a, &NextSync::NoWindow, now());
+            let opts = Options { hooks: false, prune, dry_run };
+            let Some(req) = opts.request(&c) else {
+                proptest::prop_assert!(c.out_of_sync.is_empty() && (!prune || c.pruned.is_empty()));
+                return Ok(());
+            };
+            proptest::prop_assert!(!req.resources.is_empty() && req.apply);
+            for r in &req.resources {
+                let ok = entries.iter().filter(|e| Res::of(e).is_some_and(|x| x.same(r))).any(|e| {
+                    e["status"] == "OutOfSync"
+                        && (e["hook"] != true || e["requiresPruning"] == true)
+                        && (prune || e["requiresPruning"] != true)
+                });
+                proptest::prop_assert!(ok, "{} named", r.label());
+            }
+            // Argo CD would take the request: every resource named is the Application's, and
+            // prune deletes what was shown.
+            proptest::prop_assert_eq!(ops::refusal(&a, &Op::Sync(req)), None);
+        }
     }
 
     /// An auto-sync that ran between the page's read and the sync's write is not the sync
