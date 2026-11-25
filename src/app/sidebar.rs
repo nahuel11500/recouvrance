@@ -402,7 +402,15 @@ impl AppView {
                     d.child(badge(n, if critical { danger } else { warning }))
                 })
                 .when_some(self.problems.tooltip(), |d, tip| {
-                    d.tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.text()).build(w, cx))
+                    // A context of the set that isn't connected is not in the counts: said.
+                    let left_out = self.conn.left_out("Not counted", &k8s::short_names::short_name);
+                    d.tooltip(move |w, cx| {
+                        let text = match &left_out {
+                            Some(l) => SharedString::from(format!("{}\n{l}", tip.text())),
+                            None => tip.text(),
+                        };
+                        component::tooltip::Tooltip::new(text).build(w, cx)
+                    })
                 }),
             nav_row("nav-timeline", Lucide::ClockArrowDown, "Timeline", matches!(route, Route::Timeline(_)))
                 .on_click(cx.listener(|this, _, window, cx| this.open_timeline(window, cx))),
