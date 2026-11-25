@@ -901,7 +901,7 @@ async fn api_namespace_lookup(here: &str, ns: &str) -> Option<Lookup> {
     for h in held {
         match h.apps {
             Ok(apps) => {
-                lookup.apps.extend(apps.iter().map(|a| Found { server: h.endpoint.clone(), app: a.summary.clone() }))
+                lookup.apps.extend(apps.iter().map(|a| Found { server: h.endpoint.clone(), app: a.summary.clone() }));
             }
             Err(e) => errors.push(format!("{}: {e}", h.endpoint.name())),
         }

@@ -468,7 +468,7 @@ mod tests {
                 prop_assert!(picked.is_empty() || picked.iter().any(|p| p.same(g)));
                 prop_assert!(g.name == "old" || g.name == "gone");
             }
-            let req = SyncRequest { resources: picked.clone(), prune: true, prune_shown: Some(gone), ..Default::default() };
+            let req = SyncRequest { resources: picked, prune: true, prune_shown: Some(gone), ..Default::default() };
             prop_assert_eq!(refusal(&a, &Op::Sync(req)), None);
         }
     }
