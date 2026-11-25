@@ -111,10 +111,11 @@ pub async fn held_apps(
 ) -> Vec<Held> {
     let mut sources = Vec::new();
     for endpoint in endpoints().list.into_iter().filter(|e| e.on && use_server(&e.name())) {
+        // A login that renews is read too: its feed renews it at once.
         let feed = match &endpoint.login {
-            Err(why) => Err(why.clone()),
-            Ok(_) if start => Ok(linger(&endpoint)),
-            Ok(_) => match running(&endpoint) {
+            Err(why) if !super::renews(&endpoint) => Err(why.clone()),
+            _ if start => Ok(linger(&endpoint)),
+            _ => match running(&endpoint) {
                 Some(state) => Ok(state),
                 None => continue,
             },
@@ -140,8 +141,8 @@ pub async fn held_states(
         .filter(|e| e.on && use_server(&e.name()))
         .map(|e| {
             let feed = match &e.login {
-                Err(why) => Err(why.clone()),
-                Ok(_) => Ok(linger(&e)),
+                Err(why) if !super::renews(&e) => Err(why.clone()),
+                _ => Ok(linger(&e)),
             };
             (Arc::new(e), feed)
         })

@@ -938,6 +938,16 @@ fn token_in(cell: &TokenCell) -> Option<Token> {
     cell.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
+/// Whether `token` should replace `held` in a feed: there is none, it is another login (no
+/// `exp` to compare), or it expires later.
+fn newer(held: Option<&Token>, token: &Token) -> bool {
+    match held.map(|h| (server::exp_of(&h.0), h)) {
+        None => true,
+        Some((Some(old), _)) => server::exp_of(&token.0).is_none_or(|exp| exp > old),
+        Some((None, h)) => h != token,
+    }
+}
+
 fn set_token(cell: &TokenCell, token: Option<Token>) {
     *cell.lock().unwrap_or_else(PoisonError::into_inner) = token;
 }
@@ -956,6 +966,8 @@ static FEEDS: LazyLock<Mutex<HashMap<String, Feed>>> = LazyLock::new(Default::de
 static CHANGES: AtomicU64 = AtomicU64::new(0);
 /// Counts the changes of the servers' config: feeds of an older one are left.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Counts the renewals ended (see `renewals`).
+static RENEWED: AtomicU64 = AtomicU64::new(0);
 
 /// Changes of any feed so far.
 pub fn changes() -> u64 {
@@ -970,7 +982,14 @@ pub fn generation() -> u64 {
 /// A login was renewed (its token only): the pages read the servers again, and their feeds go
 /// on with the new token.
 pub(super) fn renewed() {
+    RENEWED.fetch_add(1, Ordering::SeqCst);
     CHANGES.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Renewals ended so far (done or failed): Settings → Argo CD reads the servers again when
+/// it moved.
+pub fn renewals() -> u64 {
+    RENEWED.load(Ordering::SeqCst)
 }
 
 /// The servers or their tokens changed: pages watch them again, with the new config.
@@ -1018,9 +1037,12 @@ pub fn watch(endpoint: &Endpoint) -> Watch {
             .then(|| crate::k8s::spawn_guarded(keep_renewed(endpoint.server.base.clone(), cell.clone())));
         Feed { state, users: 0, token: cell, _task: task, _renew: renew }
     });
-    // The login as read now (renewed since the feed started): its next request sends it.
-    if token.is_some() {
-        set_token(&feed.token, token);
+    // The login as read now (renewed since the feed started): its next request sends it,
+    // unless the feed holds a newer one (renewed after this was read).
+    if let Some(t) = token
+        && newer(token_in(&feed.token).as_ref(), &t)
+    {
+        set_token(&feed.token, Some(t));
     }
     feed.users += 1;
     Watch { endpoint: Arc::new(endpoint.clone()), state: feed.state.clone(), key }
@@ -1048,7 +1070,7 @@ async fn keep_renewed(base: String, cell: TokenCell) {
         let now = jiff::Timestamp::now().as_second();
         let wait = match &before {
             None => Some(0),
-            Some(t) => super::connect::renew_in(server::exp_of(&t.0), now),
+            Some(t) => super::connect::renew_in(server::exp_of(&t.0), now, super::connect::jitter()),
         };
         // A token that doesn't expire is not renewed.
         let Some(wait) = wait else { return };
@@ -1081,6 +1103,27 @@ fn lock(state: &Mutex<FeedState>) -> std::sync::MutexGuard<'_, FeedState> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What a feed with no token says (`failure`: why its last renewal failed, if it did): a
+/// login renewed here says nothing while it is renewed (a reader waits for it), only why it
+/// failed; another says why it has none.
+fn waiting_note(endpoint: &Endpoint, failure: Option<String>) -> Option<String> {
+    if endpoint.renewable {
+        return failure;
+    }
+    Some(endpoint.login.clone().err().unwrap_or_else(|| format!("No login to {}", endpoint.name())))
+}
+
+/// Whether a login renewed here can be renewed now: it can, and it hasn't failed for good.
+/// Such a server is read even when its token has expired: its feed renews it at once.
+pub fn renews(endpoint: &Endpoint) -> bool {
+    endpoint.renewable && !super::connect::renewal_dead(&endpoint.server.base)
+}
+
+/// Whether a reader should hold `endpoint`'s feed: it has a login, or one that renews.
+pub fn readable(endpoint: &Endpoint) -> bool {
+    endpoint.login.is_ok() || renews(endpoint)
+}
+
 /// How a round of a feed ended.
 enum Ended {
     /// The stream ended or went silent, as streams do: opened again, nothing to show.
@@ -1094,25 +1137,29 @@ enum Ended {
 /// one renewed here waits for its renewal instead.
 async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>, cell: TokenCell) {
     let mut backoff = BACKOFF;
+    // What the feed says while it waits for a token, last said.
+    let mut said: Option<Option<String>> = None;
     loop {
         let Some(token) = token_in(&cell) else {
             let name = endpoint.name();
-            let why = super::connect::renewal_note(&name, &endpoint.server.base)
-                .filter(|_| endpoint.renewable)
-                .or_else(|| endpoint.login.clone().err())
-                .unwrap_or_else(|| format!("No login to {name}"));
-            {
-                let mut s = lock(&state);
-                s.error = Some(why);
-                s.refused = true;
+            let why = waiting_note(&endpoint, super::connect::renewal_failure_note(&name, &endpoint.server.base));
+            // Said once each time it changes: the pages don't rebuild each second of an outage.
+            if said.as_ref() != Some(&why) {
+                {
+                    let mut s = lock(&state);
+                    s.refused = why.is_some();
+                    s.error.clone_from(&why);
+                }
+                changed();
+                said = Some(why);
             }
-            changed();
             if !endpoint.renewable || super::connect::renewal_dead(&endpoint.server.base) {
                 return;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         };
+        said = None;
         let conn = Conn { server: endpoint.server.clone(), token, insecure: endpoint.insecure };
         let started = Instant::now();
         let ended = follow(&conn, &state, &cell).await;
@@ -1393,6 +1440,12 @@ async fn check(conn: &Conn) -> Result<String, Failure> {
 /// the feeds keep them, within `timeout`. For a reader with no feed running (`running`).
 pub async fn list_once(endpoint: Endpoint, timeout: Duration) -> Result<Vec<Arc<ApiApp>>, String> {
     let read = crate::k8s::run_abortable(async move {
+        // An expired login that renews: renewed first.
+        let endpoint = if endpoint.login.is_err() && renews(&endpoint) {
+            current_renewed(&endpoint.server.base).await.unwrap_or(endpoint)
+        } else {
+            endpoint
+        };
         let conn = match endpoint.conn() {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
@@ -1405,6 +1458,17 @@ pub async fn list_once(endpoint: Endpoint, timeout: Duration) -> Result<Vec<Arc<
 
 /// The server at `base` as the config says now: a write goes with the login set now, and not
 /// at all to a server removed or turned off since the page was drawn.
+/// [`current`], its login renewed first when it has expired and renews (whatever holds its
+/// feed or not: an agent's or a Problems scan's read with the Argo CD page closed).
+async fn current_renewed(base: &str) -> Result<Endpoint, String> {
+    let e = current(base)?;
+    if e.login.is_ok() || !renews(&e) {
+        return Ok(e);
+    }
+    let _ = super::connect::renew(base.to_string()).await;
+    current(base)
+}
+
 fn current(base: &str) -> Result<Endpoint, String> {
     let found = endpoints().list.into_iter().find(|e| e.server.base == base);
     match found {
@@ -1417,7 +1481,7 @@ fn current(base: &str) -> Result<Endpoint, String> {
 /// The Application `namespace/name` as Argo CD has it now, whole (for a confirmation).
 pub async fn read_app(endpoint: Arc<Endpoint>, namespace: String, name: String) -> Result<Value, String> {
     let read = crate::k8s::run_abortable(async move {
-        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+        let conn = match current_renewed(&endpoint.server.base).await.and_then(|e| e.conn()) {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
@@ -1433,7 +1497,7 @@ pub async fn read_app(endpoint: Arc<Endpoint>, namespace: String, name: String) 
 /// [`read_app`], None when Argo CD has no such Application (it was deleted).
 pub async fn read_app_opt(endpoint: Arc<Endpoint>, namespace: String, name: String) -> Result<Option<Value>, String> {
     let read = crate::k8s::run_abortable(async move {
-        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+        let conn = match current_renewed(&endpoint.server.base).await.and_then(|e| e.conn()) {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
@@ -1461,7 +1525,7 @@ pub async fn dashboard(
     name: String,
 ) -> Result<super::dashboard::Read, String> {
     let read = crate::k8s::run_abortable(async move {
-        let found = current(&endpoint.server.base).and_then(|e| Ok((e.conn()?, e.login?.1)));
+        let found = current_renewed(&endpoint.server.base).await.and_then(|e| Ok((e.conn()?, e.login?.1)));
         let (conn, how) = match found {
             Ok(found) => found,
             Err(e) => return Ok(held_read(&endpoint, &namespace, &name, e)),
@@ -1505,7 +1569,7 @@ pub async fn manifests_diff(
 ) -> Result<Arc<crate::smartdiff::SmartDiff>, String> {
     use super::sync_diff::{RENDER_TIMEOUT, Target};
     let read = crate::k8s::run_abortable(async move {
-        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+        let conn = match current_renewed(&endpoint.server.base).await.and_then(|e| e.conn()) {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
@@ -1528,7 +1592,7 @@ pub async fn sync_preview(
     name: String,
 ) -> Result<Arc<super::grouped_diff::AppDiff>, String> {
     let read = crate::k8s::run_abortable(async move {
-        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+        let conn = match current_renewed(&endpoint.server.base).await.and_then(|e| e.conn()) {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
@@ -1627,7 +1691,7 @@ pub async fn act_read(
     action: Action,
 ) -> Result<(String, Option<String>), String> {
     let write = crate::k8s::run_abortable(async move {
-        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+        let conn = match current_renewed(&endpoint.server.base).await.and_then(|e| e.conn()) {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
@@ -1709,7 +1773,7 @@ pub async fn act_for_agent(
 ) -> Result<String, String> {
     use super::ops::{self, Op};
     let write = crate::k8s::run_abortable(async move {
-        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+        let conn = match current_renewed(&endpoint.server.base).await.and_then(|e| e.conn()) {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
@@ -2165,5 +2229,48 @@ users:
         assert!(login(&old, None).unwrap_err().contains("expired"));
         // A valid one set in Settings still wins.
         assert_eq!(login(&fresh, Some(&old)).unwrap().1, Login::Settings);
+    }
+
+    /// A feed keeps the newer of the token it holds and one read since: a token read before
+    /// a renewal never puts back the older one.
+    #[test]
+    fn a_feed_keeps_the_newer_token() {
+        use super::{Token, newer};
+        use base64::Engine as _;
+        let jwt = |exp: i64| {
+            let b = |v: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+            Token(format!("{}.{}.sig", b(b"{}"), b(format!("{{\"exp\":{exp}}}").as_bytes())))
+        };
+        assert!(newer(None, &jwt(100)));
+        assert!(newer(Some(&jwt(100)), &jwt(200)));
+        assert!(!newer(Some(&jwt(200)), &jwt(100)));
+        assert!(!newer(Some(&jwt(200)), &jwt(200)));
+        // Tokens without exp: another one replaces it.
+        assert!(newer(Some(&Token("a".into())), &Token("b".into())));
+        assert!(!newer(Some(&Token("a".into())), &Token("a".into())));
+    }
+
+    /// A login renewed here is read with its token expired (its feed renews it), and says
+    /// nothing while it is renewed, so a reader waits; only why it failed. Another says why
+    /// it has no login.
+    #[test]
+    fn an_expired_login_that_renews_is_read_and_waited_for() {
+        use super::{Endpoint, readable, renews, waiting_note};
+        use crate::k8s::argo::server::Server;
+        let endpoint = |renewable: bool| Endpoint {
+            server: Server::parse("https://renews.example.com").unwrap(),
+            cli_context: None,
+            in_settings: true,
+            insecure: false,
+            login: Err("expired".into()),
+            on: true,
+            settings_token: true,
+            renewable,
+        };
+        assert!(renews(&endpoint(true)) && readable(&endpoint(true)));
+        assert!(!readable(&endpoint(false)));
+        assert_eq!(waiting_note(&endpoint(true), None), None);
+        assert_eq!(waiting_note(&endpoint(true), Some("refused".into())), Some("refused".into()));
+        assert_eq!(waiting_note(&endpoint(false), None), Some("expired".into()));
     }
 }

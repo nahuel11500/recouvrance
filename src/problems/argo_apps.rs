@@ -216,7 +216,7 @@ async fn server_apps(endpoint: &api::Endpoint) -> Result<Arc<Vec<LeanApp>>, Stri
 /// None: no Argo CD is read by its API, and the hubs are read instead.
 fn api_servers(endpoints: Vec<api::Endpoint>) -> Option<Vec<api::Endpoint>> {
     let on: Vec<api::Endpoint> = endpoints.into_iter().filter(|e| e.on).collect();
-    on.iter().any(|e| e.login.is_ok()).then_some(on)
+    on.iter().any(api::readable).then_some(on)
 }
 
 /// The check of a scan of `context` (`client`: its own; `serves`: it serves Applications): the
