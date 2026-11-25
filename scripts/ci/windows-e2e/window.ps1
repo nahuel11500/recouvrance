@@ -16,7 +16,12 @@ $probe = Get-Content "$env:E2E\login.log" | Where-Object { $_ -match "^parent=$P
 "probe: $probe"
 if ($probe -notmatch 'visible=True') { '::warning::this session shows no console window: the login command check proves nothing' }
 
-$app = Start-Process $env:APP -PassThru
+# Started as Explorer starts it (ShellExecute): no standard handles, so the app borrows its hidden
+# console (`console::hidden_for_gui`). Start-Process would hand it this step's pipes, and the app
+# leaves a console alone when its output is redirected.
+$start = [Diagnostics.ProcessStartInfo]::new($env:APP)
+$start.UseShellExecute = $true
+$app = [Diagnostics.Process]::Start($start)
 $failed = @()
 try {
   $deadline = (Get-Date).AddSeconds(90)
@@ -67,5 +72,4 @@ Get-ChildItem -Recurse -Force $root, $env:APPDATA | Select-Object -ExpandPropert
 foreach ($f in 'config\agents.json', 'data\audit.jsonl') {
   if (-not (Test-Path "$root\$f")) { $failed += "no $root\$f" }
 }
-icacls "$root\config"
 if ($failed) { throw ($failed -join '; ') }
