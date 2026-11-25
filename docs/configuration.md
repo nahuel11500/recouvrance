@@ -20,6 +20,9 @@ PowerShell don't wait for a GUI program: the prompt comes back at once and the o
 To wait for one, as scripts do, run it with `start /wait recouvrance serve` in `cmd` or
 `Start-Process -Wait -NoNewWindow recouvrance serve` in PowerShell, or redirect its output
 (`recouvrance agent-create ci > token.txt`); output that is redirected or piped is kept as it is.
+When only stdout is redirected, stderr goes nowhere: `serve` logs to stderr, so redirect both
+(`recouvrance serve > serve.log 2>&1`). Programs the app starts (helm, plugins, `claude`, a
+kubeconfig's login command such as `kubelogin` or `aws eks get-token`) open no console window.
 
 ## Files
 

@@ -794,7 +794,7 @@ fn launch_editor(path: &std::path::Path) -> Result<(), String> {
     );
     parts.push(path.display().to_string());
     let spawn = |args: &[String]| {
-        std::process::Command::new(&args[0])
+        crate::process::command(&args[0])
             .args(&args[1..])
             .stdin(std::process::Stdio::null())
             .spawn()
@@ -898,7 +898,7 @@ impl Render for ApplyView {
                         .on_click(|_, _, _| {
                             if let Ok(dir) = crate::templates::ensure_folder() {
                                 crate::forwards::spawn_reaped(
-                                    std::process::Command::new(crate::forwards::OPENER).arg(dir),
+                                    crate::process::command(crate::forwards::OPENER).arg(dir),
                                 );
                             }
                         }),

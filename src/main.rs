@@ -37,6 +37,7 @@ mod plugins;
 mod plural;
 mod private_files;
 mod problems;
+mod process;
 mod prom;
 mod quantity;
 mod rbac;
@@ -105,6 +106,8 @@ fn main() {
             return;
         }
     }
+    // Windows: before anything is started, so that no login command opens a console window.
+    console::hidden_for_gui();
     let application = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
     // macOS keeps the app running when its last window closes: its Dock icon brings one back.
     application.on_reopen(app::reopen);

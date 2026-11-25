@@ -117,9 +117,11 @@ pub async fn connect_claude_code(hub: Arc<Hub>) -> Result<String> {
     let url = format!("http://127.0.0.1:{}/mcp", listening_port(&hub));
     run(async move {
         // Replace our entry if it is there already.
-        let _ =
-            tokio::process::Command::new(&bin).args(["mcp", "remove", "recouvrance", "--scope", "user"]).output().await;
-        let out = tokio::process::Command::new(&bin)
+        let _ = crate::process::tokio_command(&bin)
+            .args(["mcp", "remove", "recouvrance", "--scope", "user"])
+            .output()
+            .await;
+        let out = crate::process::tokio_command(&bin)
             .args([
                 "mcp",
                 "add",
@@ -171,7 +173,7 @@ pub fn listening_port(hub: &Hub) -> u16 {
 pub async fn claude_code_entry(hub: Arc<Hub>) -> ClaudeCodeEntry {
     let Some(bin) = claude_code() else { return ClaudeCodeEntry::Missing };
     run(async move {
-        let out = tokio::process::Command::new(&bin).args(["mcp", "get", "recouvrance"]).output().await?;
+        let out = crate::process::tokio_command(&bin).args(["mcp", "get", "recouvrance"]).output().await?;
         if !out.status.success() {
             return Ok(ClaudeCodeEntry::Missing);
         }
@@ -700,7 +702,7 @@ async fn ask_claude_code(
             work.path().join(format!("mcp-{}.json", uuid::Uuid::new_v4().simple())),
             cfg.to_string().as_bytes(),
         )?;
-        let mut cmd = tokio::process::Command::new(&bin);
+        let mut cmd = crate::process::tokio_command(&bin);
         cmd.current_dir(work.path())
             .args(claude_args(&question, cfg_file.path(), &scope, &model, conv.session.as_deref(), &code_dirs()))
             // `claude -p` reads a stdin that is not a terminal: give it none.
