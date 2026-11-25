@@ -1087,7 +1087,7 @@ fn image_summary(env: &Env) -> (Vec<(String, String)>, usize, String) {
         .iter()
         .take(pool.min(envs::IMAGES_SHOWN))
         .map(|(_, i)| {
-            let newest = i.tags.last().map(|t| envs::short_tag(t)).unwrap_or_default();
+            let newest = i.tags.last().map_or_default(|t| envs::short_tag(t));
             let tag = if i.tags.len() > 1 { format!("{newest} +{}", i.tags.len() - 1) } else { newest };
             (i.component.clone(), tag)
         })
