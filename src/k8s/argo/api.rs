@@ -49,9 +49,10 @@ const MAX_PROJECTS: usize = 50;
 const PROJECTS_EVERY: Duration = Duration::from_secs(5 * 60);
 
 /// The fields of an Application the page reads; the rest is not sent (`fields`).
-const APP_FIELDS: [&str; 26] = [
+const APP_FIELDS: [&str; 27] = [
     "metadata.name",
     "metadata.namespace",
+    "metadata.creationTimestamp",
     "metadata.labels",
     "metadata.annotations",
     "metadata.deletionTimestamp",
@@ -619,9 +620,10 @@ fn put(out: &mut Value, path: &[&str], v: Value) {
 /// ignore `fields`). Memory stays small however many there are: no resources, no
 /// manifests, the history's last deployments without their sources.
 pub fn lean(app: &Value) -> Value {
-    const KEPT: [&str; 17] = [
+    const KEPT: [&str; 19] = [
         "/metadata/name",
         "/metadata/namespace",
+        "/metadata/creationTimestamp",
         "/metadata/labels",
         "/metadata/deletionTimestamp",
         "/metadata/resourceVersion",
@@ -635,6 +637,7 @@ pub fn lean(app: &Value) -> Value {
         "/status/health/message",
         "/status/operationState/phase",
         "/status/operationState/message",
+        "/status/operationState/startedAt",
         "/status/operationState/finishedAt",
         "/status/resourceHealthSource",
     ];
@@ -909,7 +912,7 @@ impl Drop for Watch {
 /// Hold the feed of `endpoint`, starting it if none runs. Feeds are kept by server, login
 /// and config generation: a new login or a change in Settings starts a new one.
 pub fn watch(endpoint: &Endpoint) -> Watch {
-    let key = format!("{}#{}", endpoint.feed_key(), generation());
+    let key = watch_key(endpoint);
     let mut feeds = FEEDS.lock().unwrap_or_else(PoisonError::into_inner);
     let feed = feeds.entry(key.clone()).or_insert_with(|| {
         let state = Arc::new(Mutex::new(FeedState::default()));
@@ -918,6 +921,17 @@ pub fn watch(endpoint: &Endpoint) -> Watch {
     });
     feed.users += 1;
     Watch { endpoint: Arc::new(endpoint.clone()), state: feed.state.clone(), key }
+}
+
+/// What a feed of `endpoint` is kept under: its server, login and the config's generation.
+pub(crate) fn watch_key(endpoint: &Endpoint) -> String {
+    format!("{}#{}", endpoint.feed_key(), generation())
+}
+
+/// The feed of `endpoint` when a page holds one now, without holding it: a reader that
+/// shouldn't open a stream of its own (a Problems scan) reads it while it runs.
+pub fn running(endpoint: &Endpoint) -> Option<Arc<Mutex<FeedState>>> {
+    FEEDS.lock().unwrap_or_else(PoisonError::into_inner).get(&watch_key(endpoint)).map(|f| f.state.clone())
 }
 
 fn lock(state: &Mutex<FeedState>) -> std::sync::MutexGuard<'_, FeedState> {
@@ -1046,15 +1060,7 @@ async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>) -> Ended {
     };
     // Not kept in the sync journal from here: the list leaves out each resource's result, and
     // the stream, open first, sends every Application whole with it.
-    let listed: Apps = list
-        .get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(ApiApp::of)
-        .filter(|a| !a.summary.name.is_empty())
-        .map(|a| (a.key(), Arc::new(a)))
-        .collect();
+    let listed: Apps = listed(&list).map(|a| (a.key(), Arc::new(a))).collect();
     drop(list);
     let mut sent = Vec::new();
     while let Ok(batch) = rx.try_recv() {
@@ -1085,6 +1091,16 @@ async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>) -> Ended {
             None => return Ended::Routine,
         }
     }
+}
+
+/// The Applications of a list's answer, as kept.
+fn listed(list: &Value) -> impl Iterator<Item = ApiApp> + '_ {
+    list.get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(ApiApp::of)
+        .filter(|a| !a.summary.name.is_empty())
 }
 
 /// Read the projects' sync windows now and every `PROJECTS_EVERY` while the feed follows.
@@ -1165,6 +1181,20 @@ async fn check(conn: &Conn) -> Result<String, Failure> {
     let apps = conn.get("/api/v1/applications?fields=items.metadata.name").await?;
     let n = apps.get("items").and_then(Value::as_array).map_or(0, Vec::len);
     Ok(format!("Logged in as {who}, Argo CD {version}: {} readable", crate::plural::count(n, "Application")))
+}
+
+/// Every Application of `endpoint` its login may read: one list, no stream, each kept as
+/// the feeds keep them, within `timeout`. For a reader with no feed running (`running`).
+pub async fn list_once(endpoint: Endpoint, timeout: Duration) -> Result<Vec<Arc<ApiApp>>, String> {
+    let read = crate::k8s::run_abortable(async move {
+        let conn = match endpoint.conn() {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(e)),
+        };
+        let list = conn.get_within(&list_path(), timeout).await;
+        Ok(list.map(|list| listed(&list).map(Arc::new).collect()).map_err(|f| f.text))
+    });
+    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }
 
 /// The server at `base` as the config says now: a write goes with the login set now, and not

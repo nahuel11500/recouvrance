@@ -724,7 +724,7 @@ impl KubeMcp {
         };
         let ask = || shared::Ask { client: client.clone(), kinds: kinds.to_vec(), record: false };
         let found = shared::fresh(&scope, fresh, Lane::Foreground, ask).await.unwrap_or_default();
-        // A hub the agent's rules don't open is not named to it.
+        // A hub or an Argo CD server the agent's rules don't open is not named to it.
         let skipped = found
             .skipped_where(|s| argo_apps::skipped_hub(s).is_none_or(|hub| call.policy().context_allowed(hub)))
             .map(|s| format!("Not checked, could not read {s}."));
@@ -738,13 +738,15 @@ impl KubeMcp {
             .into_iter()
             .filter(|x| minor || x.severity != crate::problems::Severity::Info)
             .filter(|x| {
-                // Only what this agent may see. An Argo CD Application is read on its hub: the
-                // rules for Applications there decide.
-                if let Some(hub) = &x.on_hub {
-                    let app = k8s::argo::application_kind();
-                    let a =
-                        access_for(&app, &hub.context, Verb::List, Some(hub.namespace.clone()), Some(x.name.clone()));
-                    return problem_visible(call.policy(), call.approved_rules(), false, &a);
+                // Only what this agent may see. An Argo CD Application: the rules for
+                // Applications where it was read decide.
+                if let Some(on) = &x.on_hub {
+                    return problem_visible(
+                        call.policy(),
+                        call.approved_rules(),
+                        false,
+                        &argo_problem_access(on, &x.name),
+                    );
                 }
                 k8s::find_kind(&kinds, &x.kind).is_some_and(|k| {
                     let a = access_for(k, &p.context, Verb::List, x.namespace.clone(), Some(x.name.clone()));
@@ -1108,14 +1110,44 @@ fn container_lines(pod: &serde_json::Value) -> String {
     out
 }
 
+/// What an agent's rules decide on to see an Argo CD Application a scan found: listing
+/// Applications, in its own namespace, where it was read: on its hub context, or on the Argo
+/// CD server it was read from by Argo CD's API, which rules name by the server's name.
+fn argo_problem_access(on: &crate::problems::OnHub, name: &str) -> crate::mcp::Access {
+    let app = k8s::argo::application_kind();
+    access_for(&app, &on.context, Verb::List, Some(on.namespace.clone()), Some(name.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use serde_json::json;
 
-    use super::{KubeMcp, Measured, NEVER_ASKS, Policy, container_lines, dry_run_tools, measured, permissions};
+    use super::{KubeMcp, Measured, Mode, NEVER_ASKS, Policy, container_lines, dry_run_tools, measured, permissions};
     use crate::k8s::Kind;
+
+    /// An Application read from an Argo CD server is shown to an agent by its rules for that
+    /// server (by its name, as its protection is), not those of the cluster it deploys to.
+    #[test]
+    fn an_application_read_from_a_server_is_seen_by_its_rules() {
+        let allow = |r: &str| Policy {
+            rules: vec![crate::mcp::rules_file::parse_rule(Mode::Allow, r).unwrap()],
+            ..Policy::default()
+        };
+        let on = crate::problems::OnHub {
+            context: "argocd.example.com".into(),
+            namespace: "argocd".into(),
+            server: Some("https://argocd.example.com".into()),
+        };
+        let a = super::argo_problem_access(&on, "web");
+        let seen = |r: &str| super::problem_visible(&allow(r), &[], false, &a);
+        assert!(seen("list applications.argoproj.io --context argocd.example.com"));
+        assert!(seen("list applications.argoproj.io -n argocd --context argocd.example.com"));
+        assert!(!seen("list applications.argoproj.io -n other --context argocd.example.com"));
+        assert!(!seen("list applications.argoproj.io --context prod"));
+        assert!(!seen("list pods --context argocd.example.com"));
+    }
 
     /// `my_permissions` names every tool whose input takes `dry_run`, and no other: a list kept
     /// by hand named 5 of 13 (#843).
