@@ -18,5 +18,8 @@ mkdir -p "$target"
 exec 9>"$target/.pre-push.lock"
 flock 9
 export CARGO_TARGET_DIR="$target" CARGO_BUILD_JOBS=$(( $(nproc) / 2 ))
+# Worktrees share that target dir, so a check can look fresh for code it never saw: touch the
+# crate root so clippy always reads this checkout.
+touch src/main.rs
 cargo clippy --locked --all-targets --features dev -- -D warnings
 cargo clippy --locked --all-targets -- -D warnings
