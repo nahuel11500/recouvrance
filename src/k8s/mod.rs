@@ -34,6 +34,7 @@ mod login;
 pub(crate) mod meter;
 mod metrics;
 pub(crate) mod names;
+pub(crate) mod namespace_feed;
 mod node_specs;
 pub(crate) mod pod_copy;
 mod pod_requests;

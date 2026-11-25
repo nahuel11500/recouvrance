@@ -402,11 +402,20 @@ async fn load(context: String, client: Client, feed: &mut PodFeed) -> Summary {
         version,
         k8s::lists::list_lean::<NodeLite>(client.clone(), k8s::ar_of::<core::Node>(), None),
         feed.totals(),
-        k8s::namespaces(client.clone()),
+        namespace_count(&context, client.clone()),
         metrics(on, client.clone(), "/apis/metrics.k8s.io/v1beta1/nodes"),
         metrics(on, client.clone(), "/apis/metrics.k8s.io/v1beta1/pods"),
     );
     summarize(context, Answers { version, nodes, pods, namespaces, node_metrics, pod_metrics })
+}
+
+/// The cluster's namespaces: from its namespace watch when one holds them (no request),
+/// listed else.
+async fn namespace_count(context: &str, client: Client) -> Result<Vec<String>> {
+    match k8s::namespace_feed::listed(context) {
+        Some(names) => Ok(names.to_vec()),
+        None => k8s::namespaces(client).await,
+    }
 }
 
 /// What a cluster answered for its summary, each part on its own.

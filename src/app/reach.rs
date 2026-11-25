@@ -39,6 +39,8 @@ pub(super) struct Reached {
     pub skipped: Vec<k8s::SkippedGroup>,
     /// The namespaces listed, or the accessible ones set for the cluster; what failed else.
     pub namespaces: Result<Vec<String>, String>,
+    /// The watch that keeps them listed (none with accessible namespaces set).
+    pub feed: Option<k8s::namespace_feed::NamespaceHold>,
     /// The Pods list started with the connect (`EarlyList`).
     pub early: Option<StartedList>,
 }
@@ -67,11 +69,17 @@ pub(super) async fn reach(ctx: String, early: Option<EarlyList>) -> Result<Reach
     // A cluster with them watches one of its namespaces, which the connect decides: not
     // started here.
     let early = early.filter(|_| accessible.is_empty()).map(|e| e.start(&ctx, &client));
+    // Listed by the context's namespace watch, shared with the other windows (at once when
+    // one already has them), which keeps them listed from then on.
+    let mut feed = accessible.is_empty().then(|| k8s::namespace_feed::hold(&ctx, &client));
     let namespaces = {
-        let (name, c) = (ctx.clone(), client.clone());
+        let (name, feed) = (ctx.clone(), feed.as_mut());
         async move {
-            // Namespace listing may be forbidden; that is not fatal.
-            if accessible.is_empty() { listed_namespaces(&name, k8s::namespaces(c).await) } else { Ok(accessible) }
+            match feed {
+                // Namespace listing may be forbidden; that is not fatal.
+                Some(feed) => listed_namespaces(&name, feed.answer().await.result()),
+                None => Ok(accessible),
+            }
         }
     };
     let (found, namespaces) = futures::join!(k8s::discover_all(client.clone()), namespaces);
@@ -79,7 +87,7 @@ pub(super) async fn reach(ctx: String, early: Option<EarlyList>) -> Result<Reach
         Ok(d) => (Ok(d.kinds), d.skipped),
         Err(e) => (Err(e), Vec::new()),
     };
-    Ok(Reached { ctx, client, kinds, skipped, namespaces, early })
+    Ok(Reached { ctx, client, kinds, skipped, namespaces, feed, early })
 }
 
 /// The connects done once one of them `answered` and the others had until `late` ends (or
@@ -231,7 +239,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Reached { ctx, client, kinds, skipped, namespaces, early } = reached;
+        let Reached { ctx, client, kinds, skipped, namespaces, feed, early } = reached;
         let Ok(found) = kinds else { return };
         if !skipped.is_empty() {
             self.skipped_groups.extend(skipped.iter().map(|s| s.group.clone()));
@@ -259,8 +267,9 @@ impl AppView {
             p.contexts.push(joined);
             p.set_namespaces(all, cx);
         });
-        k8s::pod_copy::clean_up(&ctx, client.clone(), crate::settings::cluster(&ctx).namespaces);
         self.clusters.push((ctx.clone(), client.clone()));
+        self.follow_namespaces(feed.into_iter().collect(), cx);
+        k8s::pod_copy::clean_up(&ctx, client.clone(), crate::settings::cluster(&ctx).namespaces);
         // Its own timeline watches: the others' go on.
         crate::timeline::open(&ctx);
         let own: Vec<Kind> = self.served_kinds(ix).cloned().collect();

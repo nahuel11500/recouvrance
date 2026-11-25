@@ -493,6 +493,10 @@ pub struct ArgoView {
     /// The sync journal, shown over the rest while open; the Application words to filter it by.
     journal: Option<journal::JournalPage>,
     journal_search: Entity<InputState>,
+    /// The words a sync's steps are filtered by (status, kind, name), in the journal and the
+    /// dashboard's Last sync; lowercase.
+    steps_search: Entity<InputState>,
+    steps_query: String,
     /// An Application asked for from another page (`show_app`), whose dashboard opens once
     /// it is listed.
     asked: Option<Key>,
@@ -520,7 +524,14 @@ impl ArgoView {
     ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search Applications, or key=value…"));
         let journal_search = cx.new(|cx| InputState::new(window, cx).placeholder("Application…"));
+        let steps_search = cx.new(|cx| InputState::new(window, cx).placeholder("Steps: status, kind, name…"));
         let subs = vec![
+            cx.subscribe(&steps_search, |this, state, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.steps_query = state.read(cx).value().to_lowercase();
+                    cx.notify();
+                }
+            }),
             cx.subscribe(&journal_search, |this, state, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     let text = state.read(cx).value().to_string();
@@ -634,6 +645,8 @@ impl ArgoView {
             sync: None,
             journal: None,
             journal_search,
+            steps_search,
+            steps_query: String::new(),
             asked: None,
             _subs: subs,
         }

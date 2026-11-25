@@ -1211,6 +1211,7 @@ impl SettingsView {
                 crate::paths::shown_config("argocd-api-tokens.json")
             )))
             .children(self.argo_api.errors.iter().map(|e| div().pb_1().text_xs().text_color(theme.danger).child(e.clone())))
+            .children(self.argo_api.notes.iter().map(|n| div().pb_1().text_xs().text_color(muted).child(n.clone())))
             .when(self.argo_api.list.is_empty(), |d| {
                 d.child(div().py_2().text_sm().text_color(muted).child("No Argo CD server: add one below, or run `argocd login`."))
             })

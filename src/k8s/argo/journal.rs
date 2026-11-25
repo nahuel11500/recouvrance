@@ -22,6 +22,9 @@ use std::sync::{LazyLock, Mutex, PoisonError, mpsc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(feature = "dev")]
+pub mod example;
+
 /// The journal's file, in the data directory.
 const FILE: &str = "argocd-sync-journal.jsonl";
 /// The journal moves to `<file>.1` (replacing the older one) past this size.
@@ -62,6 +65,10 @@ pub struct Step {
     /// `PreSync`, `Sync`, `PostSync`… for a hook.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hook_type: String,
+    /// The phase it ran in (`PreSync`, `Sync`, `PostSync`, `SyncFail`); empty in lines written
+    /// before it was kept.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sync_phase: String,
 }
 
 impl Step {
@@ -77,6 +84,43 @@ impl Step {
     /// What it came to: a hook's phase, else its status.
     pub fn result(&self) -> &str {
         if self.hook_phase.is_empty() { &self.status } else { &self.hook_phase }
+    }
+
+    pub fn is_hook(&self) -> bool {
+        !self.hook_phase.is_empty() || !self.hook_type.is_empty()
+    }
+
+    /// The phase it ran in: as Argo CD says, else (an older line) its hook's type, else Sync.
+    pub fn phase(&self) -> &str {
+        if !self.sync_phase.is_empty() {
+            &self.sync_phase
+        } else if matches!(self.hook_type.as_str(), "PreSync" | "Sync" | "PostSync" | "SyncFail") {
+            &self.hook_type
+        } else {
+            "Sync"
+        }
+    }
+
+    /// An entry of `syncResult.resources`, its message cut.
+    pub fn of(r: &Value) -> Self {
+        Self {
+            group: text(r, "group"),
+            kind: text(r, "kind"),
+            namespace: text(r, "namespace"),
+            name: text(r, "name"),
+            status: text(r, "status"),
+            message: cut(&text(r, "message")),
+            hook_phase: text(r, "hookPhase"),
+            hook_type: text(r, "hookType"),
+            sync_phase: text(r, "syncPhase"),
+        }
+    }
+
+    /// Which resource it is, hashed: the same step in two states of an operation.
+    fn key(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&self.group, &self.kind, &self.namespace, &self.name, &self.hook_type).hash(&mut h);
+        h.finish()
     }
 }
 
@@ -214,16 +258,7 @@ pub fn record_of(instance: &str, app: &Value, seen: i64) -> Option<Record> {
         .into_iter()
         .flatten()
         .take(MAX_RESOURCES)
-        .map(|r| Step {
-            group: text(r, "group"),
-            kind: text(r, "kind"),
-            namespace: text(r, "namespace"),
-            name: text(r, "name"),
-            status: text(r, "status"),
-            message: cut(&text(r, "message")),
-            hook_phase: text(r, "hookPhase"),
-            hook_type: text(r, "hookType"),
-        })
+        .map(Step::of)
         .collect();
     Some(Record {
         seen,
@@ -408,12 +443,41 @@ fn line_of(r: &Record) -> std::io::Result<String> {
 // MARK: Reading
 
 /// An operation as the journal last saw it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Operation {
     /// Its last state.
     pub last: Record,
     /// How many states of it were written.
     pub states: usize,
+    /// When each step of `last` was seen, in the same order (empty when not worked out).
+    pub seen: Vec<Seen>,
+}
+
+/// When the journal saw a step, in seconds: how long it ran, as far as this machine knows
+/// (a step seen in one state only has no length).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Seen {
+    /// The first state holding it.
+    pub first: i64,
+    /// The first state where it had the result it has now.
+    pub settled: i64,
+}
+
+/// Each step's first sighting and that of its result, by step: worked out while reading.
+type Sightings = HashMap<u64, (i64, u64, i64)>;
+
+/// Note the steps of `r` in `seen`.
+fn sight(seen: &mut Sightings, r: &Record) {
+    for s in &r.resources {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        s.result().hash(&mut h);
+        let result = h.finish();
+        let e = seen.entry(s.key()).or_insert((r.seen, result, r.seen));
+        if e.1 != result {
+            e.1 = result;
+            e.2 = r.seen;
+        }
+    }
 }
 
 /// The journal as read: its operations, newest first, and how many lines didn't read.
@@ -428,6 +492,7 @@ pub struct Loaded {
 pub fn parse(texts: &[&str], now: i64) -> Loaded {
     let mut by_id: HashMap<OpId, usize> = HashMap::new();
     let mut ops: Vec<Operation> = Vec::new();
+    let mut sightings: Vec<Sightings> = Vec::new();
     let mut bad = 0;
     for text in texts {
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -442,13 +507,25 @@ pub fn parse(texts: &[&str], now: i64) -> Loaded {
                 continue;
             }
             if let Some(&i) = by_id.get(&r.id()) {
+                sight(&mut sightings[i], &r);
                 ops[i].states += 1;
                 ops[i].last = r;
             } else {
                 by_id.insert(r.id(), ops.len());
-                ops.push(Operation { last: r, states: 1 });
+                let mut seen = Sightings::new();
+                sight(&mut seen, &r);
+                sightings.push(seen);
+                ops.push(Operation { last: r, states: 1, seen: Vec::new() });
             }
         }
+    }
+    for (op, seen) in ops.iter_mut().zip(&sightings) {
+        op.seen = op
+            .last
+            .resources
+            .iter()
+            .map(|s| seen.get(&s.key()).map_or_default(|&(first, _, settled)| Seen { first, settled }))
+            .collect();
     }
     // Newest first: by when it started, else when it was seen.
     ops.sort_by_key(|o| {
@@ -628,6 +705,27 @@ mod tests {
         assert!(quick_print("i", &json!({"metadata": {"name": "web"}})).is_none());
     }
 
+    /// Each step of an operation read from several states says when it was first seen and
+    /// when it came to its result; its phase is kept.
+    #[test]
+    fn steps_say_when_they_were_seen() {
+        let job = |phase: &str| {
+            json!([{"group": "batch", "kind": "Job", "namespace": "shop", "name": "migrate", "hookType": "PreSync",
+                "hookPhase": phase, "syncPhase": "PreSync"}, res("web", "")])
+        };
+        let lines: Vec<String> = [(10, "Running"), (40, "Running"), (70, "Failed")]
+            .iter()
+            .map(|&(seen, phase)| {
+                let r = record_of("i", &app("Running", "2026-01-01T00:00:00Z", job(phase)), seen).unwrap();
+                serde_json::to_string(&r).unwrap()
+            })
+            .collect();
+        let loaded = parse(&[&lines.join("\n")], 100);
+        let op = &loaded.ops[0];
+        assert_eq!(op.last.resources[0].phase(), "PreSync");
+        assert_eq!(op.seen, [Seen { first: 10, settled: 70 }, Seen { first: 10, settled: 10 }]);
+    }
+
     #[test]
     fn a_full_journal_moves_aside_and_both_are_read() {
         let d = dir();
@@ -680,6 +778,7 @@ mod tests {
                 ..Default::default()
             },
             states: 1,
+            seen: Vec::new(),
         };
         let ops = [
             mk("web-prod", "Succeeded", "ana", "2026-01-10T00:00:00Z"),

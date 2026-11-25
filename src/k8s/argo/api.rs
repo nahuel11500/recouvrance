@@ -155,6 +155,9 @@ impl Endpoint {
 pub struct Endpoints {
     pub list: Vec<Endpoint>,
     pub errors: Vec<String>,
+    /// CLI contexts that can't be used here, and how to connect instead: said quietly in
+    /// Settings → Argo CD, not as an error on the Argo CD page.
+    pub notes: Vec<String>,
 }
 
 /// A server of the argocd CLI's config, as read (not `Debug`: it holds the token).
@@ -166,9 +169,14 @@ struct CliEntry {
     token: Option<String>,
 }
 
+/// The server name `argocd login --port-forward` saves: the CLI port-forwards to argocd-server
+/// itself each time, through the kubeconfig. There is no address to ask.
+const CLI_PORT_FORWARD: &str = "port-forward";
+
 /// The API servers of the argocd CLI's config `text`, one entry per context (`--core`
-/// contexts have none). A config that doesn't read gives nothing, and says why.
-fn cli_entries(text: &str) -> Result<Vec<CliEntry>, String> {
+/// contexts have none; a `--port-forward` one has none either, and a line in `notes` says
+/// so). A config that doesn't read gives nothing, and says why.
+fn cli_entries(text: &str, notes: &mut Vec<String>) -> Result<Vec<CliEntry>, String> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -178,6 +186,15 @@ fn cli_entries(text: &str) -> Result<Vec<CliEntry>, String> {
     for c in &config.contexts {
         let Some(s) = config.servers.iter().find(|s| s.server == c.server) else { continue };
         if s.core || s.server.trim().is_empty() {
+            continue;
+        }
+        if s.server.trim() == CLI_PORT_FORWARD {
+            notes.push(format!(
+                "argocd CLI context {} uses the CLI's port-forward mode, which can't be used here: log in to the \
+                 server's address instead (`argocd login <address>`), or port-forward to argocd-server yourself \
+                 and add http://localhost:<port> here",
+                c.name
+            ));
             continue;
         }
         let scheme = if s.plain_text { "http" } else { "https" };
@@ -241,7 +258,7 @@ fn endpoints_from(
     }
     let mut cli_tokens: HashMap<String, Option<String>> = HashMap::new();
     let mut entries = match cli {
-        Some(Ok(text)) => cli_entries(&text).unwrap_or_else(|e| {
+        Some(Ok(text)) => cli_entries(&text, &mut out.notes).unwrap_or_else(|e| {
             out.errors.push(e);
             Vec::new()
         }),
@@ -1464,6 +1481,9 @@ contexts:
 - name: remote-plain
   server: plain.example.com
   user: dev
+- name: port-forward
+  server: port-forward
+  user: port-forward
 current-context: prod-again
 servers:
 - server: argocd-dev.example.com
@@ -1476,6 +1496,8 @@ servers:
 - server: kubernetes
   core: true
 - server: plain.example.com
+  plain-text: true
+- server: port-forward
   plain-text: true
 users:
 - name: dev
@@ -1510,6 +1532,9 @@ users:
         // Plain http to another machine would send the token in clear: not used, said why.
         assert_eq!(e.errors.len(), 1, "{:?}", e.errors);
         assert!(e.errors[0].contains("remote-plain"));
+        // `argocd login --port-forward` (#1075): no address to ask, said quietly, not an error.
+        assert_eq!(e.notes.len(), 1, "{:?}", e.notes);
+        assert!(e.notes[0].starts_with("argocd CLI context port-forward uses the CLI's port-forward mode"));
     }
 
     #[test]

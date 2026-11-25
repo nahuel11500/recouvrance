@@ -1759,6 +1759,73 @@ async fn followed_until(
     tokio::time::timeout(std::time::Duration::from_secs(60), wait).await.context("never sent")?
 }
 
+/// The namespaces a connect listed follow the cluster: one created afterwards shows in the
+/// context's namespace watch, and goes once deleted, for every holder of that one watch.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn the_namespace_list_follows_namespaces_created_and_deleted() {
+    use k8s_openapi::api::core::v1::Namespace;
+    const NAME: &str = "recouvrance-ns-test";
+
+    async fn until(
+        feed: &mut k8s::namespace_feed::NamespaceHold,
+        what: &str,
+        holds: impl Fn(&[String]) -> bool,
+    ) -> Result<()> {
+        for _ in 0..120 {
+            if holds(&feed.now().names) {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        bail!("{what}: {:?}", feed.now())
+    }
+
+    /// Once `NAME` is deleted: it is terminating until what it holds is gone.
+    async fn gone(namespaces: &Api<Namespace>) -> Result<()> {
+        for _ in 0..180 {
+            if namespaces.get_opt(NAME).await?.is_none() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let left = namespaces.get_opt(NAME).await?.and_then(|ns| ns.status);
+        bail!("{NAME} still terminating after 3 minutes: {left:?}")
+    }
+
+    run(async {
+        let ctx = context();
+        let truth = k8s::connect_for_agents(ctx.clone()).await?;
+        let namespaces: Api<Namespace> = Api::all(truth.clone());
+        let _ = namespaces.delete(NAME, &DeleteParams::default()).await;
+        gone(&namespaces).await?;
+
+        let ui = k8s::connect(ctx.clone()).await?;
+        let mut feed = k8s::namespace_feed::hold(&ctx, &ui);
+        let first = feed.answer().await;
+        let listed = first.result().map_err(anyhow::Error::msg)?;
+        assert!(listed.iter().any(|n| n == "default"), "{listed:?}");
+        assert!(!listed.iter().any(|n| n == NAME), "{listed:?}");
+        // A second window shares the watch: answered at once, from the same list.
+        let mut other = k8s::namespace_feed::hold(&ctx, &ui);
+        assert_eq!(other.answer().await.names, first.names);
+
+        let ns = serde_json::from_value(json!({"metadata": {"name": NAME}}))?;
+        namespaces.create(&PostParams::default(), &ns).await?;
+        until(&mut feed, "created", |n| n.iter().any(|n| n == NAME)).await?;
+        until(&mut other, "created, in the other window", |n| n.iter().any(|n| n == NAME)).await?;
+        assert!(k8s::namespace_feed::listed(&ctx).is_some_and(|n| n.iter().any(|n| n == NAME)));
+
+        namespaces.delete(NAME, &DeleteParams::default()).await?;
+        // Terminating until its contents are gone: listed until then, as the API lists it.
+        gone(&namespaces).await?;
+        until(&mut feed, "deleted", |n| !n.iter().any(|n| n == NAME)).await?;
+        drop((feed, other));
+        assert!(k8s::namespace_feed::listed(&ctx).is_none(), "the last hold stops the watch");
+        Ok(())
+    });
+}
+
 /// A detail page follows its object with a watch on its name, and its pods with a watch on
 /// their labels, as a real API server serves them (field and label selectors, bookmarks,
 /// deletions): a change shows with no read asked, a deletion says so, and the object created
