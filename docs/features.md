@@ -328,9 +328,9 @@
   starts it and it stays 5 minutes after the last page that asked; a server that is down is
   said, never waited on again meanwhile. An object's Application is read whole once found, for
   the object's own state in it; a namespace's are those whose destination is that namespace
-  of this cluster. One read by the API opens on the Argo CD page's dashboard, and its actions go through
-  Argo CD's API (a sync of the whole Application). Only when no server has it are they read
-  from the hub, found among the connected clusters, else among other kubeconfig contexts that
+  of this cluster. One read by the API opens on the Argo CD page's dashboard, and its actions
+  go through Argo CD's API (a sync of the whole Application). Only when no server has it are
+  they read from the hub, found among the connected clusters, else among other kubeconfig contexts that
   need no separate login; when the hub isn't found, the Argo CD page lists the contexts left
   out (named like a hub first) to ask with one click, and the one that answers is kept. It can
   also be ticked in Settings → Contexts (*Argo CD*; see
