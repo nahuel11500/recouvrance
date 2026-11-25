@@ -481,6 +481,23 @@ impl ArgoView {
             .zip([example::ENVIRONMENTS[1], example::ENVIRONMENTS[0], example::ENVIRONMENTS[2]])
             .map(|(name, env)| (name.to_string(), Arc::new(Cards::of(example::read(env, now), None, now))))
             .collect();
+        // Made-up commits for the images whose tag holds one.
+        for (n, (repo, tag)) in example::commits().into_iter().enumerate() {
+            let Some(sha) = crate::git_host::sha_of(&tag) else { continue };
+            let titles =
+                ["feat(cart): pay in three times", "fix(search): a timeout on slow queries", "chore: bump deps"];
+            crate::git_host::pretend(
+                &repo,
+                &tag,
+                crate::git_host::Commit {
+                    sha: sha.to_string(),
+                    title: titles[n % titles.len()].to_string(),
+                    author: "Ann Example".into(),
+                    date: Timestamp::from_second(now.as_second() - 3600 * (2 + n as i64 * 7)).ok(),
+                    url: format!("https://git.example.com/shop/{n}/-/commit/{sha}"),
+                },
+            );
+        }
         let mut d = Dashboard::new("shop-prod-acme (example, no real data)".into(), Vec::new(), 0);
         d.kind = "prod".into();
         d.server = "argocd.example.com".into();
@@ -1130,7 +1147,15 @@ impl ArgoView {
         let v = &c.versions;
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let own = d.current().map(|k| self.own_images(k)).unwrap_or_default();
+        // Not listed (the example): those named after the environment's product.
+        let own = d.current().map(|k| self.own_images(k)).unwrap_or_else(|| {
+            let product = d.title.split('-').next().unwrap_or_default();
+            v.images
+                .iter()
+                .filter(|i| argo::environments::named_after(&i.repo, product))
+                .map(|i| i.repo.clone())
+                .collect()
+        });
         let (mine, others): (Vec<(usize, &dashboard::Image)>, Vec<(usize, &dashboard::Image)>) =
             v.images.iter().enumerate().partition(|(_, i)| own.contains(&i.repo));
         // Nothing known as the product's: every image, as Argo CD lists them.
