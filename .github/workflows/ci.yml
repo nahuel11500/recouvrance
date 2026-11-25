@@ -1,9 +1,10 @@
 name: CI
 
-# Pull requests get the quick checks, in about two minutes: format, spelling, licenses and
-# clippy (with and without the developer tools). Pushes to main, release tags and manual runs
-# get everything: the tests, the end-to-end run on a kind cluster (the write guards), Windows,
-# macOS, the minimum Rust version, docs and release builds. A failure on main is fixed first.
+# Pull requests get format, spelling, licenses, clippy (with and without the developer tools)
+# and the tests, in parallel, in about four minutes: agents don't compile tests on the shared
+# machine. Pushes to main add the end-to-end run on a kind cluster (the write guards), Windows,
+# macOS, the minimum Rust version and docs; a failure on main is fixed first. Release builds
+# run only for tags and manual runs (the release itself is built by release.yml).
 # (merge_group stays for a merge queue, which needs an organization-owned repository.)
 on:
   pull_request:
@@ -92,7 +93,6 @@ jobs:
 
   test:
     name: Tests
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -247,7 +247,7 @@ jobs:
 
   build:
     name: Release build (${{ matrix.target }})
-    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     needs: [quick, clippy, test]
     strategy:
       fail-fast: false
