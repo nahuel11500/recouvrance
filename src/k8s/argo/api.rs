@@ -2204,7 +2204,7 @@ users:
             Some(&json!(["registry.example/shop/api:main-0123456"]))
         );
         assert_eq!(
-            ApiApp::of(&full).value.pointer("/status/summary/images").and_then(Value::as_array).map(Vec::len),
+            super::ApiApp::of(&full).value.pointer("/status/summary/images").and_then(Value::as_array).map(Vec::len),
             Some(1)
         );
     }
