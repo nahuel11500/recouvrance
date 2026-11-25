@@ -46,6 +46,7 @@ pub(crate) mod short_names;
 mod sources;
 mod table;
 pub(crate) mod topolvm;
+mod unreachable;
 mod writes;
 
 pub(crate) use access::*;
@@ -179,8 +180,8 @@ pub fn mask_secret_values(value: &mut serde_json::Value) {
 }
 
 /// An error as a person reads it: the API server's own message (not kube's debug dump of
-/// the whole Status), a context's login command that failed by its program and error,
-/// otherwise the error chain.
+/// the whole Status), a context's login command that failed by its program and error, a
+/// connection that failed by its reason (refused, DNS, TLS), otherwise the error chain.
 pub fn short_error(e: &anyhow::Error) -> String {
     if let Some(said) = login::login_failure(e.as_ref()) {
         return said;
@@ -190,6 +191,9 @@ pub fn short_error(e: &anyhow::Error) -> String {
             // A plain-text body ("404 page not found\n") keeps its newline.
             return impersonation_refused(&status.message).unwrap_or_else(|| status.message.trim().to_string());
         }
+    }
+    if let Some(said) = unreachable::connect_failure(e.as_ref()) {
+        return said;
     }
     let text = format!("{e:#}");
     // A timeout from the connect or request deadline, said plainly instead of
@@ -203,9 +207,18 @@ pub fn short_error(e: &anyhow::Error) -> String {
 
 /// An error with what was being done when it happened, as `{e:#}` says it. A context's login
 /// command that failed is said alone (its program, exit code and last stderr line), without
-/// kube's `ServiceError` and the request around it.
+/// kube's `ServiceError` and the request around it; a connection that failed by its reason
+/// (as [`short_error`] says it), after what was being done.
 pub fn error_chain(e: &anyhow::Error) -> String {
-    login::login_failure(e.as_ref()).unwrap_or_else(|| format!("{e:#}"))
+    if let Some(said) = login::login_failure(e.as_ref()) {
+        return said;
+    }
+    if let Some(said) = unreachable::connect_failure(e.as_ref()) {
+        let doing =
+            (e.chain()).take_while(|c| !c.is::<kube::Error>() && !unreachable::is_connect(*c)).map(ToString::to_string);
+        return doing.chain([said]).collect::<Vec<_>>().join(": ");
+    }
+    format!("{e:#}")
 }
 
 /// Whether `e`, or an error behind it, is a context's login command that failed.

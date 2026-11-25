@@ -313,7 +313,7 @@ impl AppView {
                     }
                     Err(e) => {
                         this.list.notice = None;
-                        this.connect_errors = Some(format!("{e:#}").into());
+                        this.connect_errors = Some(k8s::error_chain(&e).into());
                         // Each context says why it failed where the list goes; one that has
                         // no reason of its own (it served no API) takes the connect's.
                         this.conn.give_up(&contexts, &k8s::short_error(&e));
