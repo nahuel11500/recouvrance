@@ -394,13 +394,28 @@ impl AppView {
 
     /// What the bar above the list says: what failed (add-on APIs, watches), then progress.
     pub(super) fn status_line(&self) -> Option<SharedString> {
-        // Each context's own failure is said by its line (see `connect_view`), not here.
-        let skipped = super::contexts::skipped_notice(&self.skipped, self.clusters.len());
-        let failed: Option<SharedString> = match (&self.connect_notes, skipped) {
-            (Some(notes), Some(skipped)) => Some(format!("{notes}; {skipped}").into()),
-            (notes, skipped) => notes.clone().or(skipped),
-        };
+        let failed = self.failed_line(&k8s::short_names::short_name).map(SharedString::from);
         self.list.status_line(failed.as_ref())
+    }
+
+    /// The status line's failures with each context's full name, for its hover: None when
+    /// the line names none by a shorter one.
+    pub(super) fn status_hover(&self) -> Option<SharedString> {
+        let full = self.failed_line(&|c: &str| c.to_string())?;
+        (Some(&full) != self.failed_line(&k8s::short_names::short_name).as_ref()).then(|| full.into())
+    }
+
+    /// What failed besides each context's own failure (said by its line, see `connect_view`):
+    /// the connect's notes, then the add-on APIs, each context named by `name`.
+    fn failed_line(&self, name: &dyn Fn(&str) -> String) -> Option<String> {
+        let contexts: Vec<&str> =
+            (self.clusters.iter().map(|(c, _)| c.as_str())).chain(self.conn.iter().map(|(c, _)| c.as_str())).collect();
+        let notes = super::conn::notes_line(&self.connect_notes, &contexts, name);
+        let skipped = super::contexts::skipped_notice(&self.skipped, self.clusters.len(), name);
+        match (notes, skipped) {
+            (Some(notes), Some(skipped)) => Some(format!("{notes}; {skipped}")),
+            (notes, skipped) => notes.or(skipped),
+        }
     }
 
     /// Keep the list on screen in `views` (if it was complete), before another replaces it.

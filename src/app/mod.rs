@@ -517,7 +517,8 @@ pub struct AppView {
     conn: conn::ConnStates,
     /// What the bar above the list says of the connect besides each context's state (a
     /// namespace list that failed, the kubeconfig that can't be read).
-    connect_notes: Option<SharedString>,
+    /// Kept with full names: the status line names each context as the screen does.
+    connect_notes: Vec<String>,
     /// The add-on API groups a connected cluster couldn't read (`k8s::SkippedGroup`), until
     /// the next connect: by cluster, for the status line, and their names.
     skipped: Vec<(String, Vec<k8s::SkippedGroup>)>,
@@ -806,7 +807,7 @@ impl AppView {
             forwards_open: false,
             table,
             // A kubeconfig that can't be read shows where connect errors do.
-            connect_notes: status.clone(),
+            connect_notes: status.iter().map(|s| s.to_string()).collect(),
             connect_errors: status,
             conn: conn::ConnStates::default(),
             skipped_groups: HashSet::new(),
