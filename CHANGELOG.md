@@ -5,6 +5,55 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/nahuel11500/recouvrance/compare/v0.12.0...v0.13.0) - 2026-11-25
+
+### Added
+
+- *(argo)* The grouped diff says one change on many resources once, values compared without each environment's names (#1123)
+- *(argo)* An Application's Sync diff says what changes, the YAML on demand (#1111)
+- *(argo)* An expired argocd CLI login is renewed by running the CLI (#1119)
+- *(argo)* The hub settings go; a read-only hub's Argo CD server stays read-only, hub favorites move to their server (#1120)
+- *(argo)* After a selective sync, In cluster, Why and Last sync say it, and Roll back says it undoes it (#1113)
+- *(argo)* The product's own images first, with the commit their tag was built from (#1112)
+- *(argo)* An Application opened as an object is read only, with Open in Argo CD found by its uid (#1118)
+- *(argo)* Connect to Argo CD… from the app: SSO, password or token, kept signed in (#1056)
+- *(argo)* The dashboard shows what's held when a read fails, why in one line (#1103)
+- *(argo)* An overview on the Argo CD page: what needs a look, the version per environment type, the last operations (#1106)
+- *(agents)* The Argo CD tools read and act only through Argo CD's API, judged where each Application deploys (#1104)
+- *(argo)* One dashboard per environment, opening on its workload, with previous and next (#1097)
+- *(argo)* The Argo CD page remembers its filters, search, grouping and folds (#1096)
+- *(argo)* The Argo CD page lists environments, grouped by project and type, with their image tags (#1095)
+- *(argo)* The Applications page reads Argo CD only through its API (#1081)
+- *(argo)* An object's Argo CD Application is found in Argo CD's API feeds (#1059)
+- *(argo)* A sync's steps lead with its cause, the rest folded by kind (#1092)
+- *(problems)* Argo CD Applications read from Argo CD's API (#1058)
+
+### Changed
+
+- *(argo)* [**breaking**] Argo CD is read only through its API: the hub fallbacks go (#1122)
+
+### Fixed
+
+- *(argo)* An Application's sync diff says a resource's fields in one line (#1139)
+- *(argo)* An environment's destination is where its workload runs, not its app of apps' (#1138)
+- *(argo)* Needs a look is one rule for the filter, the headings, the Overview and the agents (#1137)
+- *(argo)* An Application read by the API keeps the images it runs (#1136)
+- *(argo)* The grouped sync without hooks lists no hook skipped under an Application it leaves as it is (#1130)
+- *(argo)* In Connect to Argo CD, Enter reads the address and the address is focused (#1129)
+- *(argo)* A server refusing this machine is said plainly, once, not as an expired login (#1131)
+- *(argo)* When no Argo CD server could be read, its Applications are unknown, not none (#1128)
+- *(docs)* A doc link to api::test names the function, not the test attribute (#1121)
+- *(argo)* Renew a login for agents and Problems too, quieter outages, two instances (#1116)
+- *(argo)* The sync opens in read-only mode, and turning writes on for it says what it allows (#1105)
+- *(problems)* A context of the set that can't connect is said over the Problems page and the overviews (#1101)
+- *(argo)* Grouped sync without hooks syncs only the resources out of sync, and lists the hooks it skips (#1102)
+- *(argo)* A destination reaches the context Argo CD's cluster name names, its URL and context on hover (#1100)
+- *(namespaces)* The namespace picker follows namespaces created and deleted after the connect (#1091)
+- *(argo)* An argocd CLI --port-forward context is skipped with a quiet note (#1082)
+- *(argo)* The Argo CD page says which servers it is still reading, never 0 Applications (#1080)
+- *(argo)* A chart's version among several sources is never asked for its commit (#1079)
+- *(argo)* An Application's dashboard fits its window: status tiles, wrapping chips, short tags (#1060)
+
 ## [0.12.0](https://github.com/nahuel11500/recouvrance/compare/v0.11.0...v0.12.0) - 2026-11-25
 
 ### Added
