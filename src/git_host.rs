@@ -13,8 +13,8 @@
 //! An image's repository names its project: `registry.example.com/shop/api` is `shop/api` on
 //! a GitLab (its registry under the project, so `shop` is tried too); `ghcr.io/owner/repo` is
 //! `owner/repo` on GitHub. A GitLab whose registry domains name the image's registry is
-//! asked first, then the other GitLabs. Each answer is kept for the session (a commit doesn't
-//! change), a project that doesn't have it too; a failure is asked again after a while.
+//! asked first, then the other GitLab hosts. Each answer is kept for the session (a commit
+//! doesn't change), a project that doesn't have it too; a failure is asked again after a while.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -276,7 +276,7 @@ fn parse_commit(forge: Forge, v: &Value) -> Option<Commit> {
     if sha.is_empty() {
         return None;
     }
-    let url = url.starts_with("https://").then_some(url).unwrap_or_default();
+    let url = if url.starts_with("https://") { url } else { String::new() };
     Some(Commit {
         sha,
         title: message.lines().next().unwrap_or_default().trim().to_string(),

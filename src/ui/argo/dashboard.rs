@@ -1148,15 +1148,19 @@ impl ArgoView {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         // Not listed (the example): those named after the environment's product.
-        let own = d.current().map(|k| self.own_images(k)).unwrap_or_else(|| {
-            let product = d.title.split('-').next().unwrap_or_default();
-            v.images
-                .iter()
-                .filter(|i| argo::environments::named_after(&i.repo, product))
-                .map(|i| i.repo.clone())
-                .collect()
-        });
-        let (mine, others): (Vec<(usize, &dashboard::Image)>, Vec<(usize, &dashboard::Image)>) =
+        let own = d.current().map_or_else(
+            || {
+                let product = d.title.split('-').next().unwrap_or_default();
+                v.images
+                    .iter()
+                    .filter(|i| argo::environments::named_after(&i.repo, product))
+                    .map(|i| i.repo.clone())
+                    .collect()
+            },
+            |k| self.own_images(k),
+        );
+        type Numbered<'a> = Vec<(usize, &'a dashboard::Image)>;
+        let (mine, others): (Numbered, Numbered) =
             v.images.iter().enumerate().partition(|(_, i)| own.contains(&i.repo));
         // Nothing known as the product's: every image, as Argo CD lists them.
         let folded = !mine.is_empty() && !others.is_empty() && !d.is_open("images");
