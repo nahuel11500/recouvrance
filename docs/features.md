@@ -282,17 +282,24 @@
   that report an error condition (`ComparisonError`, `SyncError`, `InvalidSpecError`...), whose
   sync has run for more than 10 minutes, or that have resources Missing with auto-sync on
   (warnings). An Application synced by hand is never listed for being out of sync, nor for what it
-  has not deployed yet (Missing). They count in the sidebar badge, `find_problems` reports them, and
-  a row opens the Application's page on its hub, which needn't be connected; the reason names the
-  hub when it is another cluster. The hubs read are the cluster scanned when it serves Argo CD,
-  and those found this session by the Argo CD page or an object's Argo CD section (only the ones
-  set in Settings, when some are): a scan in the background asks no other context, and so never
-  starts a login for a context not logged in this session (one logged in may refresh its
-  credentials as it would anywhere else in the app). Each hub's Applications are read lean, from
-  the API server's cache, at most once a minute for every cluster scanned; a hub that doesn't
-  answer within 20 seconds is named as not checked, and that answer serves every cluster's scan
-  for the minute, so it doesn't hold back what the others found. A cluster whose Applications you
-  may not list (access to some namespaces only) shows no Argo CD line.
+  has not deployed yet (Missing). They count in the sidebar badge and `find_problems` reports them.
+  They are read from Argo CD's API (see *Argo CD by its API*): every server the argocd CLI is
+  logged in to or set in Settings → Argo CD, the feeds the Argo CD page holds while it is open
+  (no request then), else one list per server at most once a minute for every cluster scanned. A
+  server that doesn't answer within 20 seconds, or can't be logged in to, is named as not checked,
+  and that answer serves every cluster's scan for the minute. An Application goes under the
+  cluster its destination maps to in the kubeconfig (by the API server's address, or by name; its
+  `in-cluster` is the cluster whose Argo CD server is that one in Settings → Per cluster), the
+  reason names its Argo CD, and a row opens its dashboard on the Argo CD page. An agent sees one
+  when its rules let it `list` `applications.argoproj.io` with the server's name as the context.
+  With no Argo CD server logged in, they are read on their hub instead, which needn't be
+  connected (a row opens the Application's page there; the reason names the hub when it is
+  another cluster): the cluster scanned when it serves Argo CD, and those found this session by
+  the Argo CD page or an object's Argo CD section (only the ones set in Settings, when some are).
+  A scan in the background asks no other context, and so never starts a login for a context not
+  logged in this session. Each hub's Applications are read lean, from the API server's cache, at
+  most once a minute for every cluster scanned, with the same 20 seconds; a cluster whose
+  Applications you may not list (access to some namespaces only) shows no Argo CD line.
 - **ExternalSecrets**: ExternalSecrets that fail to sync and secret stores not Ready show on the
   Problems page; a Secret made by an ExternalSecret shows where it comes from (the ExternalSecret,
   its store, last refresh, Ready), and an ExternalSecret's page links its store and target Secret.

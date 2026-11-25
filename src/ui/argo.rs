@@ -493,7 +493,19 @@ pub struct ArgoView {
     /// The sync journal, shown over the rest while open; the Application words to filter it by.
     journal: Option<journal::JournalPage>,
     journal_search: Entity<InputState>,
+    /// An Application asked for from another page (`show_app`), whose dashboard opens once
+    /// it is listed.
+    asked: Option<Key>,
     _subs: Vec<Subscription>,
+}
+
+/// Ask the app to open the Argo CD page on an Application's dashboard: by its Argo CD
+/// (`Endpoint::instance`), namespace and name.
+#[derive(Clone, Debug)]
+pub struct OpenArgoApp {
+    pub instance: String,
+    pub namespace: String,
+    pub name: String,
 }
 
 impl EventEmitter<OpenOnContext> for ArgoView {}
@@ -622,8 +634,33 @@ impl ArgoView {
             sync: None,
             journal: None,
             journal_search,
+            asked: None,
             _subs: subs,
         }
+    }
+
+    /// Open the dashboard of the Application `app` (from the Problems page), over what the
+    /// page shows; once it is listed when it isn't yet.
+    pub fn show_app(&mut self, app: &OpenArgoApp, cx: &mut Context<Self>) {
+        self.asked = Some((app.instance.clone(), app.namespace.clone(), app.name.clone()));
+        self.open_asked(cx);
+        cx.notify();
+    }
+
+    /// Open the dashboard asked for by `show_app` if its Application is listed now.
+    fn open_asked(&mut self, cx: &mut Context<Self>) {
+        let Some(k) = self.asked.clone() else { return };
+        let listed = self.rows.as_ref().is_some_and(|r| r.fleet.apps.iter().any(|a| key(a) == k));
+        if !listed {
+            return;
+        }
+        self.asked = None;
+        self.journal = None;
+        self.grouped = None;
+        if let Some(sync) = &mut self.sync {
+            sync.shown = false;
+        }
+        self.open_dashboard(&k, cx);
     }
 
     /// Show a read of the hubs, unless one that started later is shown already.
@@ -677,6 +714,7 @@ impl ArgoView {
             this.rows = Some(rows);
             this.refilter(cx);
             this.dashboard_changed(cx);
+            this.open_asked(cx);
             cx.notify();
         });
     }

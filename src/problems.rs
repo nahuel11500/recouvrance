@@ -37,11 +37,17 @@ pub struct Problem {
     pub on_hub: Option<OnHub>,
 }
 
-/// Where an Argo CD Application found by a scan lives: its hub, and its own namespace there.
+/// Where an Argo CD Application found by a scan lives: its Argo CD, and its own namespace
+/// there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OnHub {
+    /// The hub context it was read on, or the name of the Argo CD API server it was read from
+    /// (`argocd.example.com`, as agents' rules name a server).
     pub context: String,
     pub namespace: String,
+    /// Read from Argo CD's API: that Argo CD (`Endpoint::instance`), whose Argo CD page
+    /// dashboard opens it.
+    pub server: Option<String>,
 }
 
 fn cell<'a>(defs: &[ColumnDef], row: &'a Row, name: &str) -> &'a str {

@@ -245,8 +245,9 @@ impl AppView {
         });
     }
 
-    /// Open an Argo CD Application on its hub from the Problems page: with the client the hub
-    /// was found with, else connected anew (released with the page).
+    /// Open an Argo CD Application from the Problems page: one read by Argo CD's API on the
+    /// Argo CD page's dashboard; one read on its hub there, with the client the hub was found
+    /// with, else connected anew (released with the page).
     pub(super) fn follow_hub_links(
         &mut self,
         page: &Entity<crate::ui::problems_view::ProblemsView>,
@@ -256,6 +257,13 @@ impl AppView {
         cx.subscribe_in(page, window, |this, page, ev: &crate::details::OpenOn, window, cx| {
             let own = k8s::argo::known_client(&ev.context).map(|client| (ev.context.clone(), client));
             this.open_on(ev.context.clone(), ev.res.clone(), own, page.entity_id(), window, cx);
+        })
+        .detach();
+        cx.subscribe_in(page, window, |this, _, ev: &crate::ui::argo::OpenArgoApp, window, cx| {
+            this.open_argo(window, cx);
+            if let Route::Argo(argo) = this.route().clone() {
+                argo.update(cx, |argo, cx| argo.show_app(ev, cx));
+            }
         })
         .detach();
     }
