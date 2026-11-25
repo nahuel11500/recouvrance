@@ -63,6 +63,10 @@ http-body-util = "0.1"
 bytes = "1"
 tower = { version = "0.5.3", default-features = false, features = ["timeout"] }
 
+[target.'cfg(windows)'.dependencies]
+# Approval notifications as native toasts (WinRT, no PowerShell process).
+tauri-winrt-notification = "0.8.1"
+
 [dev-dependencies]
 proptest = "1.12.0"
 
