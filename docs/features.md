@@ -387,8 +387,10 @@
   Argo CD server that can't be read is named above the list; the others are shown. An
   environment's project is its workload's (an app of apps often sits in a project of its own),
   and the project filter keeps it for any of its Applications' projects. A project or type
-  picked shows on its button, highlighted (*Project: shop*, *Type: acc*), *Clear filters*
-  turns every filter and the search off, and the count says *filtered*.
+  picked shows on its button, highlighted (*Project: shop*, *Type: acc*; a long name ends in
+  "…" and its tooltip says it whole), the funnel button (*Clear filters*) turns every filter and
+  the search off, and the count says *filtered*. The toolbar stays on one line at the default
+  window width with filters on: the search gets narrower first.
 - **Argo CD by its API**: Applications are read from Argo CD's own API, with the argocd CLI's
   login (`argocd login`, its contexts, servers and tokens; `--insecure`, `--plaintext` to this
   machine and `--grpc-web-root-path` are honoured, `--core` contexts have no server) or a token
