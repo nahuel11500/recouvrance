@@ -97,14 +97,110 @@ pub struct Node {
     pub health: Option<String>,
     pub tone: Tone,
     pub message: Option<String>,
-    /// Its pods ready, of all of them, when it has pods.
-    pub pods: Option<(usize, usize)>,
+    /// What its pods are doing, when it has pods.
+    pub pods: Option<Pods>,
+}
+
+/// The pods under an object, by what they are doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pods {
+    /// Running and ready.
+    pub ready: usize,
+    /// Run to completion: never ready, and not meant to be.
+    pub done: usize,
+    /// In trouble: failed, crashing, evicted…
+    pub failed: usize,
+    pub all: usize,
+}
+
+impl Pods {
+    /// One pod node of the tree.
+    fn of_pod(pod: &Value) -> Self {
+        let (reason, tone) = pod_state(pod);
+        let mut out = Self { all: 1, ..Self::default() };
+        match tone {
+            Tone::Good => out.ready = 1,
+            Tone::Bad => out.failed = 1,
+            Tone::Done if matches!(reason.as_str(), "Completed" | "Succeeded") => out.done = 1,
+            _ => {}
+        }
+        out
+    }
+
+    fn add(&mut self, o: Self) {
+        self.ready += o.ready;
+        self.done += o.done;
+        self.failed += o.failed;
+        self.all += o.all;
+    }
+
+    /// Those that should be ready: all but those run to completion.
+    pub fn serving(&self) -> usize {
+        self.all - self.done
+    }
+
+    /// Those neither done nor failed: starting or running.
+    fn running(&self) -> usize {
+        self.all - self.done - self.failed
+    }
+
+    /// Whether to say them as runs (done, running, failed) rather than ready of all: for what
+    /// runs to completion (`jobs`), or when none of them should be ready.
+    fn as_runs(&self, jobs: bool) -> bool {
+        jobs || self.serving() == 0
+    }
+
+    /// What the row says of them, and its tone. For what runs to completion (`jobs`): how many
+    /// are done, running and failed (`2 done, 1 failed`). For what serves: ready of those that
+    /// should be (`1/2`), a pod run to completion not counted.
+    pub fn summary(&self, jobs: bool) -> Option<(String, Tone)> {
+        if self.as_runs(jobs) {
+            let parts: Vec<String> = [(self.done, "done"), (self.running(), "running"), (self.failed, "failed")]
+                .iter()
+                .filter(|(n, _)| *n > 0)
+                .map(|(n, w)| format!("{n} {w}"))
+                .collect();
+            let tone = if self.failed > 0 {
+                Tone::Bad
+            } else if self.running() > 0 {
+                Tone::Busy
+            } else {
+                Tone::Done
+            };
+            return (!parts.is_empty()).then(|| (parts.join(", "), tone));
+        }
+        let tone = if self.ready < self.serving() { Tone::Busy } else { Tone::Done };
+        Some((format!("{}/{}", self.ready, self.serving()), tone))
+    }
+
+    /// The tooltip's line: `1 of 2 pods ready, 3 completed`, or `Pods: 2 done` for runs.
+    pub fn tip(&self, jobs: bool) -> Option<String> {
+        if self.as_runs(jobs) {
+            return self.summary(jobs).map(|(s, _)| format!("Pods: {s}"));
+        }
+        let mut out = format!("{} of {} ready", self.ready, crate::plural::count(self.serving(), "pod"));
+        if self.done > 0 {
+            out.push_str(&format!(", {} completed", self.done));
+        }
+        Some(out)
+    }
 }
 
 impl Node {
     /// Whether it is in trouble: Degraded or Missing.
     pub fn in_trouble(&self) -> bool {
         self.tone == Tone::Bad
+    }
+
+    /// What the row says of its pods, and its tone: runs for a Job or a CronJob, whose pods
+    /// complete; ready of all for what serves.
+    pub fn pods_summary(&self) -> Option<(String, Tone)> {
+        self.pods?.summary(self.category == Category::Jobs)
+    }
+
+    /// The tooltip's line on its pods.
+    pub fn pods_tip(&self) -> Option<String> {
+        self.pods?.tip(self.category == Category::Jobs)
     }
 
     /// Whether the view keeps it: `query` (lowercase words) in its kind or name, in trouble
@@ -133,18 +229,16 @@ pub fn nodes_from_tree(tree: &Value) -> Vec<Node> {
     let nodes = arr(tree, "/nodes");
     let by_uid: HashMap<&str, &Value> = nodes.iter().filter_map(|n| Some((s(n, "/uid")?, n))).collect();
     // Each pod counted for every object above it.
-    let mut pods: HashMap<&str, (usize, usize)> = HashMap::new();
+    let mut pods: HashMap<&str, Pods> = HashMap::new();
     for n in nodes.iter().filter(|n| s(n, "/kind") == Some("Pod") && s(n, "/group").unwrap_or("").is_empty()) {
-        let ready = usize::from(pod_state(n).1 == Tone::Good);
+        let this = Pods::of_pod(n);
         let mut at: &Value = n;
         for _ in 0..8 {
             let Some(parent) = arr(at, "/parentRefs").iter().find_map(|p| by_uid.get(s(p, "/uid")?).copied()) else {
                 break;
             };
             if let Some(uid) = s(parent, "/uid") {
-                let c = pods.entry(uid).or_default();
-                c.0 += ready;
-                c.1 += 1;
+                pods.entry(uid).or_default().add(this);
             }
             at = parent;
         }
@@ -526,10 +620,61 @@ mod tests {
                 ("web", Category::Networking)
             ]
         );
-        assert_eq!(nodes[0].pods, Some((1, 2)));
+        assert_eq!(nodes[0].pods_summary(), Some(("1/2".to_string(), Tone::Busy)));
         assert!(nodes[2].in_trouble());
         assert!(nodes[2].keeps("job night", true, None) && !nodes[0].keeps("", true, None));
         assert!(nodes[0].keeps("", false, Some("Healthy")) && !nodes[2].keeps("", false, Some("Healthy")));
+    }
+
+    /// A pod run to completion is never ready, and isn't meant to be: a CronJob and its Jobs
+    /// say their runs (done, running, failed), not ready of all; what serves doesn't count it.
+    #[test]
+    fn completed_pods_are_runs_done_not_pods_unready() {
+        let node = |kind: &str, group: &str, uid: &str, parent: Option<&str>, health: &str, reason: Option<&str>| {
+            let mut n = json!({"kind": kind, "group": group, "namespace": "shop", "name": uid, "uid": uid,
+                               "health": {"status": health}});
+            if let Some(p) = parent {
+                n["parentRefs"] = json!([{"uid": p}]);
+            }
+            if let Some(r) = reason {
+                n["info"] = json!([{"name": "Status Reason", "value": r}]);
+            }
+            n
+        };
+        let tree = json!({"nodes": [
+            node("CronJob", "batch", "cj", None, "Healthy", None),
+            node("Job", "batch", "j1", Some("cj"), "Healthy", None),
+            node("Pod", "", "j1-a", Some("j1"), "Healthy", Some("Completed")),
+            node("Job", "batch", "j2", Some("cj"), "Healthy", None),
+            node("Pod", "", "j2-a", Some("j2"), "Healthy", Some("Completed")),
+            node("Job", "batch", "j3", Some("cj"), "Degraded", None),
+            node("Pod", "", "j3-a", Some("j3"), "Degraded", Some("Error")),
+            node("Job", "batch", "j4", None, "Progressing", None),
+            node("Pod", "", "j4-a", Some("j4"), "Progressing", Some("Running")),
+            node("Deployment", "apps", "web", None, "Healthy", None),
+            node("ReplicaSet", "apps", "web-1", Some("web"), "Healthy", None),
+            node("Pod", "", "web-1-a", Some("web-1"), "Healthy", Some("Running")),
+            node("Pod", "", "web-1-b", Some("web-1"), "Healthy", Some("Completed")),
+        ]});
+        let nodes = nodes_from_tree(&tree);
+        let summary = |name: &str| {
+            let n = nodes.iter().find(|n| n.res.name == name).expect(name);
+            n.pods_summary()
+        };
+        let say = |s: &str, t: Tone| Some((s.to_string(), t));
+        assert_eq!(summary("cj"), say("2 done, 1 failed", Tone::Bad));
+        assert_eq!(summary("j1"), say("1 done", Tone::Done));
+        assert_eq!(summary("j3"), say("1 failed", Tone::Bad));
+        assert_eq!(summary("j4"), say("1 running", Tone::Busy));
+        assert_eq!(summary("web"), say("1/1", Tone::Done));
+        let web = nodes.iter().find(|n| n.res.name == "web").unwrap();
+        assert_eq!(web.pods_tip().as_deref(), Some("1 of 1 pod ready, 1 completed"));
+        let j1 = nodes.iter().find(|n| n.res.name == "j1").unwrap();
+        assert_eq!(j1.pods_tip().as_deref(), Some("Pods: 1 done"));
+        // What serves with only completed pods says them as runs, not 0/0.
+        let only_done = Pods { done: 2, all: 2, ..Pods::default() };
+        assert_eq!(only_done.summary(false), say("2 done", Tone::Done));
+        assert_eq!(Pods::default().summary(true), None);
     }
 
     /// The sync's result in Argo CD's order: by phase, then wave (from the manifests), hooks

@@ -393,16 +393,12 @@ impl ArgoView {
         if let Some(m) = &n.message {
             tip.push(m.clone());
         }
-        if let Some((ready, all)) = n.pods {
-            tip.push(format!("{ready} of {} ready", crate::plural::count(all, "pod")));
-        }
+        tip.extend(n.pods_tip());
         if reaches {
             tip.push("Click to open it on its cluster".into());
         }
-        let pods = n.pods.map(|(ready, all)| {
-            let color = if ready < all { theme.warning } else { theme.muted_foreground };
-            div().flex_none().text_xs().text_color(color).child(format!("{ready}/{all}"))
-        });
+        let pods =
+            n.pods_summary().map(|(text, tone)| div().flex_none().text_xs().text_color(tone.color(cx)).child(text));
         let (k, res) = (k.cloned(), n.res.clone());
         with_tip(("argo-res", i), tip.join("\n"))
             .flex()
