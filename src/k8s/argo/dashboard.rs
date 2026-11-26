@@ -73,6 +73,29 @@ pub struct State {
     /// The names of the resources Degraded.
     pub degraded: Vec<String>,
     pub tone: Tone,
+    /// What the resource tree holds in trouble that Argo CD's health leaves out (the objects
+    /// its resources made): `3 Degraded below`.
+    pub below: Option<String>,
+}
+
+impl State {
+    /// Take the worst of the Application's health and what its resource tree holds in
+    /// trouble (`problems`, read from the tree): Argo CD counts only the resources it
+    /// manages, not the Jobs of a CronJob, for example. Those in trouble make it Bad, said
+    /// in `below` unless Argo CD says Degraded itself.
+    pub fn with_tree(&mut self, problems: &Problems) {
+        if !problems.from_tree {
+            return;
+        }
+        let bad: Vec<&Problem> = problems.rows.iter().filter(|r| r.tone == Tone::Bad).collect();
+        let Some(first) = bad.first() else { return };
+        self.tone = Tone::Bad;
+        if self.health == "Degraded" {
+            return;
+        }
+        let status = if bad.iter().all(|r| r.status == first.status) { first.status.as_str() } else { "in trouble" };
+        self.below = Some(format!("{} {status} below", bad.len()));
+    }
 }
 
 /// The State of `app`: a sync running or failed says so over the comparison with git. The
@@ -113,6 +136,7 @@ pub fn state(app: &Value, tree: Option<&Value>) -> State {
         health_message: summary.health_message.clone(),
         degraded,
         tone: super::attention(&summary),
+        below: None,
     }
 }
 
@@ -945,6 +969,15 @@ pub struct Cards {
     pub note: Option<String>,
     /// A selective sync newer than the newest deployment.
     pub partial: Option<Partial>,
+    /// Its resources with their health, by category (the Resources view): from the tree,
+    /// else from the Application's status.
+    pub nodes: Vec<Node>,
+    /// The last operation, whole, and its result per resource in Argo CD's order (the Sync
+    /// status view).
+    pub operation: Option<Operation>,
+    pub sync_rows: Vec<SyncRow>,
+    /// What the Details panel says.
+    pub details: Details,
 }
 
 impl Cards {
@@ -969,15 +1002,29 @@ impl Cards {
         // Worked out here, off the UI thread, with every line.
         let smart = read.managed.as_ref().map(|m| Arc::new(super::grouped_diff::AppDiff::of(m)));
         let changes = smart.as_ref().map_or_else(Vec::new, |s| super::grouped_diff::by_resource(&s.diff));
+        let mut state = state(app, tree);
+        state.with_tree(&problems);
+        let last_sync = last_sync(app);
+        let healths = views::healths(app, tree);
+        let sync_rows = last_sync.as_ref().map_or_else(Vec::new, |l| {
+            let waves = views::waves(read.managed.as_ref());
+            views::sync_rows(&l.steps, &waves, |st| {
+                healths.get(&(st.kind.clone(), st.namespace.clone(), st.name.clone())).cloned()
+            })
+        });
         Self {
             summary: Summary::of(app),
-            state: state(app, tree),
+            state,
             findings: Diagnosis::of(app, now).findings,
             versions: versions(app, seen),
             deployed: deployed.into_iter().zip(commits).collect(),
             problems,
+            nodes: tree.map_or_else(|| views::nodes_from_status(app), views::nodes_from_tree),
+            operation: views::operation(app),
+            sync_rows,
+            details: views::details(app),
             tree_error: read.tree.and_then(Result::err),
-            last_sync: last_sync(app),
+            last_sync,
             diff,
             git_diff: read.diff,
             // Worked out here, off the UI thread, with every line.
@@ -992,6 +1039,8 @@ impl Cards {
 
 mod read;
 pub(in crate::k8s::argo) use read::extras;
+mod views;
+pub use views::{Category, Details, Node, Operation, SyncRow, health_tone};
 
 /// A made-up example, for the developer tools' snapshots and the tests.
 #[cfg(any(test, feature = "dev"))]

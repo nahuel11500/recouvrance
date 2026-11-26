@@ -365,7 +365,7 @@ impl ArgoView {
         let looks = v_flex().children(o.looks.iter().take(LOOKS_SHOWN).enumerate().map(|(i, l)| {
             let env = &rows.envs[l.env];
             env_link(("argo-ov-look", i), l.env, cx)
-                .child(div().size(px(7.)).flex_none().rounded_full().bg(env.tone.color(cx)))
+                .child(div().size(px(7.)).flex_none().rounded_full().bg(env.tone().color(cx)))
                 .child(div().w(px(80.)).flex_none().text_xs().text_color(muted).child(types.name(env.kind).to_string()))
                 .child(
                     div().w(px(260.)).flex_none().truncate().text_sm().text_color(theme.blue).child(env.name.clone()),
@@ -639,6 +639,7 @@ mod tests {
             members: vec![(0, 0)],
             name: name.into(),
             project: project.into(),
+            projects: vec![project.into()],
             kind,
             tone: Tone::Good,
             state,

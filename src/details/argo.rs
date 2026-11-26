@@ -169,6 +169,7 @@ fn confirm_api(
         api::Action::Sync(_) => format!("sync {target}"),
         api::Action::Terminate => format!("terminate-op {target}"),
         api::Action::Rollback { id, .. } => format!("rollback {target} {id}"),
+        api::Action::Delete { cascade } => format!("delete {target} --cascade={cascade}"),
     };
     let cmd = format!("argocd app {args} --server {}", shell_word(&server_name));
     let guard = Guard::protected(&server_name, window, cx);
@@ -195,6 +196,74 @@ fn confirm_api(
                         let _ = cx.update(|window, cx| match result {
                             Ok(msg) => window.push_notification(Notification::success(msg), cx),
                             Err(e) => window.push_notification(Notification::error(format!("{label} failed: {e}")), cx),
+                        });
+                    })
+                    .detach();
+                true
+            })
+    });
+}
+
+/// What deleting an Application does, with and without its resources.
+const DELETE_NOTE: &str = "Argo CD deletes the Application and every object it deployed (cascade). Argo CD \
+     deploys it again if an app of apps or an ApplicationSet still lists it in git.";
+const DELETE_KEEP_NOTE: &str = "Argo CD deletes the Application only: the objects it deployed stay in the cluster, \
+     no longer managed. Argo CD deploys it again if an app of apps or an ApplicationSet still lists it in git.";
+
+/// Confirm, then delete the Application `ns/name` read from `endpoint` by Argo CD's API, with
+/// what it deployed (`cascade`) or without. The checks of [`confirm_api_action`] apply (a
+/// read-only server refused first, write mode when it is sent), and its name is typed to
+/// confirm, as for a Kubernetes delete.
+pub(crate) fn confirm_api_delete(
+    endpoint: &Arc<api::Endpoint>,
+    ns: &str,
+    name: &str,
+    cascade: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let protected = api::read_only(endpoint).unwrap_or_else(|| endpoint.name());
+    let what = format!("delete {name}");
+    if !super::not_read_only(&protected, window, cx) || !super::ensure_argo_writes(&what, &endpoint.name(), window, cx)
+    {
+        return;
+    }
+    let (endpoint, ns, name) = (endpoint.clone(), ns.to_string(), name.to_string());
+    let call = api::Action::Delete { cascade };
+    let cmd = format!(
+        "argocd app delete {} --cascade={cascade} --server {}",
+        shell_word(&format!("{ns}/{name}")),
+        shell_word(&endpoint.name())
+    );
+    let guard = Guard::typed_text(&name, format!("Type {name} to delete it:"), window, cx);
+    let title = if cascade {
+        format!("Delete Application {name} and what it deployed?")
+    } else {
+        format!("Delete Application {name}, keeping what it deployed?")
+    };
+    let note = if cascade { DELETE_NOTE } else { DELETE_KEEP_NOTE };
+    window.open_alert_dialog(cx, move |alert, _, cx| {
+        let (endpoint, ns, name, call, guard) =
+            (endpoint.clone(), ns.clone(), name.clone(), call.clone(), guard.clone());
+        alert
+            .title(title.clone())
+            .description(note)
+            .child(confirm_with(&cmd, Some(&guard), &RunAs::default(), cx))
+            .confirm_buttons("Delete", true, Some(&guard))
+            .on_ok(move |_, window, cx| {
+                if !guard_ok(Some(&guard), cx) {
+                    return false;
+                }
+                if !super::writes_still_on(window, cx) {
+                    return true;
+                }
+                let write = api::act(endpoint.clone(), ns.clone(), name.clone(), call.clone());
+                window
+                    .spawn(cx, async move |cx| {
+                        let result = write.await;
+                        let _ = cx.update(|window, cx| match result {
+                            Ok(msg) => window.push_notification(Notification::success(msg), cx),
+                            Err(e) => window.push_notification(Notification::error(format!("Delete failed: {e}")), cx),
                         });
                     })
                     .detach();

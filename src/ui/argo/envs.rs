@@ -23,6 +23,9 @@ pub struct State {
     pub running: bool,
     /// What makes it need a look (`argo::Look`, the rule every count of the page shares).
     pub look: argo::Look,
+    /// An object below its Applications is in trouble, which Argo CD's health leaves out (a
+    /// Job a CronJob made): known once its dashboard has read the resource tree.
+    pub tree_degraded: bool,
 }
 
 impl State {
@@ -39,9 +42,15 @@ impl State {
         s
     }
 
-    /// Worth a look at `now` (`argo::Look`): out of sync with auto-sync off is not.
+    /// Worth a look at `now` (`argo::Look`): out of sync with auto-sync off is not. An
+    /// object in trouble below its Applications is.
     pub fn needs_look(self, now: jiff::Timestamp) -> bool {
-        self.look.needs_a_look(now)
+        self.look.needs_a_look(now) || self.tree_degraded
+    }
+
+    /// Degraded, as Argo CD says or as its resource tree does.
+    pub fn any_degraded(self) -> bool {
+        self.degraded || self.tree_degraded
     }
 }
 
@@ -52,7 +61,10 @@ pub struct Env {
     /// depth under the root.
     pub members: Vec<(usize, usize)>,
     pub name: String,
+    /// Its workload's project (`main`'s): the roots often sit in a project of their own.
     pub project: String,
+    /// Every project of its Applications, its own first: the project filter keeps it for any.
+    pub projects: Vec<String>,
     /// Its type, an index of the types (`EnvTypes`).
     pub kind: usize,
     pub tone: Tone,
@@ -83,6 +95,22 @@ impl Env {
     pub fn root(&self) -> usize {
         self.members[0].0
     }
+
+    /// Its color, an object in trouble below its Applications counted.
+    pub fn tone(&self) -> Tone {
+        if self.state.tree_degraded { Tone::Bad } else { self.tone }
+    }
+}
+
+/// The Application of an environment's members that runs the most images (its workload),
+/// else its root.
+fn main_of(apps: &[FleetApp], members: &[(usize, usize)]) -> usize {
+    members
+        .iter()
+        .map(|(i, _)| *i)
+        .max_by_key(|&i| (apps[i].app.images.len(), std::cmp::Reverse(i)))
+        .filter(|&i| !apps[i].app.images.is_empty())
+        .unwrap_or(members[0].0)
 }
 
 /// The color of a group: red when one of them is, amber when one is on its way, green when
@@ -120,11 +148,14 @@ pub fn environments(
         .iter()
         .map(|m| environments::images(m.iter().flat_map(|(i, _)| apps[*i].app.images.iter().map(String::as_str))))
         .collect();
+    // Each one's workload: its project is the environment's (an app of apps often sits in a
+    // project of its own, `shop-platform` over `shop`).
+    let mains: Vec<usize> = groups.iter().map(|m| main_of(apps, m)).collect();
     // The product's images: those whose tags differ between the project's environments, and
     // those named after the project.
     let mut by_project: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (e, m) in groups.iter().enumerate() {
-        by_project.entry(apps[m[0].0].app.project.as_str()).or_default().push(e);
+    for (e, &main) in mains.iter().enumerate() {
+        by_project.entry(apps[main].app.project.as_str()).or_default().push(e);
     }
     let mut product: Vec<HashSet<String>> = vec![HashSet::new(); groups.len()];
     for (project, envs) in &by_project {
@@ -144,16 +175,18 @@ pub fn environments(
         .into_iter()
         .zip(images)
         .zip(product)
-        .map(|((members, images), product)| {
+        .zip(mains)
+        .map(|(((members, images), product), main)| {
             let root = &apps[members[0].0];
             let summaries = || members.iter().map(|(i, _)| &apps[*i].app);
             let on_tag = environments::on_tag(&images, &product);
-            let main = members
-                .iter()
-                .map(|(i, _)| *i)
-                .max_by_key(|&i| (apps[i].app.images.len(), std::cmp::Reverse(i)))
-                .filter(|&i| !apps[i].app.images.is_empty())
-                .unwrap_or(members[0].0);
+            let project = apps[main].app.project.clone();
+            let mut projects = vec![project.clone()];
+            for a in summaries() {
+                if !projects.contains(&a.project) {
+                    projects.push(a.project.clone());
+                }
+            }
             let (dest, more_clusters) = workload_destination(
                 &members,
                 |i| apps[i].parent,
@@ -179,7 +212,8 @@ pub fn environments(
             }
             Env {
                 name: root.app.name.clone(),
-                project: root.app.project.clone(),
+                project,
+                projects,
                 kind: types.of(&root.app.name, on_tag),
                 tone: group_tone(summaries().map(argo::attention)),
                 state: State::of(summaries()),
@@ -329,11 +363,11 @@ impl Filter {
         let state = !any_state
             || (self.needs_look && s.needs_look(now))
             || (self.out_of_sync && s.out_of_sync)
-            || (self.degraded && (s.degraded || s.failed))
+            || (self.degraded && (s.any_degraded() || s.failed))
             || (self.running && s.running);
         state
             && (favorite || !self.favorites)
-            && self.project.as_ref().is_none_or(|p| *p == env.project)
+            && self.project.as_ref().is_none_or(|p| env.projects.contains(p))
             && self.kind.as_ref().is_none_or(|k| k == kind)
             && (env.on_tag || !self.on_tag)
             && query_keeps(&self.query, &env.search, labels)
@@ -495,6 +529,7 @@ mod tests {
             members: vec![(0, 0)],
             name: name.into(),
             project: project.into(),
+            projects: vec![project.into()],
             kind,
             tone: Tone::Good,
             state,
@@ -652,6 +687,104 @@ mod tests {
         let nested = |i: usize| [None, Some(0), Some(1), Some(1)][i];
         let (d, more) = workload_destination(&members, nested, |_| 0, |i| clusters[i]);
         assert_eq!((d, more), (2, vec!["prod-b".to_string()]));
+    }
+
+    /// The environments of Applications as Argo CD's API sends them, read as the page reads
+    /// them, with the default types.
+    fn read(values: Vec<serde_json::Value>) -> (Vec<FleetApp>, Vec<Env>, EnvTypes) {
+        use std::sync::Arc;
+        let endpoint = Arc::new(argo::api::Endpoint {
+            server: argo::server::Server::parse("https://argocd.example.com").unwrap(),
+            cli_context: None,
+            in_settings: true,
+            insecure: false,
+            login: Err("none in tests".into()),
+            on: true,
+            settings_token: false,
+            renewable: false,
+            cli: None,
+            cli_renews: false,
+        });
+        let mut state = argo::api::FeedState { listed: true, live: true, ..Default::default() };
+        for v in values {
+            let a = Arc::new(argo::api::ApiApp { summary: Summary::of(&v), value: v });
+            state.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
+        }
+        let fleet = argo::from_api(vec![argo::ApiRead { endpoint, state }], &[], &[]);
+        let apps = fleet.apps;
+        let parents: Vec<Option<usize>> = apps.iter().map(|a| a.parent).collect();
+        let order = super::super::tree_order(&parents, |a, b| apps[a].app.name.cmp(&apps[b].app.name));
+        let types = EnvTypes::default();
+        let envs = environments(&apps, &parents, &order, &types);
+        (apps, envs, types)
+    }
+
+    fn app(name: &str, project: &str, parent: Option<&str>, images: &[&str]) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "metadata": {"name": name, "namespace": "argocd"},
+            "spec": {"project": project, "destination": {"name": "prod-eu", "namespace": name}},
+            "status": {"sync": {"status": "Synced"}, "health": {"status": "Healthy"}, "summary": {"images": images}},
+        });
+        if let Some(p) = parent {
+            let id = format!("{p}:argoproj.io/Application:argocd/{name}");
+            v["metadata"]["annotations"][argo::TRACKING_ID] = serde_json::json!(id);
+        }
+        v
+    }
+
+    /// The root sits in a project of its own (`shop-platform`), its workload in `shop`: the
+    /// environment is `shop`'s, and the project filter keeps it for either.
+    #[test]
+    fn an_environment_s_project_is_its_workload_s() {
+        let (_, envs, types) = read(vec![
+            app("shop-prod-acme", "shop-platform", None, &[]),
+            app("shop-prod-acme-workload", "shop", Some("shop-prod-acme"), &["registry.example.com/shop/api:1.2.0"]),
+        ]);
+        assert_eq!(envs.len(), 1);
+        let e = &envs[0];
+        assert_eq!(e.project, "shop");
+        assert_eq!(e.projects, ["shop", "shop-platform"]);
+        let now = jiff::Timestamp::UNIX_EPOCH;
+        let keeps =
+            |p: &str| Filter { project: Some(p.into()), ..Default::default() }.keeps(e, "prod", false, &[], now);
+        assert!(keeps("shop") && keeps("shop-platform") && !keeps("billing"));
+        assert_eq!(types.name(e.kind), "prod");
+        assert!(e.search.contains("shop-platform"), "the search keeps the root's project");
+    }
+
+    /// No naming is assumed: flat Applications with no app of apps are each an environment,
+    /// and those an `ApplicationSet` makes, `<app>-<cluster>`, are typed by their names alone.
+    #[test]
+    fn any_layout_gives_environments() {
+        let (apps, envs, types) = read(vec![
+            app("web-prod", "web", None, &["registry.example.com/web/web:2.0.0"]),
+            app("web-staging", "web", None, &["registry.example.com/web/web:main-77b324b"]),
+            app("api-prod-eu", "api", None, &["registry.example.com/api/api:1.0.0", "docker.io/library/redis:7"]),
+            app("api-prod-us", "api", None, &["registry.example.com/api/api:1.1.0", "docker.io/library/redis:7"]),
+            app("api-review-cart", "api", None, &["registry.example.com/api/api:cart-1"]),
+        ]);
+        assert_eq!(envs.len(), 5, "each its own environment");
+        let by_name = |n: &str| envs.iter().find(|e| e.name == n).unwrap();
+        for (name, project, kind) in [
+            ("web-prod", "web", "prod"),
+            ("web-staging", "web", "staging"),
+            ("api-prod-eu", "api", "prod"),
+            ("api-prod-us", "api", "prod"),
+            ("api-review-cart", "api", "review"),
+        ] {
+            let e = by_name(name);
+            assert_eq!((e.project.as_str(), types.name(e.kind)), (project, kind), "{name}");
+            assert_eq!(apps[e.main].app.name, name, "its workload is itself");
+            assert_eq!(e.cluster, "prod-eu");
+        }
+        // The product's images first: those named after the project, and those whose tags
+        // differ between its environments; redis runs the same everywhere.
+        let eu = by_name("api-prod-eu");
+        assert_eq!(
+            eu.images.iter().filter(|(own, _)| *own).map(|(_, i)| i.component.as_str()).collect::<Vec<_>>(),
+            ["api"]
+        );
+        assert!(by_name("web-prod").on_tag && !by_name("web-staging").on_tag);
     }
 
     #[test]

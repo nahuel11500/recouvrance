@@ -562,3 +562,33 @@ fn the_sync_diff_groups_a_field_by_kind() {
         ]
     );
 }
+
+/// Argo CD says Healthy, counting only the resources it manages; a Job a CronJob made is
+/// Degraded in the tree: the State takes the worst, says how many below, and the tile is Bad.
+#[test]
+fn a_degraded_object_below_makes_a_healthy_state_bad() {
+    let a = app("example-staging");
+    let tree = json!({"nodes": [
+        {"kind": "CronJob", "group": "batch", "namespace": "shop", "name": "nightly", "uid": "cj",
+         "health": {"status": "Healthy"}},
+        {"kind": "Job", "group": "batch", "namespace": "shop", "name": "nightly-1", "uid": "j1",
+         "parentRefs": [{"uid": "cj"}], "health": {"status": "Degraded", "message": "BackoffLimitExceeded"}},
+    ]});
+    let read = |tree: Value| Read {
+        app: a.clone(),
+        tree: Some(Ok(tree)),
+        diff: None,
+        managed: None,
+        commits: Vec::new(),
+        note: None,
+    };
+    let cards = Cards::of(read(tree), None, now());
+    assert_eq!(cards.state.health, "Healthy");
+    assert_eq!(cards.state.tone, Tone::Bad);
+    assert_eq!(cards.state.below.as_deref(), Some("1 Degraded below"));
+    assert!(cards.nodes.iter().any(|n| n.res.name == "nightly-1" && n.in_trouble()));
+    // Nothing in trouble below: as Argo CD says.
+    let cards = Cards::of(read(json!({"nodes": []})), None, now());
+    assert_ne!(cards.state.tone, Tone::Bad);
+    assert!(cards.state.below.is_none());
+}

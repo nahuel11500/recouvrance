@@ -192,19 +192,13 @@ impl Rows {
                 l
             })
             .collect();
-        let mut projects: Vec<String> = envs.iter().map(|e| e.project.clone()).collect();
+        let mut projects: Vec<String> = envs.iter().flat_map(|e| e.projects.iter().cloned()).collect();
         projects.sort();
         projects.dedup();
         let mut kinds: Vec<usize> = envs.iter().map(|e| e.kind).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        let count = |f: &dyn Fn(&Env) -> bool| envs.iter().filter(|e| f(e)).count();
-        let counts = [
-            count(&|e| e.state.needs_look(now)),
-            count(&|e| e.state.out_of_sync),
-            count(&|e| e.state.degraded || e.state.failed),
-            count(&|e| e.state.running),
-        ];
+        let counts = counts(&envs, now);
         let show_cluster = !envs::uniform(envs.iter().map(|e| e.cluster.as_str()));
         let own_namespace = |e: &Env| if e.namespace.is_empty() || e.namespace == e.name { "" } else { "other" };
         let show_namespace = !envs::uniform(envs.iter().map(own_namespace));
@@ -230,6 +224,16 @@ impl Rows {
         }
     }
 
+    /// Mark the environments with an Application whose resource tree holds an object in
+    /// trouble (`bad`, as their dashboards read them), and count again.
+    fn set_tree_verdicts(&mut self, bad: &HashSet<Key>) {
+        let apps = &self.fleet.apps;
+        for env in &mut self.envs {
+            env.state.tree_degraded = env.members.iter().any(|(i, _)| bad.contains(&key(&apps[*i])));
+        }
+        self.counts = counts(&self.envs, self.now);
+    }
+
     /// The environments in the order shown, each with the headings it is under: grouped by
     /// `by`, those with a favorite (`favorite`) first in their group.
     fn listed(&self, by: GroupBy, favorite: impl Fn(usize) -> bool) -> Vec<(Vec<String>, usize)> {
@@ -244,6 +248,17 @@ impl Rows {
         }
         groups.into_iter().flat_map(|g| crate::favorites::favorites_first(g, |(_, e)| favorite(*e))).collect()
     }
+}
+
+/// How many environments need a look, are out of sync, Degraded or failed, and running.
+fn counts(envs: &[Env], now: jiff::Timestamp) -> [usize; 4] {
+    let count = |f: &dyn Fn(&Env) -> bool| envs.iter().filter(|e| f(e)).count();
+    [
+        count(&|e| e.state.needs_look(now)),
+        count(&|e| e.state.out_of_sync),
+        count(&|e| e.state.any_degraded() || e.state.failed),
+        count(&|e| e.state.running),
+    ]
 }
 
 // MARK: Page
@@ -297,6 +312,12 @@ pub struct ArgoView {
     _feeds: Task<()>,
     /// The dashboard of a service, shown instead of the list while it is open.
     dashboard: Option<dashboard::Dashboard>,
+    /// The Applications whose resource tree, as their dashboard last read it, holds an object
+    /// in trouble Argo CD's health leaves out: their environments count as Degraded.
+    tree_bad: HashSet<Key>,
+    /// The words the Resources view is filtered by (kind, name); lowercase.
+    res_search: Entity<InputState>,
+    res_query: String,
     /// The Applications picked, by Argo CD, namespace and name (see `grouped`); how many of
     /// them the filter keeps, and how many it hides.
     selected: HashSet<Key>,
@@ -361,7 +382,14 @@ impl ArgoView {
         });
         let journal_search = cx.new(|cx| InputState::new(window, cx).placeholder("Application…"));
         let steps_search = cx.new(|cx| InputState::new(window, cx).placeholder("Steps: status, kind, name…"));
+        let res_search = cx.new(|cx| InputState::new(window, cx).placeholder("Resources: kind, name…"));
         let subs = vec![
+            cx.subscribe(&res_search, |this, state, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.res_query = state.read(cx).value().to_lowercase();
+                    cx.notify();
+                }
+            }),
             cx.subscribe(&steps_search, |this, state, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     this.steps_query = state.read(cx).value().to_lowercase();
@@ -459,6 +487,9 @@ impl ArgoView {
             starred_count: 0,
             _feeds: feeds,
             dashboard: None,
+            tree_bad: HashSet::new(),
+            res_search,
+            res_query: String::new(),
             selected: HashSet::new(),
             picked: 0,
             picked_hidden: 0,
@@ -552,6 +583,8 @@ impl ArgoView {
                     cx,
                 );
             });
+            let mut rows = rows;
+            rows.set_tree_verdicts(&this.tree_bad);
             this.rows = Some(rows);
             this.refilter(cx);
             this.ask_commits(cx);
@@ -682,7 +715,7 @@ impl ArgoView {
                 (env.members.len() > 1 && expanded.contains(&key(&apps[env.root()]))).then_some(env.members.len())
             },
             |e| rows.envs[e].state.needs_look(rows.now),
-            |e| rows.envs[e].tone,
+            |e| rows.envs[e].tone(),
         );
         (self.lines, self.headings) = (lines, headings);
         self.env_order = listed.iter().map(|(_, e)| *e).filter(|&e| env_keeps[e]).collect();
@@ -702,6 +735,13 @@ impl ArgoView {
 
     fn change_filter(&mut self, change: impl FnOnce(&mut Filter), cx: &mut Context<Self>) {
         change(&mut self.filter);
+        self.changed(cx);
+    }
+
+    /// Every filter off, the search emptied.
+    fn clear_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter = Filter::default();
+        self.search.update(cx, |s, cx| s.set_value("", window, cx));
         self.changed(cx);
     }
 
@@ -947,7 +987,7 @@ impl ArgoView {
                     .flex_none()
                     .gap_1p5()
                     .overflow_hidden()
-                    .child(div().size(px(7.)).flex_none().rounded_full().bg(env.tone.color(cx)))
+                    .child(div().size(px(7.)).flex_none().rounded_full().bg(env.tone().color(cx)))
                     .child(
                         div()
                             .flex_1()
@@ -1184,10 +1224,28 @@ impl ArgoView {
             .child(toggle("argo-favorites", "Favorites", self.starred_count, f.favorites, |f| {
                 f.favorites = !f.favorites;
             }))
-            .child(picker("argo-project", "All projects", f.project.clone(), projects, view.clone(), |f, v| {
-                f.project = v;
-            }))
+            .child(picker(
+                "argo-project",
+                "Project",
+                "All projects",
+                f.project.clone(),
+                projects,
+                view.clone(),
+                |f, v| {
+                    f.project = v;
+                },
+            ))
             .child(type_picker(f.kind.clone(), f.on_tag, types, view.clone()))
+            .when(*f != Filter::default(), |h| {
+                h.child(
+                    Button::new("argo-clear-filters")
+                        .small()
+                        .ghost()
+                        .icon(Lucide::X)
+                        .label("Clear filters")
+                        .on_click(cx.listener(|this, _, window, cx| this.clear_filters(window, cx))),
+                )
+            })
             .child(div().flex_1())
             .child(group_picker(self.group_by, view))
             .child(
@@ -1222,7 +1280,7 @@ fn state_badges(s: envs::State, cx: &App) -> Vec<Div> {
     if s.failed {
         out.push(badge("Sync failed", theme.danger));
     }
-    if s.degraded {
+    if s.any_degraded() {
         out.push(badge("Degraded", theme.danger));
     }
     if s.out_of_sync {
@@ -1262,14 +1320,21 @@ fn image_summary(env: &Env) -> (Vec<(String, String)>, usize, String) {
 /// A button picking one value of a filter (or all of them) from a menu.
 fn picker(
     id: &'static str,
+    name: &'static str,
     all: &'static str,
     current: Option<String>,
     values: Vec<String>,
     view: WeakEntity<ArgoView>,
     set: fn(&mut Filter, Option<String>),
 ) -> impl IntoElement {
-    Button::new(id).small().outline().label(current.clone().unwrap_or_else(|| all.to_string())).dropdown_menu(
-        move |menu, _, _| {
+    // On, it says so: highlighted, and what it keeps named (`Project: shop`).
+    let label = current.as_ref().map_or_else(|| all.to_string(), |v| format!("{name}: {v}"));
+    Button::new(id)
+        .small()
+        .when(current.is_some(), ButtonVariants::primary)
+        .when(current.is_none(), Button::outline)
+        .label(label)
+        .dropdown_menu(move |menu, _, _| {
             let pick = |value: Option<String>| {
                 let view = view.clone();
                 move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
@@ -1286,8 +1351,7 @@ fn picker(
                     PopupMenuItem::new(v.clone()).checked(current.as_ref() == Some(v)).on_click(pick(Some(v.clone()))),
                 )
             })
-        },
-    )
+        })
 }
 
 /// The label of the type filter's "on a version tag" choice.
@@ -1301,40 +1365,46 @@ fn type_picker(
     view: WeakEntity<ArgoView>,
 ) -> impl IntoElement {
     let label = match (&current, on_tag) {
-        (Some(t), _) => t.clone(),
-        (None, true) => ON_TAG.to_string(),
+        (Some(t), _) => format!("Type: {t}"),
+        (None, true) => format!("Type: {}", ON_TAG.to_lowercase()),
         (None, false) => "All types".to_string(),
     };
-    Button::new("argo-type").small().outline().label(label).dropdown_menu(move |menu, _, _| {
-        let pick = |kind: Option<String>, tag: bool| {
-            let view = view.clone();
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                let kind = kind.clone();
-                let _ = view.update(cx, |this, cx| {
-                    this.change_filter(
-                        |f| {
-                            f.kind = kind;
-                            f.on_tag = tag;
-                        },
-                        cx,
-                    );
-                });
-            }
-        };
-        let menu = menu
-            .scrollable(true)
-            .max_h(px(420.))
-            .item(PopupMenuItem::new("All types").checked(current.is_none() && !on_tag).on_click(pick(None, false)))
-            .item(PopupMenuItem::new(ON_TAG).checked(current.is_none() && on_tag).on_click(pick(None, true)))
-            .separator();
-        types.iter().fold(menu, |menu, t| {
-            menu.item(
-                PopupMenuItem::new(t.clone())
-                    .checked(current.as_ref() == Some(t))
-                    .on_click(pick(Some(t.clone()), false)),
-            )
+    let on = current.is_some() || on_tag;
+    Button::new("argo-type")
+        .small()
+        .when(on, ButtonVariants::primary)
+        .when(!on, Button::outline)
+        .label(label)
+        .dropdown_menu(move |menu, _, _| {
+            let pick = |kind: Option<String>, tag: bool| {
+                let view = view.clone();
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    let kind = kind.clone();
+                    let _ = view.update(cx, |this, cx| {
+                        this.change_filter(
+                            |f| {
+                                f.kind = kind;
+                                f.on_tag = tag;
+                            },
+                            cx,
+                        );
+                    });
+                }
+            };
+            let menu = menu
+                .scrollable(true)
+                .max_h(px(420.))
+                .item(PopupMenuItem::new("All types").checked(current.is_none() && !on_tag).on_click(pick(None, false)))
+                .item(PopupMenuItem::new(ON_TAG).checked(current.is_none() && on_tag).on_click(pick(None, true)))
+                .separator();
+            types.iter().fold(menu, |menu, t| {
+                menu.item(
+                    PopupMenuItem::new(t.clone())
+                        .checked(current.as_ref() == Some(t))
+                        .on_click(pick(Some(t.clone()), false)),
+                )
+            })
         })
-    })
 }
 
 /// How the list is grouped: by project then type, by project, or not.
@@ -1487,7 +1557,10 @@ impl Render for ArgoView {
             Some(rows) => {
                 let count = self.lines.len();
                 let kept = (self.filter != Filter::default()).then_some(self.kept);
-                let summary = envs::summary(rows.envs.len(), kept, rows.fleet.apps.len(), &rows.fleet);
+                let mut summary = envs::summary(rows.envs.len(), kept, rows.fleet.apps.len(), &rows.fleet);
+                if kept.is_some() {
+                    summary.push_str(" · filtered");
+                }
                 let type_errors = rows.types.errors.clone();
                 let tab = |id: &'static str, label: &'static str, list: bool, cx: &mut Context<Self>| {
                     Button::new(id)

@@ -1167,7 +1167,9 @@ impl SettingsView {
                 "On the Argo CD page, an environment's type comes from its root Application's name: one \
                  `type = pattern` (a regular expression) per line, in the order the page shows them. The match \
                  that starts first in the name wins, ties go to the earlier line. `type = tag:other` is an \
-                 environment of type `other` whose product images all carry a version tag. No match: other.",
+                 environment of type `other` whose product images all carry a version tag. No match: other. \
+                 These patterns are the only thing to adapt to your Argo CD: environments come from app of apps \
+                 (or stand alone), whatever their names.",
                 v_flex()
                     .w(px(420.))
                     .gap_1()

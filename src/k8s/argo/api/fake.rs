@@ -180,7 +180,7 @@ async fn handle(State(fake): State<Arc<Fake>>, method: Method, uri: Uri, body: B
                 return Err((StatusCode::BAD_REQUEST, "another operation is already in progress".into()));
             }
             let mut sync = json!({"prune": body["prune"], "dryRun": body["dryRun"], "syncStrategy": body["strategy"]});
-            for key in ["resources", "revision"] {
+            for key in ["resources", "revision", "syncOptions"] {
                 if let Some(v) = body.get(key) {
                     sync[key] = v.clone();
                 }
@@ -212,6 +212,19 @@ async fn handle(State(fake): State<Arc<Fake>>, method: Method, uri: Uri, body: B
             app["status"]["operationState"]["phase"] = json!("Terminating");
             Ok(())
         }),
+        ("DELETE", ["api", "v1", "applications", name]) => {
+            let gone = {
+                let mut apps = lock(&fake.apps);
+                let before = apps.len();
+                apps.retain(|a| a.pointer("/metadata/name") != Some(&json!(name)));
+                apps.len() < before
+            };
+            if gone {
+                json_response(&json!({}))
+            } else {
+                (StatusCode::NOT_FOUND, json!({"message": "not found"}).to_string()).into_response()
+            }
+        }
         _ => (StatusCode::NOT_FOUND, json!({"message": format!("{method} {path}: no such route")}).to_string())
             .into_response(),
     }
