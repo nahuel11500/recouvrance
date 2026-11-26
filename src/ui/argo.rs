@@ -265,9 +265,29 @@ fn counts(envs: &[Env], now: jiff::Timestamp) -> [usize; 4] {
 
 // MARK: Page
 
-/// Column widths.
+/// Column widths. The header and every row are built from these, so their columns line up
+/// (#1153): a row is its padding (`ROW_PAD`, plus its indent), its checkbox and chevron
+/// (`LEAD`), its name cell, then the columns `COL_GAP` apart, then its menu.
+///
+/// Where the name cell ends, from the row's padding, whatever its indent (`name_cell`).
 const NAME: f32 = 340.;
 const INDENT: f32 = 16.;
+/// A row's (and the header's) padding on each side, before any indent.
+const ROW_PAD: f32 = 8.;
+/// The checkbox's cell, and the chevron's.
+const CHECK: f32 = 20.;
+/// The gap between a row's checkbox, chevron, columns and menu.
+const ROW_GAP: f32 = 4.;
+/// The gap between two columns.
+const COL_GAP: f32 = 12.;
+/// The checkbox and the chevron with their gaps: where the columns start on an unindented row.
+const LEAD: f32 = 2. * (CHECK + ROW_GAP);
+
+/// A name cell's width on a row indented by `indent`: it ends at `NAME` whatever the indent,
+/// so the next column starts where the header's does (until a deep tree reaches the minimum).
+fn name_cell(indent: f32) -> f32 {
+    (NAME - LEAD - indent).max(120.)
+}
 /// The space kept for a row's menu, so no column draws under it. The header keeps that room
 /// too, so its columns shrink like the rows' in a narrow window (`column`).
 const MENU: f32 = 24.;
@@ -972,7 +992,7 @@ impl ArgoView {
             .w_full()
             .gap_2()
             .px_2()
-            .pl(px(8. + INDENT * h.depth as f32))
+            .pl(px(ROW_PAD + INDENT * h.depth as f32))
             .py_0p5()
             .text_sm()
             .border_b_1()
@@ -1035,7 +1055,8 @@ impl ArgoView {
         let cx: &App = cx;
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        let badges = state_badges(env.state, cx);
+        let badges = state_badges(i, env.state, cx);
+        let indent = INDENT * self.group_depth() as f32;
         let (shown, more, tip) = image_summary(env);
         let images = h_flex()
             .id(("argo-images", i))
@@ -1070,12 +1091,12 @@ impl ArgoView {
             .flex_1()
             .min_w_0()
             .overflow_hidden()
-            .gap_3()
+            .gap(px(COL_GAP))
             .cursor_pointer()
             .on_click(open)
             .child(
                 h_flex()
-                    .w(px(NAME - 48.))
+                    .w(px(name_cell(indent)))
                     .flex_none()
                     .gap_1p5()
                     .overflow_hidden()
@@ -1091,11 +1112,22 @@ impl ArgoView {
                             .child(env.name.clone()),
                     )
                     .when(several, |d| {
-                        d.child(div().flex_none().text_xs().text_color(muted).child(env.members.len().to_string()))
+                        let what: SharedString = crate::plural::count(env.members.len(), "Application").into();
+                        d.child(
+                            div()
+                                .id(("argo-count", i))
+                                .flex_none()
+                                .text_xs()
+                                .text_color(muted)
+                                .role(Role::Label)
+                                .aria_label(what.clone())
+                                .tooltip(move |w, cx| component::tooltip::Tooltip::new(what.clone()).build(w, cx))
+                                .child(env.members.len().to_string()),
+                        )
                     })
                     .child(star),
             )
-            .child(h_flex().w(px(BADGES)).flex_none().gap_1().overflow_hidden().children(badges))
+            .child(badges)
             .child(div().flex_1().min_w(px(120.)).overflow_hidden().child(images))
             .child(column(90., false).text_color(muted).children(last_sync))
             .when(rows.show_cluster || rows.show_namespace, |d| {
@@ -1113,16 +1145,16 @@ impl ArgoView {
             .id(("argo-row", i))
             .group(SharedString::from(format!("argo-row-{i}")))
             .w_full()
-            .gap_1()
-            .px_2()
-            .pl(px(8. + INDENT * self.group_depth() as f32))
+            .gap(px(ROW_GAP))
+            .px(px(ROW_PAD))
+            .pl(px(ROW_PAD + indent))
             .py_0p5()
             .text_sm()
             .border_b_1()
             .border_color(theme.border)
             .hover(|s| s.bg(theme.list_hover))
-            .child(div().w(px(20.)).flex_none().child(pick))
-            .child(div().w(px(20.)).flex_none().when(several, |d| d.child(toggle)))
+            .child(div().w(px(CHECK)).flex_none().child(pick))
+            .child(div().w(px(CHECK)).flex_none().when(several, |d| d.child(toggle)))
             .child(opener)
             .child(div().w(px(MENU)).flex_none().child(row_menu(
                 &k,
@@ -1195,12 +1227,12 @@ impl ArgoView {
             .flex_1()
             .min_w_0()
             .overflow_hidden()
-            .gap_3()
+            .gap(px(COL_GAP))
             .cursor_pointer()
             .on_click(open)
             .child(
                 h_flex()
-                    .w(px((NAME - 48. - INDENT).max(120.)))
+                    .w(px(name_cell(indent)))
                     .flex_none()
                     .gap_1p5()
                     .overflow_hidden()
@@ -1240,16 +1272,16 @@ impl ArgoView {
             .id(("argo-row", i))
             .group(SharedString::from(format!("argo-row-{i}")))
             .w_full()
-            .gap_1()
-            .px_2()
-            .pl(px(8. + indent))
+            .gap(px(ROW_GAP))
+            .px(px(ROW_PAD))
+            .pl(px(ROW_PAD + indent))
             .py_0p5()
             .text_sm()
             .border_b_1()
             .border_color(theme.border)
             .hover(|s| s.bg(theme.list_hover))
-            .child(div().w(px(20.)).flex_none().child(pick))
-            .child(div().w(px(20.)).flex_none())
+            .child(div().w(px(CHECK)).flex_none().child(pick))
+            .child(div().w(px(CHECK)).flex_none())
             .child(opener)
             .child(div().w(px(MENU)).flex_none().child(row_menu(
                 &k,
@@ -1264,23 +1296,31 @@ impl ArgoView {
     fn header(&self, cx: &App) -> Div {
         let cell = |w: f32, shrinks: bool, text: &'static str| column(w, shrinks).child(text);
         let (cluster, namespace) = self.rows.as_ref().map_or((false, false), |r| (r.show_cluster, r.show_namespace));
+        // Built like an environment's row (`env_row`): the same padding and gaps, the columns
+        // in one box with the menu's room after it, so they get the same room and shrink alike.
+        let columns = h_flex()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .gap(px(COL_GAP))
+            // Over the checkbox and the chevron, then the name cell: it ends at `NAME` like
+            // every row's.
+            .child(div().w(px(NAME)).flex_none().pl(px(LEAD)).child("Environment"))
+            .child(div().w(px(BADGES)).flex_none().child("State"))
+            .child(div().flex_1().min_w(px(120.)).overflow_hidden().child("Images"))
+            .child(cell(90., false, "Last sync"))
+            .when(cluster || namespace, |d| d.child(cell(220., true, "Destination")))
+            .when(self.several_sources(), |d| d.child(cell(150., true, "Argo CD")));
         h_flex()
-            .gap_3()
-            .px_2()
+            .gap(px(ROW_GAP))
+            .px(px(ROW_PAD))
             .py_1()
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(div().w(px(NAME - 48. + 44.)).flex_none().pl(px(24.)).child("Environment"))
-            .child(div().w(px(BADGES)).flex_none().child("State"))
-            .child(div().flex_1().min_w(px(120.)).child("Images"))
-            .child(cell(90., false, "Last sync"))
-            .when(cluster || namespace, |d| d.child(cell(220., true, "Destination")))
-            .when(self.several_sources(), |d| d.child(cell(150., true, "Argo CD")))
-            // Where the rows have their menu (after a 4 px gap, the header's are 12): the columns
-            // get the same room in both, so they shrink alike.
-            .child(div().w(px(MENU - 8.)).flex_none())
+            .child(columns)
+            .child(div().w(px(MENU)).flex_none())
     }
 
     /// The search, the state toggles with their counts, the project and type pickers, and the
@@ -1369,14 +1409,64 @@ const PICKER_MENU: f32 = 320.;
 /// A picker that is off: room for "All projects" and its caret, so the toolbar keeps one line.
 const PICKER_OFF: f32 = 128.;
 
-/// The room the state badges take on a row.
-const BADGES: f32 = 200.;
+/// The room the state badges take on a row: the two widest shown together ("Sync failed" and
+/// "OutOfSync", about 95 px each at the small text size) and the "+N" chip, with their gaps.
+const BADGES: f32 = 240.;
+/// Badges shown on a row, at most; the others are counted in a "+N" chip that names them all.
+const BADGES_SHOWN: usize = 2;
 
-/// What is wrong with an environment, as badges: out of sync, Degraded, its sync failed,
+/// One thing wrong with an environment, declared worst first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Badge {
+    Failed,
+    Degraded,
+    OutOfSync,
+    Syncing,
+}
+
+impl Badge {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Failed => "Sync failed",
+            Self::Degraded => "Degraded",
+            Self::OutOfSync => "OutOfSync",
+            Self::Syncing => "Syncing",
+        }
+    }
+
+    fn color(self, cx: &App) -> Hsla {
+        match self {
+            Self::Failed | Self::Degraded => cx.theme().danger,
+            Self::OutOfSync => cx.theme().warning,
+            Self::Syncing => Tone::Busy.color(cx),
+        }
+    }
+}
+
+/// What is wrong with an environment, worst first: its sync failed, Degraded, out of sync,
 /// one running.
-fn state_badges(s: envs::State, cx: &App) -> Vec<Div> {
-    let theme = cx.theme();
-    let badge = |text: &'static str, color: Hsla| {
+fn badges_of(s: envs::State) -> Vec<Badge> {
+    [
+        (s.failed, Badge::Failed),
+        (s.any_degraded(), Badge::Degraded),
+        (s.out_of_sync, Badge::OutOfSync),
+        (s.running, Badge::Syncing),
+    ]
+    .into_iter()
+    .filter_map(|(on, b)| on.then_some(b))
+    .collect()
+}
+
+/// The badges a row shows (the `BADGES_SHOWN` worst, in order) and how many more there are,
+/// so a badge is never cut by the column's edge (#1153).
+fn capped(all: &[Badge]) -> (&[Badge], usize) {
+    let shown = all.len().min(BADGES_SHOWN);
+    (&all[..shown], all.len() - shown)
+}
+
+/// An environment's state column on row `i`: its worst badges, then "+N" naming them all.
+fn state_badges(i: usize, s: envs::State, cx: &App) -> Div {
+    let badge = |text: SharedString, color: Hsla| {
         div()
             .flex_none()
             .px_1p5()
@@ -1385,22 +1475,28 @@ fn state_badges(s: envs::State, cx: &App) -> Vec<Div> {
             .border_color(color.opacity(0.5))
             .text_xs()
             .text_color(color)
+            .whitespace_nowrap()
             .child(text)
     };
-    let mut out = Vec::new();
-    if s.failed {
-        out.push(badge("Sync failed", theme.danger));
-    }
-    if s.any_degraded() {
-        out.push(badge("Degraded", theme.danger));
-    }
-    if s.out_of_sync {
-        out.push(badge("OutOfSync", theme.warning));
-    }
-    if s.running {
-        out.push(badge("Syncing", Tone::Busy.color(cx)));
-    }
-    out
+    let all = badges_of(s);
+    let (shown, more) = capped(&all);
+    let muted = cx.theme().muted_foreground;
+    let tip: SharedString = all.iter().map(|b| b.label()).collect::<Vec<_>>().join(", ").into();
+    h_flex()
+        .w(px(BADGES))
+        .flex_none()
+        .gap_1()
+        .overflow_hidden()
+        .children(shown.iter().map(|b| badge(b.label().into(), b.color(cx))))
+        .when(more > 0, |d| {
+            d.child(
+                badge(format!("+{more}").into(), muted)
+                    .id(("argo-state-more", i))
+                    .role(Role::Label)
+                    .aria_label(SharedString::from(format!("{more} more: {tip}")))
+                    .tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx)),
+            )
+        })
 }
 
 /// An environment's images on its row: the product's first, at most `IMAGES_SHOWN` (component,
@@ -1740,7 +1836,8 @@ impl ArgoView {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the standard one.
-    use super::tree_order;
+    use super::envs::State;
+    use super::{Badge, INDENT, LEAD, NAME, badges_of, capped, name_cell, tree_order};
 
     fn by_index(a: usize, b: usize) -> std::cmp::Ordering {
         a.cmp(&b)
@@ -1765,15 +1862,51 @@ mod tests {
         seen.sort_unstable();
         assert_eq!(seen, [0, 1, 2, 3]);
     }
+
+    #[test]
+    fn a_row_shows_its_two_worst_badges_and_counts_the_others() {
+        let all = State { out_of_sync: true, degraded: true, failed: true, running: true, ..State::default() };
+        let badges = badges_of(all);
+        assert_eq!(badges, [Badge::Failed, Badge::Degraded, Badge::OutOfSync, Badge::Syncing]);
+        assert_eq!(capped(&badges), (&[Badge::Failed, Badge::Degraded][..], 2));
+        // Out of sync and running: both fit, no "+N".
+        let two = badges_of(State { out_of_sync: true, running: true, ..State::default() });
+        assert_eq!(capped(&two), (&[Badge::OutOfSync, Badge::Syncing][..], 0));
+        // Failed comes before out of sync whatever else is on; a degraded tree counts.
+        let three = badges_of(State { out_of_sync: true, failed: true, tree_degraded: true, ..State::default() });
+        assert_eq!(capped(&three), (&[Badge::Failed, Badge::Degraded][..], 1));
+        assert_eq!(capped(&badges_of(State::default())), (&[][..], 0));
+    }
+
+    #[test]
+    fn name_cells_end_where_the_header_s_does() {
+        // Environments sit up to two headings deep, their Applications a few levels more.
+        for depth in 0..=5 {
+            let indent = INDENT * depth as f32;
+            assert_eq!(indent + LEAD + name_cell(indent), NAME, "depth {depth}");
+        }
+    }
 }
 
 /// Rules that hold for any parents, however tangled.
 #[cfg(test)]
 mod properties {
-    use super::tree_order;
+    use super::envs::State;
+    use super::{BADGES_SHOWN, badges_of, capped, tree_order};
     use proptest::prelude::*;
 
     proptest! {
+        /// No more than `BADGES_SHOWN` badges, the worst ones in order, and the rest counted.
+        #[test]
+        fn badges_are_capped_worst_first(out_of_sync: bool, degraded: bool, failed: bool, running: bool, tree_degraded: bool) {
+            let all = badges_of(State { out_of_sync, degraded, failed, running, tree_degraded, ..State::default() });
+            let (shown, more) = capped(&all);
+            prop_assert!(shown.len() <= BADGES_SHOWN);
+            prop_assert_eq!(shown.len() + more, all.len());
+            prop_assert_eq!(shown, &all[..shown.len()]);
+            prop_assert!(all.windows(2).all(|p| p[0] < p[1]));
+        }
+
         /// Every Application is listed once, under its parent when it has one outside a loop.
         #[test]
         fn every_application_is_shown_once(parents in proptest::collection::vec(proptest::option::of(0usize..12), 0..12)) {
