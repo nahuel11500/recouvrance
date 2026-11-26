@@ -1214,7 +1214,15 @@ impl ArgoView {
         h_flex()
             .gap_2()
             .flex_wrap()
-            .child(div().w(px(280.)).child(Input::new(&self.search).small().cleanable(true)))
+            // The search gives up room before anything wraps: it is placed at its narrowest and
+            // grows into what is left, up to its usual width.
+            .child(
+                div()
+                    .flex_basis(px(160.))
+                    .flex_grow_1()
+                    .max_w(px(280.))
+                    .child(Input::new(&self.search).small().cleanable(true)),
+            )
             .child(toggle("argo-look", "Needs a look", look, f.needs_look, |f| f.needs_look = !f.needs_look))
             .child(toggle("argo-out-of-sync", "Out of sync", out_of_sync, f.out_of_sync, |f| {
                 f.out_of_sync = !f.out_of_sync;
@@ -1237,12 +1245,14 @@ impl ArgoView {
             ))
             .child(type_picker(f.kind.clone(), f.on_tag, types, view.clone()))
             .when(*f != Filter::default(), |h| {
+                // An icon, so a filter turned on doesn't make the toolbar wrap (#1146).
                 h.child(
                     Button::new("argo-clear-filters")
                         .small()
                         .ghost()
-                        .icon(Lucide::X)
-                        .label("Clear filters")
+                        .icon(Lucide::FunnelX)
+                        .tooltip("Clear filters")
+                        .accessibility_label("Clear filters")
                         .on_click(cx.listener(|this, _, window, cx| this.clear_filters(window, cx))),
                 )
             })
@@ -1257,6 +1267,10 @@ impl ArgoView {
             )
     }
 }
+
+/// The widest a filter picker gets: a long project or type name ends in "…", and its tooltip
+/// (and screen readers) say it whole.
+const PICKER_MAX: f32 = 190.;
 
 /// The room the state badges take on a row.
 const BADGES: f32 = 200.;
@@ -1331,8 +1345,10 @@ fn picker(
     let label = current.as_ref().map_or_else(|| all.to_string(), |v| format!("{name}: {v}"));
     Button::new(id)
         .small()
+        .max_w(px(PICKER_MAX))
         .when(current.is_some(), ButtonVariants::primary)
         .when(current.is_none(), Button::outline)
+        .when(current.is_some(), |b| b.tooltip(label.clone()))
         .label(label)
         .dropdown_menu(move |menu, _, _| {
             let pick = |value: Option<String>| {
@@ -1372,8 +1388,10 @@ fn type_picker(
     let on = current.is_some() || on_tag;
     Button::new("argo-type")
         .small()
+        .max_w(px(PICKER_MAX))
         .when(on, ButtonVariants::primary)
         .when(!on, Button::outline)
+        .when(on, |b| b.tooltip(label.clone()))
         .label(label)
         .dropdown_menu(move |menu, _, _| {
             let pick = |kind: Option<String>, tag: bool| {
