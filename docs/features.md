@@ -384,7 +384,11 @@
   its root) in Argo CD's web UI or its destination namespace, picks the environment's
   Applications, and asks for *Refresh*, *Hard refresh*, *Sync*, *Terminate* (while an operation
   runs) or *Roll back to the previous deployment* (auto-sync off) (see *Argo CD by its API*). An
-  Argo CD server that can't be read is named above the list; the others are shown.
+  Argo CD server that can't be read is named above the list; the others are shown. An
+  environment's project is its workload's (an app of apps often sits in a project of its own),
+  and the project filter keeps it for any of its Applications' projects. A project or type
+  picked shows on its button, highlighted (*Project: shop*, *Type: acc*), *Clear filters*
+  turns every filter and the search off, and the count says *filtered*.
 - **Argo CD by its API**: Applications are read from Argo CD's own API, with the argocd CLI's
   login (`argocd login`, its contexts, servers and tokens; `--insecure`, `--plaintext` to this
   machine and `--grpc-web-root-path` are honoured, `--core` contexts have no server) or a token
@@ -455,6 +459,35 @@
   the page is hidden, once it shows again), and on *Refresh*. Leaving the tab or the page stops
   the read running; the page shown again reads the tab anew. The cards are worked out off the UI
   thread.
+- **Argo CD environment page: actions and views**: under the title, the actions on the
+  Application whose entry is shown, as Argo CD's own page has them: *Sync…* (the sync page
+  below, for that Application; *Sync environment…* for all of them), with when a sync by hand
+  can start under its sync windows beside it, *Refresh*, *Hard refresh*, *Terminate…* while an
+  operation runs, *Roll back…* (auto-sync off), and in *…* *Delete with what it deployed…* or
+  *Delete, keeping what it deployed…* (its name typed to confirm), *Open in Argo CD*. They go
+  through Argo CD's API with the row menu's checks: a server set read-only is refused first,
+  write mode applies when it is sent. The reload of the page itself is the small icon by
+  *Updated at*. The views, one at a time: *Overview* (the cards), *Resources* (every object of
+  the resource tree in columns: Workloads, Jobs & CronJobs, Config & Secrets, Networking,
+  Storage, Operators and others; each with its health's dot, its kind, its name and its pods
+  ready; a search by name or kind, *Only problems* and the healths to pick, *N shown of M*; a
+  click opens the object on the context that reaches its cluster), *Sync status* (the last
+  operation: what, its phase, its whole message, when it started and ended, how long, its
+  revision and who started it; then each resource of its result with its sync wave, from the
+  `argocd.argoproj.io/sync-wave` annotation of its manifest, 0 without, kind, namespace, name,
+  status, health now, hook and message, in the order Argo CD runs them: phase, wave, hooks first;
+  filtered by status, health and hook; the last sync card's *steps* opens it), *History and
+  rollback* (the history's list unfolded, its comparisons, and the Versions card), *Details*
+  (*Summary*: project, labels, annotations folded, cluster and its server, namespace copied by a
+  click, created, auto-sync, sync options, retry, status and revision, health, links and images;
+  *Sources*, one per line; *Manifest*, the Application's YAML without its status) and *Diff*
+  (what a sync would change). The State card takes the worst of Argo CD's health and the tree:
+  Argo CD counts only the resources it manages, so a Job a CronJob made that fails leaves it
+  *Healthy*; the card then says `Healthy · 1 Degraded below` in red, and once the page has read
+  that tree the environment's row on the list is *Degraded* too (and counts in *Needs a look*).
+  The sync page's options: full with hooks or the resources out of sync only without hooks
+  (with up to 5 Applications, each resource can be left out: a selective sync), prune, dry run,
+  force, server-side apply and replace.
 - **What changed between two syncs**: in the History card's list, *diff* on a deployment compares
   it with the one before, and *pick* on two deployments compares them; the comparison opens under
   the cards. *Sources*: what each deployment asked for, from Argo CD's history (the revision

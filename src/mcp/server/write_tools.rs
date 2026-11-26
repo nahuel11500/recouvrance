@@ -518,6 +518,7 @@ fn argo_op(p: &GitOpsParams) -> Option<Op> {
                 apply: p.hooks == Some(false),
                 revision: None,
                 prune_shown: None,
+                ..Default::default()
             }))
         }
         "rollback" => Some(Op::Rollback { id: p.deployment_id, dry_run }),

@@ -37,11 +37,15 @@ pub struct Options {
     pub hooks: bool,
     pub prune: bool,
     pub dry_run: bool,
+    /// Argo CD's Force, Server-Side Apply and Replace (see `SyncRequest`).
+    pub force: bool,
+    pub server_side: bool,
+    pub replace: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { hooks: true, prune: false, dry_run: false }
+        Self { hooks: true, prune: false, dry_run: false, force: false, server_side: false, replace: false }
     }
 }
 
@@ -72,7 +76,25 @@ impl Options {
             apply: !self.hooks,
             revision: checked.revision.clone(),
             prune_shown: self.prune.then(|| checked.pruned.clone()),
+            force: self.force,
+            server_side: self.server_side,
+            replace: self.replace,
         })
+    }
+
+    /// [`Self::request`], the resources `left_out` unpicked: a sync of the resources out of
+    /// sync names the others only, and none left is nothing to sync. The full sync names none,
+    /// so nothing is left out of it.
+    pub fn request_picked(&self, checked: &Checked, left_out: &[Res]) -> Option<SyncRequest> {
+        let mut req = self.request(checked)?;
+        if self.hooks || left_out.is_empty() {
+            return Some(req);
+        }
+        req.resources.retain(|r| !left_out.iter().any(|l| l.same(r)));
+        if let Some(shown) = &mut req.prune_shown {
+            shown.retain(|r| !left_out.iter().any(|l| l.same(r)));
+        }
+        (!req.resources.is_empty()).then_some(req)
     }
 
     /// `with hooks, prune, dry run`: what the confirmation says.
@@ -83,6 +105,15 @@ impl Options {
         }
         if self.dry_run {
             parts.push("dry run");
+        }
+        if self.force {
+            parts.push("force");
+        }
+        if self.server_side {
+            parts.push("server-side apply");
+        }
+        if self.replace {
+            parts.push("replace");
         }
         parts.join(", ")
     }
@@ -325,19 +356,44 @@ mod tests {
         let plain = Options::default().request(&checked).unwrap();
         assert_eq!(plain, SyncRequest::default(), "full, no prune, no dry run: Argo CD's own Sync");
         let pinned = Checked { revision: Some("abc".into()), ..checked };
-        let r = Options { hooks: false, prune: true, dry_run: true }.request(&pinned).unwrap();
+        let r = Options { hooks: false, prune: true, dry_run: true, ..Default::default() }.request(&pinned).unwrap();
         assert!(r.apply && r.prune && r.dry_run);
         assert_eq!(r.resources, [web.clone(), pruned[0].clone()], "what is out of sync, and what prune deletes");
         assert_eq!(r.prune_shown, Some(pruned), "prune deletes no more than was shown");
         assert_eq!(r.revision.as_deref(), Some("abc"), "pinned to the revision shown");
         assert_eq!(ops::strategy(&r), json!({"apply": {}}));
-        let r = Options { hooks: false, prune: false, dry_run: false }.request(&pinned).unwrap();
+        let r = Options { hooks: false, prune: false, dry_run: false, ..Default::default() }.request(&pinned).unwrap();
         assert_eq!(r.resources, [web], "without prune, what is to prune is not named");
         assert_eq!(
-            Options { hooks: false, prune: true, dry_run: true }.text(),
+            Options { hooks: false, prune: true, dry_run: true, ..Default::default() }.text(),
             "out of sync only, without hooks, prune, dry run"
         );
         assert_eq!(Options::default().text(), "full, with hooks");
+        let all = Options { force: true, server_side: true, replace: true, ..Default::default() };
+        let r = all.request(&pinned).unwrap();
+        assert!(r.force && r.server_side && r.replace);
+        assert_eq!(ops::sync_options(&r), ["ServerSideApply=true", "Replace=true"]);
+        assert_eq!(all.text(), "full, with hooks, force, server-side apply, replace");
+    }
+
+    /// Resources unpicked are left out of a sync of the resources out of sync, and of what
+    /// prune was shown to delete; with none left, nothing is synced.
+    #[test]
+    fn resources_unpicked_are_left_out() {
+        let res = |name: &str| Res {
+            kind: "ConfigMap".into(),
+            namespace: "shop".into(),
+            name: name.into(),
+            ..Default::default()
+        };
+        let checked = Checked { out_of_sync: vec![res("a"), res("b")], pruned: vec![res("old")], ..Default::default() };
+        let oos = Options { hooks: false, prune: true, ..Default::default() };
+        let r = oos.request_picked(&checked, &[res("a"), res("old")]).unwrap();
+        assert_eq!(r.resources, [res("b")]);
+        assert_eq!(r.prune_shown, Some(Vec::new()));
+        assert_eq!(oos.request_picked(&checked, &[res("a"), res("b"), res("old")]), None);
+        let full = Options::default().request_picked(&checked, &[res("a")]).unwrap();
+        assert!(full.resources.is_empty(), "the full sync is of the whole Application");
     }
 
     /// An Application with nothing out of sync is not synced at all without hooks: an empty
@@ -419,7 +475,7 @@ mod tests {
             let mut a = app();
             a["status"]["resources"] = json!(entries);
             let c = check(&a, &NextSync::NoWindow, now());
-            let opts = Options { hooks: false, prune, dry_run };
+            let opts = Options { hooks: false, prune, dry_run, ..Default::default() };
             let Some(req) = opts.request(&c) else {
                 proptest::prop_assert!(c.out_of_sync.is_empty() && (!prune || c.pruned.is_empty()));
                 return Ok(());

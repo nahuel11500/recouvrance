@@ -39,6 +39,8 @@ use crate::k8s::argo::{FleetApp, short_revision};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
 
+/// Applications whose resources out of sync can be picked one by one, at most.
+const PICK_ROWS: usize = 5;
 /// How often the Applications synced are read while their operations run.
 const READ_EVERY: Duration = Duration::from_secs(2);
 /// How often they are read while the page is hidden, or when more than `MANY` run.
@@ -103,9 +105,10 @@ impl Row {
         }
     }
 
-    /// Its sync with `opts`, when it is ready and has something to sync.
-    fn request(&self, opts: Options) -> Option<SyncRequest> {
-        opts.request(self.ready()?)
+    /// Its sync with `opts`, the resources `left_out` unpicked, when it is ready and has
+    /// something to sync.
+    fn request(&self, opts: Options, left_out: &[Res]) -> Option<SyncRequest> {
+        opts.request_picked(self.ready()?, left_out)
     }
 
     /// Its operation ended (or it couldn't be sent).
@@ -181,6 +184,8 @@ pub(super) struct GroupedSync {
     sent_with: Option<Options>,
     /// Sync… was clicked once with production environments among them: the next click goes on.
     armed: bool,
+    /// The resources unpicked, by row: a sync of the resources out of sync leaves them out.
+    unpicked: Vec<(usize, Res)>,
     /// Shown instead of the list (hidden while it runs, when left).
     pub(super) shown: bool,
     /// Followed too long: no longer read.
@@ -217,7 +222,23 @@ impl GroupedSync {
 
     /// The rows the sync with `opts` goes to, with their request.
     fn jobs(&self, opts: Options) -> Vec<(usize, SyncRequest)> {
-        self.rows.iter().enumerate().filter_map(|(i, r)| Some((i, r.request(opts)?))).collect()
+        self.rows.iter().enumerate().filter_map(|(i, r)| Some((i, r.request(opts, &self.left_out(i))?))).collect()
+    }
+
+    /// The resources of row `i` unpicked.
+    fn left_out(&self, i: usize) -> Vec<Res> {
+        self.unpicked.iter().filter(|(r, _)| *r == i).map(|(_, res)| res.clone()).collect()
+    }
+
+    /// Pick the resource `res` of row `i` again, or unpick it.
+    fn flip_pick(&mut self, i: usize, res: Res) {
+        match self.unpicked.iter().position(|(r, x)| *r == i && x.same(&res)) {
+            Some(at) => {
+                self.unpicked.remove(at);
+            }
+            None => self.unpicked.push((i, res)),
+        }
+        self.armed = false;
     }
 
     /// The production environments the sync goes to, each named once (`prod: shop-prod-acme`).
@@ -325,6 +346,7 @@ impl ArgoView {
             opts: Options::default(),
             sent_with: None,
             armed: false,
+            unpicked: Vec::new(),
             shown: true,
             gave_up: false,
             checks: Default::default(),
@@ -876,6 +898,33 @@ impl ArgoView {
                                 .child("Argo CD applies nothing and says what it would do."),
                         ),
                 )
+                .child(
+                    h_flex()
+                        .gap_4()
+                        .flex_wrap()
+                        .child(
+                            Checkbox::new("argo-sync-force")
+                                .label("Force")
+                                .checked(opts.force)
+                                .on_click(set(|o, v| o.force = v)),
+                        )
+                        .child(
+                            Checkbox::new("argo-sync-server-side")
+                                .label("Server-side apply")
+                                .checked(opts.server_side)
+                                .on_click(set(|o, v| o.server_side = v)),
+                        )
+                        .child(
+                            Checkbox::new("argo-sync-replace")
+                                .label("Replace")
+                                .checked(opts.replace)
+                                .on_click(set(|o, v| o.replace = v)),
+                        )
+                        .child(div().text_xs().text_color(if opts.force || opts.replace { theme.warning } else { muted }).child(
+                            "Force deletes and creates again what can't be patched; Replace uses kubectl replace \
+                             instead of apply; server-side apply lets the API server merge.",
+                        )),
+                )
         });
         let diff = match self.sync_diff_summary() {
             Some(s) => div().text_sm().font_weight(FontWeight::MEDIUM).child(selectable(s)),
@@ -1001,9 +1050,32 @@ impl ArgoView {
             return out.child(line(format!("Left out: {why}"), theme.warning));
         }
         if !sent || !r.in_sync {
-            let synced = r.request(opts).is_some();
+            let synced = r.request(opts, &g.left_out(i)).is_some();
             for (text, warn) in checked_lines(checked, synced, opts, r.production.as_deref()) {
                 out = out.child(line(text, if warn { theme.warning } else { muted }));
+            }
+            // A few Applications: each resource out of sync can be left out (Argo CD's
+            // selective sync).
+            if !sent && !opts.hooks && g.rows.len() <= PICK_ROWS {
+                let mut pickable: Vec<Res> = checked.out_of_sync.clone();
+                if opts.prune {
+                    pickable.extend(checked.pruned.iter().cloned());
+                }
+                let left_out = g.left_out(i);
+                let view = cx.entity().downgrade();
+                out = out.child(h_flex().flex_wrap().gap_x_3().gap_y_0p5().pl_2().children(
+                    pickable.into_iter().enumerate().map(|(n, res)| {
+                        let picked = !left_out.iter().any(|l| l.same(&res));
+                        let view = view.clone();
+                        Checkbox::new(SharedString::from(format!("argo-sync-pick-{i}-{n}")))
+                            .label(res.label())
+                            .checked(picked)
+                            .on_click(move |_: &bool, _, cx| {
+                                let res = res.clone();
+                                let _ = view.update(cx, |this, cx| this.update_sync(cx, |g| g.flip_pick(i, res)));
+                            })
+                    }),
+                ));
             }
             return out;
         }
@@ -1067,7 +1139,7 @@ mod tests {
     fn hooks_are_skipped_only_where_something_is_synced() {
         let hooks = vec!["PreSync Job shop/db-migrate".to_string()];
         let checked = Checked { hooks, auto_sync: true, ..Default::default() };
-        let without = Options { hooks: false, prune: true, dry_run: false };
+        let without = Options { hooks: false, prune: true, dry_run: false, ..Default::default() };
         assert_eq!(
             checked_lines(&checked, false, without, None),
             [("Nothing out of sync: not synced · auto-sync on".to_string(), false)]
@@ -1083,7 +1155,7 @@ mod tests {
                 ("Nothing to prune.".to_string(), false),
             ]
         );
-        let whole = Options { hooks: true, prune: false, dry_run: false };
+        let whole = Options { hooks: true, prune: false, dry_run: false, ..Default::default() };
         assert_eq!(
             checked_lines(&synced, true, whole, None),
             [

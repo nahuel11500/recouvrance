@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::Input;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -29,6 +28,9 @@ use crate::k8s::argo::{self, api, short_revision};
 use crate::smartdiff::{self, ObjectKey, ResourceChange, SmartDiff};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
+use env_page::{DetailsTab, View, ViewFilters};
+
+mod env_page;
 
 /// A status tile's width, before it grows to share its row: four side by side on a wide
 /// window, two pairs on a narrow one.
@@ -132,6 +134,10 @@ pub(super) struct Dashboard {
     manifests_load: crate::latest::Latest,
     /// Reads the commits of the product's images from their git host.
     commits_load: crate::latest::Latest,
+    /// The view shown under the action bar, the Details' tab, and the views' filters.
+    view: View,
+    details_tab: DetailsTab,
+    filters: ViewFilters,
 }
 
 impl Dashboard {
@@ -159,6 +165,9 @@ impl Dashboard {
             sources_load: Default::default(),
             manifests_load: Default::default(),
             commits_load: Default::default(),
+            view: View::default(),
+            details_tab: DetailsTab::default(),
+            filters: ViewFilters::default(),
         }
     }
 
@@ -306,6 +315,10 @@ impl ArgoView {
         d.tab = tab;
         d.failed = None;
         d.open.clear();
+        // The view stays; History is its list, unfolded.
+        if d.view == View::History {
+            d.open.insert("history".to_string());
+        }
         d.sync_open.clear();
         d.close_compare();
         d.tick = None;
@@ -364,6 +377,17 @@ impl ArgoView {
     /// A read of the tab `k` ended: show it, unless another tab is shown by then; read it again
     /// when its row changed meanwhile, or in a few seconds while a sync runs.
     fn dashboard_read(&mut self, k: Key, cards: Result<Arc<Cards>, String>, cx: &mut Context<Self>) {
+        // What the tree holds in trouble below it counts for its environment on the list.
+        if let Ok(c) = &cards
+            && c.problems.from_tree
+        {
+            let changed =
+                if c.state.below.is_some() { self.tree_bad.insert(k.clone()) } else { self.tree_bad.remove(&k) };
+            if changed && let Some(rows) = &mut self.rows {
+                rows.set_tree_verdicts(&self.tree_bad);
+                self.refilter(cx);
+            }
+        }
         let Some(d) = &mut self.dashboard else { return };
         let next = d.take_read(k, cards, Timestamp::now());
         cx.notify();
@@ -604,7 +628,6 @@ impl ArgoView {
             let at = t.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%H:%M:%S").to_string();
             format!("Updated at {at}")
         });
-        let current = d.current().and_then(|k| self.find(k));
         let header = h_flex()
             .gap_2()
             .child(
@@ -657,31 +680,28 @@ impl ArgoView {
                     )
             }))
             .children(updated.map(|u| div().flex_none().text_xs().text_color(muted).child(u)))
+            // Reads the page again from Argo CD; Refresh in the action bar asks Argo CD to
+            // compare with git again.
             .child(
-                Button::new("argo-dash-refresh")
-                    .small()
-                    .outline()
-                    .icon(Lucide::RefreshCw)
-                    .label("Refresh")
-                    .loading(d.loading)
-                    .disabled(d.example.is_some())
-                    .on_click(cx.listener(|this, _, _, cx| this.load_dashboard(cx))),
-            )
-            .when_some(d.current().cloned().filter(|_| current.is_some()), |h, k| {
-                h.child(
-                    Button::new("argo-dash-open")
+                with_tip("argo-dash-reload-tip", "Reload: read this page again from Argo CD".into()).child(
+                    Button::new("argo-dash-refresh")
                         .small()
                         .ghost()
-                        .icon(Lucide::ExternalLink)
-                        .label("Open in Argo CD")
-                        .on_click(cx.listener(move |this, _, _, cx| this.open(&k, cx))),
-                )
-            });
+                        .icon(Lucide::RotateCw)
+                        .accessibility_label("Reload")
+                        .loading(d.loading)
+                        .disabled(d.example.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| this.load_dashboard(cx))),
+                ),
+            );
         let environments = self.environments(d, cx);
-        let body = match d.shown() {
+        let shown = d.shown();
+        let shown_cards = shown.as_ref().and_then(|c| c.as_ref().ok()).cloned();
+        let actions = self.action_bar(d, shown_cards.as_deref(), cx);
+        let body = match shown {
             None => div().p_4().text_color(muted).child("Reading the Application…").into_any_element(),
             Some(Err(e)) => div().p_4().text_color(theme.danger).child(selectable(e)).into_any_element(),
-            Some(Ok(cards)) => self.cards(d, &cards, cx),
+            Some(Ok(cards)) => self.view_body(d, &cards, cx),
         };
         let failed = d.failed.clone().filter(|_| d.shown().is_some_and(|c| c.is_ok()));
         v_flex()
@@ -689,6 +709,7 @@ impl ArgoView {
             .gap_2()
             .child(header)
             .child(environments)
+            .child(actions)
             .children(failed.map(|f| div().text_xs().text_color(theme.warning).child(selectable(f))))
             .child(div().id("argo-dash-body").flex_1().min_h_0().overflow_y_scroll().child(body))
             .into_any_element()
@@ -827,7 +848,18 @@ impl ArgoView {
                     )
                     .children(
                         degraded.map(|t| div().min_w_0().truncate().text_color(theme.danger).child(selectable(t))),
-                    ),
+                    )
+                    .children(s.below.clone().map(|t| {
+                        let tip = "Argo CD counts only the resources it manages; these are objects they made (the \
+                                   Jobs of a CronJob, a Deployment's pods). See Problems, or Resources.";
+                        with_tip("argo-dash-below", tip.into())
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.danger)
+                            .font_weight(FontWeight::MEDIUM)
+                            .underline()
+                            .child(format!("· {t}"))
+                    })),
             )
             .when_some(s.health_message.clone(), |v, m| {
                 v.child(div().text_xs().text_color(theme.muted_foreground).line_clamp(2).child(selectable(m)))
@@ -876,7 +908,10 @@ impl ArgoView {
         });
         // Argo CD says the same of every sync that went well: only another message is shown.
         let message = s.message.clone().filter(|_| s.tone != Tone::Good);
-        let steps = (!s.steps.is_empty()).then(|| self.toggle_link("steps", "steps", "steps", d, cx));
+        let steps = (!s.steps.is_empty()).then(|| {
+            link("argo-dash-steps", "steps", cx)
+                .on_click(cx.listener(|this, _, _, cx| this.set_view(View::SyncStatus, cx)))
+        });
         let journal = self.journal_link("argo-dash-journal-sync", d, cx);
         tile("Last sync", Some(s.tone), cx)
             .child(figure(s.phase.clone(), s.tone.color(cx)))
@@ -1052,51 +1087,9 @@ impl ArgoView {
                     .child(div().text_xs().text_color(muted).child(selectable(f.hint.clone())))
             })));
         }
-        if let Some(s) = c.last_sync.as_ref().filter(|s| d.is_open("steps") && !s.steps.is_empty()) {
-            let is_open = |key: &str| d.is_open(&format!("steps-{key}"));
-            let toggle: super::journal::StepsToggle =
-                std::rc::Rc::new(|this, key, cx| this.toggle_part(format!("steps-{key}"), cx));
-            let of = super::journal::StepsOf {
-                id: "argo-dash-steps".into(),
-                steps: &s.steps,
-                summary: &s.summary,
-                seen: &[],
-                running: s.running,
-                ended: s.finished.map(Timestamp::as_second),
-                query: &self.steps_query,
-                is_open: &is_open,
-            };
-            out.push(
-                self.panel("Sync steps", "steps", d, cx)
-                    .child(div().w(px(260.)).child(Input::new(&self.steps_search).small().cleanable(true)))
-                    .child(self.steps_view(&of, toggle, Timestamp::now(), cx)),
-            );
-        }
         if d.is_open("diff") && c.diff.total() > 0 {
-            let diff = &c.diff;
-            let panel = self.panel("Sync diff", "diff", d, cx);
-            out.push(match (&c.smart, &c.git_diff) {
-                (Some(smart), _) => panel.child(self.sync_diff_view(d, smart, &c.changes, cx)),
-                (None, Some(Ok(g))) => panel.children(g.changed.iter().map(|r| {
-                    v_flex()
-                        .gap_0p5()
-                        .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(selectable(format!(
-                            "{} ({})",
-                            r.res.label(),
-                            r.change.text()
-                        ))))
-                        .child(crate::details::diff_block(&r.lines, cx))
-                })),
-                _ => panel.children(
-                    diff.changed
-                        .iter()
-                        .chain(&diff.unknown)
-                        .map(|r| (r, "differs"))
-                        .chain(diff.added.iter().map(|r| (r, "to create")))
-                        .chain(diff.pruned.iter().map(|r| (r, "to prune")))
-                        .map(|(r, what)| div().text_xs().child(selectable(format!("{}: {what}", r.label())))),
-                ),
-            });
+            let body = self.diff_body(d, c, cx);
+            out.push(self.panel("Sync diff", "diff", d, cx).child(body));
         }
         if d.is_open("problems") && !c.problems.rows.is_empty() {
             let rows: Vec<Div> = c.problems.rows.iter().map(|r| self.problem_row(d, r, cx)).collect();
@@ -1114,6 +1107,34 @@ impl ArgoView {
             )));
         }
         out
+    }
+
+    /// What a sync would change: the smart diff when the managed resources were read, else
+    /// Argo CD's diff, else the resources out of sync.
+    fn diff_body(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
+        let diff = &c.diff;
+        match (&c.smart, &c.git_diff) {
+            (Some(smart), _) => self.sync_diff_view(d, smart, &c.changes, cx),
+            (None, Some(Ok(g))) => v_flex().gap_1().children(g.changed.iter().map(|r| {
+                v_flex()
+                    .gap_0p5()
+                    .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(selectable(format!(
+                        "{} ({})",
+                        r.res.label(),
+                        r.change.text()
+                    ))))
+                    .child(crate::details::diff_block(&r.lines, cx))
+            })),
+            _ => v_flex().gap_1().children(
+                diff.changed
+                    .iter()
+                    .chain(&diff.unknown)
+                    .map(|r| (r, "differs"))
+                    .chain(diff.added.iter().map(|r| (r, "to create")))
+                    .chain(diff.pruned.iter().map(|r| (r, "to prune")))
+                    .map(|(r, what)| div().text_xs().child(selectable(format!("{}: {what}", r.label())))),
+            ),
+        }
     }
 
     /// What a sync would change, read with the smart diff: what changes first (images first,

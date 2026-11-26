@@ -1725,6 +1725,10 @@ pub enum Action {
         id: i64,
         dry_run: bool,
     },
+    /// Delete the Application; with `cascade`, what it deployed too.
+    Delete {
+        cascade: bool,
+    },
 }
 
 /// The request argocd-server's routes take for `action` on the Application `namespace/name`:
@@ -1740,6 +1744,9 @@ pub(super) fn request(action: &Action, namespace: &str, name: &str) -> (http::Me
         }
         Action::Sync(req) => (http::Method::POST, format!("{app}/sync"), Some(sync_body(body, req))),
         Action::Terminate => (http::Method::DELETE, format!("{app}/operation?appNamespace={ns}"), None),
+        Action::Delete { cascade } => {
+            (http::Method::DELETE, format!("{app}?appNamespace={ns}&cascade={cascade}"), None)
+        }
         Action::Rollback { id, dry_run } => {
             let mut body = body;
             body["id"] = json!(id);
@@ -1764,6 +1771,10 @@ fn sync_body(mut body: Value, req: &super::ops::SyncRequest) -> Value {
     }
     if !req.resources.is_empty() {
         body["resources"] = Value::Array(req.resources.iter().map(super::ops::resource_entry).collect());
+    }
+    let options = super::ops::sync_options(req);
+    if !options.is_empty() {
+        body["syncOptions"] = json!({"items": options});
     }
     body
 }
@@ -1831,6 +1842,8 @@ pub async fn act_read(
                 },
                 Action::Terminate => format!("The operation of {name} is terminating"),
                 Action::Rollback { id, .. } => format!("Rollback of {name} to deployment {id} started"),
+                Action::Delete { cascade: true } => format!("Argo CD deletes {name} and what it deployed"),
+                Action::Delete { cascade: false } => format!("Argo CD deletes {name}, its resources kept"),
             })
             .map(|said| (said, before))
             .map_err(|f| f.text))
@@ -2102,6 +2115,10 @@ users:
             req(Action::Terminate),
             ("DELETE".into(), "/api/v1/applications/web/operation?appNamespace=team%20a".into(), None)
         );
+        assert_eq!(
+            req(Action::Delete { cascade: false }),
+            ("DELETE".into(), "/api/v1/applications/web?appNamespace=team%20a&cascade=false".into(), None)
+        );
         let body = json!({"name": "web", "appNamespace": "team a", "id": 7});
         assert_eq!(
             req(Action::Rollback { id: 7, dry_run: false }),
@@ -2138,8 +2155,13 @@ users:
             apply: false,
             revision: None,
             prune_shown: None,
+            force: true,
+            server_side: true,
+            replace: false,
         });
-        assert_eq!(all["strategy"], json!({"hook": {}}));
+        assert_eq!(all["strategy"], json!({"hook": {"force": true}}));
+        assert_eq!(all["syncOptions"], json!({"items": ["ServerSideApply=true"]}));
+        assert!(plain.get("syncOptions").is_none());
         assert_eq!((all["prune"].clone(), all["dryRun"].clone()), (json!(true), json!(true)));
         assert_eq!(
             all["resources"],

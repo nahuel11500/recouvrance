@@ -2487,7 +2487,8 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
             &k8s::argo::windows::NextSync::NoWindow,
             jiff::Timestamp::now(),
         );
-        let opts = k8s::argo::grouped_sync::Options { hooks: false, prune: false, dry_run: false };
+        let opts =
+            k8s::argo::grouped_sync::Options { hooks: false, prune: false, dry_run: false, ..Default::default() };
         let req = opts.request(&checked).expect("a resource is out of sync");
         gate::set_ui_writes(true);
         k8s::argo::api::act(endpoint.clone(), "argocd".into(), name.into(), k8s::argo::api::Action::Sync(req))
@@ -2519,7 +2520,7 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
         // The window's writes: write mode off refuses them when they are sent.
         gate::set_ui_writes(false);
         let refused = k8s::argo::api::act(
-            endpoint,
+            endpoint.clone(),
             "argocd".into(),
             name.into(),
             k8s::argo::api::Action::Refresh { hard: false },
@@ -2528,6 +2529,22 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
         let err = refused.expect_err("write mode is off");
         assert!(err.contains(gate::WRITES_OFF), "{err}");
         assert_eq!(fake.writes().len(), before, "the refused refresh reached Argo CD");
+
+        // The window's delete of an Application: refused with write mode off, sent with it
+        // on, its resources kept when asked.
+        let delete = k8s::argo::api::Action::Delete { cascade: false };
+        let refused = k8s::argo::api::act(endpoint.clone(), "argocd".into(), name.into(), delete.clone()).await;
+        assert!(refused.expect_err("write mode is off").contains(gate::WRITES_OFF));
+        assert_eq!(fake.writes().len(), before, "the refused delete reached Argo CD");
+        gate::set_ui_writes(true);
+        k8s::argo::api::act(endpoint, "argocd".into(), name.into(), delete).await.map_err(anyhow::Error::msg)?;
+        gate::set_ui_writes(false);
+        let (method, path, _) = fake.writes().last().cloned().context("no delete was sent")?;
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("DELETE", "/api/v1/applications/e2e-argo?appNamespace=argocd&cascade=false")
+        );
+        assert!(fake.get(name).is_none(), "the Application is gone");
         Ok(())
     });
 }

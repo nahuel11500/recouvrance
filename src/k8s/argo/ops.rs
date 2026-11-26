@@ -35,6 +35,12 @@ pub struct SyncRequest {
     /// What prune deletes, as shown to whoever confirmed the sync: if git changed since and
     /// it would now delete more, the sync is refused. None when nothing was shown.
     pub prune_shown: Option<Vec<Res>>,
+    /// Delete and create again what can't be patched (`kubectl apply --force`).
+    pub force: bool,
+    /// Kubernetes' server-side apply (`ServerSideApply=true`).
+    pub server_side: bool,
+    /// `kubectl replace`/`create` instead of apply (`Replace=true`).
+    pub replace: bool,
 }
 
 /// What can be written to an Application's operation.
@@ -96,9 +102,23 @@ pub fn shown_revision(app: &Value) -> Option<String> {
     app.pointer("/status/sync/revision").and_then(Value::as_str).filter(|r| !r.is_empty()).map(String::from)
 }
 
-/// The sync strategy of `req`: `{"apply": {}}` without hooks, else `{"hook": {}}`.
+/// The sync strategy of `req`: `{"apply": {}}` without hooks, else `{"hook": {}}`; with
+/// `force` in it when asked.
 pub fn strategy(req: &SyncRequest) -> Value {
-    if req.apply { json!({"apply": {}}) } else { json!({"hook": {}}) }
+    let how = if req.force { json!({"force": true}) } else { json!({}) };
+    if req.apply { json!({"apply": how}) } else { json!({"hook": how}) }
+}
+
+/// The sync options `req` asks for, as Argo CD writes them (`ServerSideApply=true`).
+pub fn sync_options(req: &SyncRequest) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if req.server_side {
+        out.push("ServerSideApply=true");
+    }
+    if req.replace {
+        out.push("Replace=true");
+    }
+    out
 }
 
 /// A resource as `operation.sync.resources` names it (group and namespace left out when empty).

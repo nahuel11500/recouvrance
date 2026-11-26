@@ -36,7 +36,7 @@ mod tabs;
 mod yaml_edit;
 
 pub(crate) use actions::*;
-pub(crate) use argo::{ArgoAction, OpenOn, confirm_api_action};
+pub(crate) use argo::{ArgoAction, OpenOn, confirm_api_action, confirm_api_delete};
 use browser::FileBrowser;
 pub(crate) use compare::{diff_block, preview_block, preview_scroll};
 pub(crate) use guard::*;
