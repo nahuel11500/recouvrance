@@ -1117,7 +1117,13 @@ impl ArgoView {
         } else {
             "Set up the assistant first (Settings → Assistant: Claude Code or an API key)"
         };
-        Button::new(id).xsmall().outline().icon(Lucide::Sparkles).tooltip(tip).disabled(!d.assistant)
+        Button::new(id)
+            .xsmall()
+            .outline()
+            .icon(Lucide::Sparkles)
+            .accessibility_label("Ask the assistant")
+            .tooltip(tip)
+            .disabled(!d.assistant)
     }
 
     /// Ask the assistant about the problems of the tab shown (`k`): all of them, or the one at
