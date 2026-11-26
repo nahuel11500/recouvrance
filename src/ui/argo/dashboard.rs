@@ -28,6 +28,7 @@ use crate::k8s::argo::{self, api, short_revision};
 use crate::smartdiff::{self, ObjectKey, ResourceChange, SmartDiff};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
+pub(super) use env_page::sync_table;
 use env_page::{DetailsTab, View, ViewFilters};
 
 mod env_page;
@@ -44,8 +45,12 @@ const HISTORY: f32 = 360.;
 const ENV_MAX: f32 = 360.;
 /// How often the tab shown is read while a sync runs.
 const RUNNING_EVERY: Duration = Duration::from_secs(3);
-/// Problems listed in their tile before "+N more".
-const PROBLEMS_IN_TILE: usize = 3;
+/// Problems listed in the Problems panel before "show all".
+const PROBLEMS_SHOWN: usize = 8;
+/// Images listed one a line when none is known as the product's, before the others are folded.
+const IMAGES_LISTED: usize = 8;
+/// Sources deployed listed before "show all".
+const DEPLOYED_SHOWN: usize = 3;
 /// Names listed per kind of change in the Sync diff card.
 const NAMES_SHOWN: usize = 4;
 /// Changes listed in the Sync diff card.
@@ -116,8 +121,9 @@ pub(super) struct Dashboard {
     load: crate::latest::Latest,
     /// Reads it again while a sync runs, once the page is shown.
     tick: Option<Task<()>>,
-    /// The parts unfolded: "why", "steps", "diff", "history", "pods", "problems",
-    /// `"why-<resource>"`.
+    /// The parts unfolded: "why", "steps", "diff", "history", "pods", "problems" (every
+    /// problem listed), "images", "deployed"; and the Resources view's categories folded
+    /// (`"res-fold-<category>"`).
     open: HashSet<String>,
     /// The Sync diff's noise shown, and its resources whose YAML diff is unfolded.
     sync_noise: bool,
@@ -138,6 +144,8 @@ pub(super) struct Dashboard {
     view: View,
     details_tab: DetailsTab,
     filters: ViewFilters,
+    /// The assistant can be asked (Claude Code or an API key is set up), as seen on opening.
+    assistant: bool,
 }
 
 impl Dashboard {
@@ -168,6 +176,7 @@ impl Dashboard {
             view: View::default(),
             details_tab: DetailsTab::default(),
             filters: ViewFilters::default(),
+            assistant: crate::assistant::backend().is_some(),
         }
     }
 
@@ -571,6 +580,28 @@ impl ArgoView {
         cx.notify();
     }
 
+    /// The made-up example on the view `view` (`resources`, `sync`, `history`, `details`,
+    /// `diff`; `all`: the Overview with every part unfolded).
+    #[cfg(feature = "dev")]
+    pub fn demo_dashboard_view(&mut self, view: &str, cx: &mut Context<Self>) {
+        if self.dashboard.as_ref().is_none_or(|d| d.example.is_none()) {
+            self.demo_dashboard(cx);
+        }
+        let Some(d) = &mut self.dashboard else { return };
+        d.view = match view {
+            "resources" => View::Resources,
+            "sync" => View::SyncStatus,
+            "history" => View::History,
+            "details" => View::Details,
+            "diff" => View::Diff,
+            _ => View::Overview,
+        };
+        if view == "all" {
+            d.open.extend(["images", "deployed", "problems", "history"].map(String::from));
+        }
+        cx.notify();
+    }
+
     /// The made-up example after a selective sync of the workload (two of its resources, by
     /// hand, an hour ago), newer than its newest deployment.
     #[cfg(feature = "dev")]
@@ -779,22 +810,18 @@ impl ArgoView {
         }))
     }
 
-    /// The four status tiles (two pairs that stack on a narrow window), the parts unfolded
-    /// from them full width, then the Versions and History panels.
+    /// The three status tiles (they stack on a narrow window), the Problems panel always
+    /// under them, the parts unfolded from the tiles full width, then the Versions and
+    /// History panels.
     fn cards(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> AnyElement {
-        let pair = |a: Div, b: Div| {
-            h_flex()
-                .flex_wrap()
-                .items_stretch()
-                .gap_3()
-                .flex_grow(1.)
-                .flex_basis(px(2. * TILE + 12.))
-                .min_w_0()
-                .child(a)
-                .child(b)
-        };
-        let status = pair(self.state_card(d, c, cx), self.last_sync_card(d, c, cx));
-        let changes = pair(self.diff_card(d, c, cx), self.problems_card(d, c, cx));
+        let tiles = h_flex()
+            .flex_wrap()
+            .items_stretch()
+            .gap_3()
+            .child(self.state_card(d, c, cx))
+            .child(self.last_sync_card(d, c, cx))
+            .child(self.diff_card(d, c, cx));
+        let problems = self.problems_panel(d, c, cx);
         let unfolded = self.unfolded(d, c, cx);
         v_flex()
             .gap_3()
@@ -803,7 +830,8 @@ impl ArgoView {
                 let line = format!("Not read now ({why}): shown as the Applications list has it.");
                 v.child(div().text_xs().text_color(cx.theme().warning).child(selectable(line)))
             })
-            .child(h_flex().flex_wrap().items_stretch().gap_3().child(status).child(changes))
+            .child(tiles)
+            .child(problems)
             .children(unfolded)
             .child(
                 h_flex()
@@ -856,13 +884,12 @@ impl ArgoView {
                     )
                     .children(s.below.clone().map(|t| {
                         let tip = "Argo CD counts only the resources it manages; these are objects they made (the \
-                                   Jobs of a CronJob, a Deployment's pods). See Problems, or Resources.";
+                                   Jobs of a CronJob, a Deployment's pods): listed under Problems, below.";
                         with_tip("argo-dash-below", tip.into())
                             .min_w_0()
                             .truncate()
                             .text_color(theme.danger)
                             .font_weight(FontWeight::MEDIUM)
-                            .underline()
                             .child(format!("· {t}"))
                     })),
             )
@@ -988,29 +1015,53 @@ impl ArgoView {
             .child(h_flex().gap_2().child(show).children(from_status))
     }
 
-    fn problems_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
+    /// The problems, always under the tiles: one row each (status, name, kind, pods, for how
+    /// long) with why, the worst first; the first few, then all on demand. Its header counts the
+    /// pods, opens them, and asks the assistant about them all. With none, one line: none (when
+    /// that is known), or why it isn't known.
+    fn problems_panel(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
         let p = &c.problems;
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        // Nothing found is only good news when the tree was read or the Application is
-        // Healthy: from a status without health, nothing found says nothing.
         let known_clean = c.clean_is_known();
-        let tone = if p.rows.iter().any(|r| r.tone == Tone::Bad) {
-            Tone::Bad
-        } else if p.rows.is_empty() && known_clean {
-            Tone::Good
-        } else if p.rows.is_empty() {
-            Tone::Done
-        } else {
-            Tone::Busy
-        };
-        let (figure_text, color) = match p.rows.len() {
-            0 if known_clean => ("None".to_string(), theme.success),
-            0 => ("Unknown".to_string(), muted),
-            n => (n.to_string(), tone.color(cx)),
-        };
-        // Why nothing can be said, or why the pods aren't listed: on hover.
-        let unknown = (p.rows.is_empty() && !known_clean).then(|| {
+        let k = d.current().cloned();
+        let reaches =
+            k.as_ref().and_then(|k| self.find(k)).is_some_and(|a| a.on.is_some() && !a.dest.namespace.is_empty());
+        let pods_link = (p.from_tree && !p.pods.is_empty()).then(|| {
+            let label = format!("{} ›", crate::plural::count(p.pods.len(), "pod"));
+            if reaches {
+                let k = k.clone();
+                link("argo-dash-all-pods", &label, cx).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(k) = &k {
+                        this.open_destination(k, cx);
+                    }
+                }))
+            } else {
+                self.toggle_link("pods", "pods", &label, d, cx)
+            }
+        });
+        let tree_unread =
+            c.tree_error.clone().filter(|_| !p.from_tree).map(|e| hint("argo-dash-tree-error", "pods unread", e, cx));
+        if p.rows.is_empty() {
+            let line = h_flex()
+                .gap_2()
+                .items_center()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.border)
+                .text_sm();
+            if known_clean {
+                return line
+                    .child(div().flex_none().size(px(8.)).rounded_full().bg(theme.success))
+                    .child(div().child("No problems"))
+                    .when(p.from_tree, |h| {
+                        h.child(div().text_xs().text_color(muted).child("every resource and pod is healthy"))
+                    })
+                    .children(pods_link)
+                    .children(tree_unread);
+            }
             let why = c
                 .tree_error
                 .clone()
@@ -1018,56 +1069,84 @@ impl ArgoView {
                 .unwrap_or_else(|| {
                     "Argo CD keeps no health per resource in the Application, and its resource tree wasn't read".into()
                 });
-            hint("argo-dash-problems-why", "no detail", format!("{why}."), cx)
-        });
-        let tree_unread = c
-            .tree_error
-            .clone()
-            .filter(|_| !p.from_tree && unknown.is_none())
-            .map(|e| hint("argo-dash-tree-error", "pods unread", e, cx));
-        let rows: Vec<Div> = p
-            .rows
-            .iter()
-            .take(PROBLEMS_IN_TILE)
-            .map(|r| {
-                h_flex()
-                    .gap_1p5()
-                    .min_w_0()
-                    .text_xs()
-                    .child(chip(&r.status, r.tone, cx))
-                    .child(div().min_w_0().truncate().child(selectable(r.res.name.clone())))
+            return line
+                .child(div().flex_none().size(px(8.)).rounded_full().bg(muted))
+                .child(div().text_color(muted).child("Problems unknown"))
+                .child(hint("argo-dash-problems-why", "why?", format!("{why}."), cx));
+        }
+        let tone = if p.rows.iter().any(|r| r.tone == Tone::Bad) { Tone::Bad } else { Tone::Busy };
+        let all = d.is_open("problems");
+        let shown = if all { p.rows.len() } else { p.rows.len().min(PROBLEMS_SHOWN) };
+        let k_all = k;
+        let ask_all = self
+            .ask_button("argo-dash-ask-all", d)
+            .label("Ask the assistant")
+            .on_click(cx.listener(move |this, _, _, cx| this.ask_problems(k_all.as_ref(), None, cx)));
+        let header = h_flex()
+            .gap_2()
+            .items_center()
+            .flex_wrap()
+            .pb_1()
+            .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child("PROBLEMS"))
+            .child(chip(&p.rows.len().to_string(), tone, cx))
+            .when(p.from_tree, |h| {
+                h.child(div().text_xs().text_color(muted).child(format!("{} pods in trouble", p.troubled)))
             })
-            .collect();
-        let list = (!p.rows.is_empty()).then(|| {
-            let more = p.rows.len().saturating_sub(PROBLEMS_IN_TILE);
-            let label = if more > 0 { format!("+{more} more") } else { "details".to_string() };
-            self.toggle_link("problems", "problems", &label, d, cx)
-        });
-        let k = d.current().cloned();
-        let reaches =
-            k.as_ref().and_then(|k| self.find(k)).is_some_and(|a| a.on.is_some() && !a.dest.namespace.is_empty());
-        let all_pods = (p.from_tree && !p.pods.is_empty()).then(|| {
-            if reaches {
-                link("argo-dash-all-pods", "pods", cx).on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(k) = &k {
-                        this.open_destination(k, cx);
-                    }
-                }))
+            .children(pods_link)
+            .children(tree_unread)
+            .child(div().flex_1())
+            .child(ask_all);
+        let rows: Vec<Div> =
+            p.rows.iter().take(shown).enumerate().map(|(i, r)| self.problem_row(d, i, r, reaches, cx)).collect();
+        let fold = (p.rows.len() > PROBLEMS_SHOWN).then(|| {
+            let label = if all {
+                "show fewer".to_string()
             } else {
-                self.toggle_link("pods", "pods", "pods", d, cx)
-            }
+                format!("show all {} (+{} more)", p.rows.len(), p.rows.len() - shown)
+            };
+            h_flex().pt_1().child(self.toggle_link("problems", "problems", &label, d, cx))
         });
-        tile("Problems", Some(tone), cx)
-            .child(figure(figure_text, color))
-            .when(p.from_tree, |v| {
-                v.child(div().text_xs().text_color(muted).child(format!(
-                    "{} · {} in trouble",
-                    crate::plural::count(p.pods.len(), "pod"),
-                    p.troubled
-                )))
-            })
-            .children(rows)
-            .child(h_flex().gap_2().children(list).children(all_pods).children(unknown).children(tree_unread))
+        frame_toned(Some(tone), cx).w_full().gap_0().child(header).children(rows).children(fold)
+    }
+
+    /// The button asking the assistant: it says on hover what it asks, or why it can't be
+    /// asked (no assistant set up), then shows disabled.
+    fn ask_button(&self, id: impl Into<ElementId>, d: &Dashboard) -> Button {
+        let tip = if d.assistant {
+            "Ask the assistant why: it reads the cluster (read-only) and answers with the cause and the fix"
+        } else {
+            "Set up the assistant first (Settings → Assistant: Claude Code or an API key)"
+        };
+        Button::new(id).xsmall().outline().icon(Lucide::Sparkles).tooltip(tip).disabled(!d.assistant)
+    }
+
+    /// Ask the assistant about the problems of the tab shown (`k`): all of them, or the one at
+    /// `one`.
+    fn ask_problems(&mut self, k: Option<&Key>, one: Option<usize>, cx: &mut Context<Self>) {
+        let Some(d) = &self.dashboard else { return };
+        let Some(Ok(cards)) = d.shown() else { return };
+        let rows: Vec<&Problem> = match one {
+            Some(i) => cards.problems.rows.get(i).into_iter().collect(),
+            None => cards.problems.rows.iter().collect(),
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let det = &cards.details;
+        let application = match (k, &d.example) {
+            (Some(k), _) => k.2.clone(),
+            (None, Some(tabs)) => tabs.get(d.tab).map_or_else(|| d.title.clone(), |(n, _)| n.clone()),
+            (None, None) => d.title.clone(),
+        };
+        let scope = dashboard::AskScope {
+            environment: d.title.clone(),
+            application,
+            cluster: if det.cluster.is_empty() { det.server.clone() } else { det.cluster.clone() },
+            namespace: det.namespace.clone(),
+            context: k.and_then(|k| self.find(k)).and_then(|a| a.on.clone()),
+        };
+        let question = dashboard::problems_question(&scope, &rows, Timestamp::now());
+        cx.emit(super::AskAssistant { question });
     }
 
     /// The parts unfolded from the tiles, full width under them: each has room for its lines.
@@ -1095,10 +1174,6 @@ impl ArgoView {
         if d.is_open("diff") && c.diff.total() > 0 {
             let body = self.diff_body(d, c, cx);
             out.push(self.panel("Sync diff", "diff", d, cx).child(body));
-        }
-        if d.is_open("problems") && !c.problems.rows.is_empty() {
-            let rows: Vec<Div> = c.problems.rows.iter().map(|r| self.problem_row(d, r, cx)).collect();
-            out.push(self.panel("Problems", "problems", d, cx).children(rows));
         }
         if d.is_open("pods") && !c.problems.pods.is_empty() {
             out.push(self.panel("Pods", "pods", d, cx).child(h_flex().flex_wrap().gap_x_4().gap_y_1().children(
@@ -1193,52 +1268,55 @@ impl ArgoView {
         )
     }
 
-    fn problem_row(&self, d: &Dashboard, r: &Problem, cx: &mut Context<Self>) -> Div {
+    /// A problem: its status, its name whole (a click opens it when a context reaches its
+    /// cluster), its kind, its pods in trouble and for how long, the assistant asked about it,
+    /// and why under it, whole.
+    fn problem_row(&self, d: &Dashboard, i: usize, r: &Problem, reaches: bool, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
-        // Keyed by the resource: the rows may move when the tab is read again.
-        let part = format!("why-{}", r.res.label());
-        let open = d.is_open(&part);
-        let why = r.why.is_some().then(|| self.toggle_link(&part, &part, "why", d, cx));
+        let muted = theme.muted_foreground;
         let mut facts = vec![r.res.kind.clone()];
         if let Some((bad, all)) = r.pods {
-            facts.push(format!("{bad} of {}", crate::plural::count(all, "pod")));
+            facts.push(format!("{bad} of {} in trouble", crate::plural::count(all, "pod")));
         }
         if let Some(since) = r.since {
             facts.push(format!("for {}", span_text(Timestamp::now().as_second() - since.as_second())));
         }
+        let k = d.current().cloned();
+        let name = div().id(("argo-dash-problem", i)).min_w_0().font_weight(FontWeight::MEDIUM);
+        let name = if reaches {
+            let (k, res) = (k.clone(), r.res.clone());
+            name.text_color(theme.blue).cursor_pointer().hover(Styled::underline).child(r.res.name.clone()).on_click(
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(k) = &k {
+                        this.open_deployed(k, res.clone(), cx);
+                    }
+                }),
+            )
+        } else {
+            name.child(selectable(r.res.name.clone()))
+        };
+        let ask = self
+            .ask_button(("argo-dash-ask", i), d)
+            .ghost()
+            .on_click(cx.listener(move |this, _, _, cx| this.ask_problems(k.as_ref(), Some(i), cx)));
         v_flex()
             .gap_0p5()
+            .py_1p5()
+            .border_t_1()
+            .border_color(theme.border.opacity(0.6))
             .child(
                 h_flex()
                     .gap_2()
+                    .items_center()
                     .min_w_0()
                     .text_sm()
                     .child(chip(&r.status, r.tone, cx))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .min_w_0()
-                            .truncate()
-                            .child(selectable(r.res.name.clone())),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(selectable(facts.join(" · "))),
-                    )
-                    .children(why),
+                    .child(name)
+                    .child(div().flex_none().text_xs().text_color(muted).child(selectable(facts.join(" · "))))
+                    .child(div().flex_1())
+                    .child(ask),
             )
-            .when(open, |v| {
-                v.child(
-                    div()
-                        .pl_2()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(selectable(r.why.clone().unwrap_or_default())),
-                )
-            })
+            .when_some(r.why.clone(), |v, why| v.child(div().text_xs().text_color(muted).child(selectable(why))))
     }
 
     /// "journal": the sync journal of the Application shown, every operation seen of it, even
@@ -1291,8 +1369,10 @@ impl ArgoView {
         d.commits_load.spawn(cx, crate::git_host::read(wanted), |_, _, cx| cx.notify());
     }
 
-    /// The images running (the product's first, the others folded), the commit each of the
-    /// product's was built from, the commit each source deploys, and who released it.
+    /// What runs, the product's first: one line per repository of the product's images (its
+    /// component, its tag made short, the commit it was built from), the other images folded
+    /// under how many there are; then the sources deployed and their commits (the first few),
+    /// a selective sync after them, and who released it, with the rollback.
     fn versions_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
         let v = &c.versions;
         let theme = cx.theme().clone();
@@ -1309,50 +1389,36 @@ impl ArgoView {
             },
             |k| self.own_images(k),
         );
-        type Numbered<'a> = Vec<(usize, &'a dashboard::Image)>;
-        let (mine, others): (Numbered, Numbered) =
-            v.images.iter().enumerate().partition(|(_, i)| own.contains(&i.repo));
-        // Nothing known as the product's: every image, as Argo CD lists them.
-        let folded = !mine.is_empty() && !others.is_empty() && !d.is_open("images");
-        let shown: Vec<(usize, &dashboard::Image)> =
-            if folded { mine.clone() } else { mine.iter().chain(&others).copied().collect() };
-        let chips = h_flex()
-            .flex_wrap()
-            .gap_1p5()
-            .children(shown.into_iter().map(|(i, img)| image_chip(i, img, cx)))
-            .when(!mine.is_empty() && !others.is_empty(), |row| {
-                let label = format!("+{} others", others.len());
-                row.child(self.toggle_link("images", "images", &label, d, cx))
-            });
-        let commits: Vec<(usize, &dashboard::Image, crate::git_host::Commit)> = mine
-            .iter()
-            .filter_map(|(i, img)| match crate::git_host::known(&img.repo, &img.tag) {
-                Some(crate::git_host::Lookup::Found(c)) => Some((*i, *img, c)),
-                _ => None,
-            })
-            .collect();
-        let commit_rows = commits.into_iter().map(|(i, img, commit)| {
-            let mut by = vec![commit.author.clone()];
-            if let Some(t) = commit.date {
-                by.push(format!("{} ago", k8s::age(t)));
-            }
-            let url = commit.url.clone();
-            h_flex()
-                .gap_2()
-                .text_xs()
-                .min_w_0()
-                .child(div().flex_none().text_color(muted).child(img.component.clone()))
-                .child(
-                    with_tip(("argo-dash-image-commit", i), super::overview::commit_text(&commit))
-                        .min_w_0()
-                        .truncate()
-                        .text_color(if url.is_empty() { theme.foreground } else { theme.blue })
-                        .when(!url.is_empty(), |d| {
-                            d.cursor_pointer().hover(Styled::underline).on_click(move |_, _, cx| cx.open_url(&url))
-                        })
-                        .child(commit.title.clone()),
+        let (mut mine, mut others) = dashboard::image_lines(&v.images, |r| own.contains(r));
+        // Nothing known as the product's and many images: the first few listed, the rest folded.
+        let product_known = !others.is_empty() || mine.iter().any(|l| own.contains(&l.repo));
+        if !product_known && mine.len() > IMAGES_LISTED {
+            others = mine.split_off(IMAGES_LISTED);
+        }
+        let heading = |text: &str| {
+            div().pt_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child(text.to_uppercase())
+        };
+        let image_rows: Vec<Div> = mine.iter().enumerate().map(|(i, l)| image_row(i, l, cx)).collect();
+        let others_open = d.is_open("images");
+        let others_part = (!others.is_empty()).then(|| {
+            let what = if product_known { "other image" } else { "more image" };
+            let label = format!("{} {}", if others_open { "▾" } else { "▸" }, crate::plural::count(others.len(), what));
+            let toggle = self.toggle_link("images", "images", &label, d, cx);
+            v_flex().gap_1().child(h_flex().child(toggle)).when(others_open, |v| {
+                v.child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .children(others.iter().enumerate().map(|(i, l)| image_chip(mine.len() + i, l, cx))),
                 )
-                .child(div().flex_none().text_color(muted).child(by.join(", ")))
+            })
+        });
+        let deployed_open = d.is_open("deployed");
+        let deployed_shown = if deployed_open { c.deployed.len() } else { c.deployed.len().min(DEPLOYED_SHOWN) };
+        let deployed_more = (c.deployed.len() > DEPLOYED_SHOWN).then(|| {
+            let label =
+                if deployed_open { "show fewer".to_string() } else { format!("show all {} sources", c.deployed.len()) };
+            h_flex().child(self.toggle_link("deployed", "deployed", &label, d, cx))
         });
         let mut released = Vec::new();
         if let Some(t) = v.released {
@@ -1360,6 +1426,13 @@ impl ArgoView {
         }
         if let Some(by) = &v.by {
             released.push(format!("by {by}"));
+        }
+        let mut footer = released.join(" ");
+        if let Some(p) = &v.previous {
+            if !footer.is_empty() {
+                footer.push_str(" · ");
+            }
+            footer.push_str(&format!("before: {}", short_revision(p)));
         }
         let rollback = match (v.auto_sync, v.rollback_to) {
             (true, _) => Some(
@@ -1385,21 +1458,20 @@ impl ArgoView {
                 )
             }
         };
-        let title = match v.images.len() {
-            0 => "Versions".to_string(),
-            n => format!("Versions · {}", crate::plural::count(n, "image")),
-        };
-        card(&title, None, cx)
-            .child(if v.images.is_empty() {
-                div().text_sm().text_color(muted).child("Argo CD lists no image.").into_any_element()
-            } else {
-                chips.into_any_element()
+        card("Versions", None, cx)
+            .when(v.images.is_empty(), |c| c.child(div().text_sm().text_color(muted).child("Argo CD lists no image.")))
+            .when(!image_rows.is_empty(), |c| c.child(v_flex().gap_1().children(image_rows)))
+            .children(others_part)
+            .when(!c.deployed.is_empty(), |card| {
+                card.child(heading("Deployed from")).children(
+                    c.deployed
+                        .iter()
+                        .take(deployed_shown)
+                        .enumerate()
+                        .map(|(i, (dep, commit))| deployed_row(i, dep, commit.as_ref(), cx)),
+                )
             })
-            .children(commit_rows)
-            .when_some(v.previous.clone(), |c, p| {
-                c.child(div().text_xs().text_color(muted).child(selectable(format!("Before: {}", short_revision(&p)))))
-            })
-            .children(c.deployed.iter().enumerate().map(|(i, (dep, commit))| deployed_row(i, dep, commit.as_ref(), cx)))
+            .children(deployed_more)
             // The newest deployment isn't all that runs: a selective sync came after it.
             .when_some(c.partial.as_ref(), |card, p| {
                 let rest = c.deployed.first().map_or_default(|(d, _)| short_revision(&d.revision));
@@ -1414,14 +1486,16 @@ impl ArgoView {
                         .child(selectable(text)),
                 )
             })
-            .when(!released.is_empty() || rollback.is_some(), |c| {
+            .when(!footer.is_empty() || rollback.is_some(), |c| {
                 c.child(
                     h_flex()
                         .gap_2()
-                        .pt_1()
-                        .child(
-                            div().flex_1().min_w_0().text_xs().text_color(muted).child(selectable(released.join(" "))),
-                        )
+                        .items_center()
+                        .mt_1()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .child(div().flex_1().min_w_0().text_xs().text_color(muted).child(selectable(footer)))
                         .children(rollback),
                 )
             })
@@ -1730,19 +1804,84 @@ pub(super) fn lines_block(lines: &[crate::history::DiffLine], cx: &App) -> Div {
         })
 }
 
-/// An image running: its component, and its tag made short (`main-eab9300`), the old tag before
-/// it when it changed. The whole reference on hover, copied by a click.
-fn image_chip(i: usize, img: &dashboard::Image, cx: &App) -> Stateful<Div> {
+/// A tag as the Versions card says it: short (`main-eab9300`), the old one before it when it
+/// changed.
+fn tag_text(l: &dashboard::ImageLine) -> String {
+    match (&l.from, l.tags.len()) {
+        (Some(from), 1) => format!("{} → {}", short_revision(from), short_revision(l.tag())),
+        _ => short_revision(l.tag()),
+    }
+}
+
+/// One of the product's images: its component, its tag made short (`+N` when it runs at
+/// several; the whole references on hover, copied by a click), and the commit it was built
+/// from when its git host said it.
+fn image_row(i: usize, l: &dashboard::ImageLine, cx: &App) -> Div {
     let theme = cx.theme();
-    let changed = img.from.is_some();
-    let (text, whole) = match &img.from {
-        Some(from) => (
-            format!("{} → {}", short_revision(from), short_revision(&img.tag)),
-            format!("{}:{from} → {}:{}", img.repo, img.repo, img.tag),
-        ),
-        None => (short_revision(&img.tag), format!("{}:{}", img.repo, img.tag)),
-    };
+    let muted = theme.muted_foreground;
+    let changed = l.from.is_some();
+    let whole = l.whole();
     let copied = whole.clone();
+    let tag = with_tip(("argo-dash-image", i), format!("{whole}\nClick to copy"))
+        .flex_none()
+        .px_1p5()
+        .rounded_md()
+        .cursor_pointer()
+        .font_family(theme.mono_font_family.clone())
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(if changed { theme.warning } else { theme.foreground })
+        .bg(if changed { theme.warning.opacity(0.12) } else { theme.muted })
+        .child(tag_text(l))
+        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone())));
+    let several =
+        (l.tags.len() > 1).then(|| div().flex_none().text_color(muted).child(format!("+{}", l.tags.len() - 1)));
+    let commit = match crate::git_host::known(&l.repo, l.tag()) {
+        Some(crate::git_host::Lookup::Found(c)) => Some(c),
+        _ => None,
+    };
+    let commit = commit.map(|commit| {
+        let mut by = vec![commit.author.clone()];
+        if let Some(t) = commit.date {
+            by.push(format!("{} ago", k8s::age(t)));
+        }
+        let url = commit.url.clone();
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_2()
+            .child(
+                with_tip(("argo-dash-image-commit", i), super::overview::commit_text(&commit))
+                    .min_w_0()
+                    .truncate()
+                    .text_color(if url.is_empty() { theme.foreground } else { theme.blue })
+                    .when(!url.is_empty(), |d| {
+                        d.cursor_pointer().hover(Styled::underline).on_click(move |_, _, cx| cx.open_url(&url))
+                    })
+                    .child(commit.title.clone()),
+            )
+            .child(div().flex_none().text_color(muted).child(by.join(", ")))
+    });
+    h_flex()
+        .gap_2()
+        .items_center()
+        .min_w_0()
+        .text_xs()
+        .child(div().flex_none().min_w(px(110.)).text_sm().font_weight(FontWeight::MEDIUM).child(l.component.clone()))
+        .child(tag)
+        .children(several)
+        .children(commit)
+}
+
+/// An image folded away (third-party, or past the first few): its component and its tag
+/// made short, the whole references on hover, copied by a click.
+fn image_chip(i: usize, l: &dashboard::ImageLine, cx: &App) -> Stateful<Div> {
+    let theme = cx.theme();
+    let whole = l.whole();
+    let copied = whole.clone();
+    let mut tag = tag_text(l);
+    if l.tags.len() > 1 {
+        tag.push_str(&format!(" +{}", l.tags.len() - 1));
+    }
     with_tip(("argo-dash-image", i), format!("{whole}\nClick to copy"))
         .flex()
         .flex_row()
@@ -1755,18 +1894,9 @@ fn image_chip(i: usize, img: &dashboard::Image, cx: &App) -> Stateful<Div> {
         .border_1()
         .text_xs()
         .cursor_pointer()
-        .border_color(if changed { theme.danger } else { theme.border })
-        .when(changed, |h| h.bg(theme.danger.opacity(0.1)))
-        .child(div().flex_none().text_color(theme.muted_foreground).child(img.component.clone()))
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .font_family(theme.mono_font_family.clone())
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(if changed { theme.danger } else { theme.foreground })
-                .child(text),
-        )
+        .border_color(theme.border)
+        .child(div().flex_none().text_color(theme.muted_foreground).child(l.component.clone()))
+        .child(div().min_w_0().truncate().font_family(theme.mono_font_family.clone()).child(tag))
         .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone())))
 }
 
@@ -1865,7 +1995,7 @@ fn card(title: &str, tone: Option<Tone>, cx: &App) -> Div {
     )
 }
 
-/// One of the four status tiles: a card that shares its row with the others.
+/// One of the three status tiles: a card that shares its row with the others.
 fn tile(title: &str, tone: Option<Tone>, cx: &App) -> Div {
     card(title, tone, cx).flex_grow(1.).flex_basis(px(TILE)).min_w(px(TILE_MIN))
 }

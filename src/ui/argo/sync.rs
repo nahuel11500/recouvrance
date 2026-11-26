@@ -13,6 +13,7 @@
 //! Leaving the page while a sync runs only hides it: the syncs go on, and the selection bar
 //! shows it again.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
@@ -25,17 +26,18 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
-use super::dashboard::{chip, link};
+use super::dashboard::{chip, link, sync_table};
 use super::grouped::{labels, some};
 use super::{ArgoView, Key, key};
 use crate::details::{ConfirmButtons as _, Guard, confirm_extras, guard_ok};
+use crate::k8s::argo::dashboard::SyncRow;
 use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::grouped_diff::MAX_APPS;
 use crate::k8s::argo::grouped_sync::{self, Checked, Options, PARALLEL, Progress, Target};
-use crate::k8s::argo::operation_tone;
 use crate::k8s::argo::ops::{self, Op, SyncRequest};
 use crate::k8s::argo::windows::{NextSync, Planner};
 use crate::k8s::argo::{FleetApp, short_revision};
+use crate::k8s::argo::{operation_tone, steps};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
 
@@ -52,6 +54,10 @@ const FOLLOW_FOR: Duration = Duration::from_secs(30 * 60);
 const NAMED: usize = 10;
 /// Resources out of sync, and hooks, named under an Application, at most (the others counted).
 const RES_NAMED: usize = 8;
+/// Applications synced up to this many show their resources' list unfolded.
+const OPS_UNFOLDED: usize = 3;
+/// Resources listed under one Application, at most.
+const OPS_ROWS: usize = 300;
 const TERMINATE_NOTE: &str =
     "Argo CD stops the operation running, hooks included. What it applied so far stays as it is.";
 
@@ -119,6 +125,61 @@ impl Row {
             None => false,
         }
     }
+}
+
+/// A made-up Application whose sync is in `phase` (`Running`, `Succeeded` or `Failed`): a
+/// migration hook before, two config objects in wave -1, the workloads, a check hook after
+/// (the developer tools' example).
+#[cfg(feature = "dev")]
+fn demo_operation(ns: &str, phase: &str, now: jiff::Timestamp) -> Value {
+    let running = phase == "Running";
+    let res = |kind: &str, name: &str, status: &str, hook: Option<(&str, &str)>, message: &str| {
+        let mut r = serde_json::json!({"group": if kind == "Deployment" { "apps" } else { "" }, "kind": kind,
+            "namespace": ns, "name": name, "status": status, "message": message,
+            "syncPhase": hook.map_or("Sync", |(t, _)| t)});
+        if let Some((t, p)) = hook {
+            r["hookType"] = t.into();
+            r["hookPhase"] = p.into();
+        }
+        r
+    };
+    let mut results = vec![
+        res("Job", "db-migrate", "Synced", Some(("PreSync", "Succeeded")), "job.batch/db-migrate created"),
+        res("ConfigMap", "api-config", "Synced", None, "configmap/api-config configured"),
+        res("Secret", "api-env", "Synced", None, "secret/api-env unchanged"),
+        res("Deployment", "api", "Synced", None, "deployment.apps/api configured"),
+    ];
+    match phase {
+        "Running" => results.push(res("Deployment", "worker", "", None, "")),
+        "Failed" => {
+            results.push(res("Deployment", "worker", "Synced", None, "deployment.apps/worker configured"));
+            results.push(res(
+                "Job",
+                "smoke-test",
+                "Synced",
+                Some(("PostSync", "Failed")),
+                "Job has reached the specified backoff limit",
+            ));
+        }
+        _ => {
+            results.push(res("Deployment", "worker", "Synced", None, "deployment.apps/worker configured"));
+            results.push(res("Job", "smoke-test", "Synced", Some(("PostSync", "Succeeded")), "job completed"));
+        }
+    }
+    let wave = |kind: &str, name: &str, w: i64| serde_json::json!({"kind": kind, "namespace": ns, "name": name, "syncWave": w});
+    serde_json::json!({
+        "metadata": {"name": format!("{ns}-workload"), "namespace": "argocd"},
+        "status": {
+            "resources": [wave("ConfigMap", "api-config", -1), wave("Secret", "api-env", -1), wave("Deployment", "worker", 1)],
+            "operationState": {
+                "phase": phase,
+                "message": if running { "waiting for healthy state of apps/Deployment/api" } else { "" },
+                "startedAt": jiff::Timestamp::from_second(now.as_second() - 90).unwrap_or(now).to_string(),
+                "finishedAt": if running { Value::Null } else { now.to_string().into() },
+                "syncResult": {"resources": results},
+            },
+        },
+    })
 }
 
 /// Whether every Application to sync has a sync option on in its own spec (`(on, of)` from
@@ -211,12 +272,22 @@ pub(super) struct GroupedSync {
     checks: crate::latest::Latest,
     sends: Option<Task<()>>,
     follow: Option<Task<()>>,
+    /// The rows whose resources' list was folded or unfolded by hand (see `ops_open`).
+    ops_flipped: HashSet<usize>,
 }
 
 /// An Application followed: its row, where it is read, and when the operation before the one sent started.
 type Follow = (usize, Target, Option<String>);
 
 impl GroupedSync {
+    /// Whether the list of resources synced of row `i` is unfolded: by default when a few
+    /// Applications are synced, or when its sync failed; a click flips it.
+    fn ops_open(&self, i: usize) -> bool {
+        let few = self.rows.iter().filter(|r| r.in_sync).count() <= OPS_UNFOLDED;
+        let failed = self.rows.get(i).is_some_and(|r| matches!(&r.progress, Some(Ok(p)) if p.ended && !p.succeeded));
+        (few || failed) != self.ops_flipped.contains(&i)
+    }
+
     /// Sent, and some of it is still going.
     pub(super) fn running(&self) -> bool {
         self.sent_with.is_some() && !self.gave_up && self.rows.iter().any(|r| r.in_sync && !r.ended())
@@ -370,6 +441,7 @@ impl ArgoView {
             checks: Default::default(),
             sends: None,
             follow: None,
+            ops_flipped: HashSet::new(),
         });
         self.check_grouped(cx);
         cx.notify();
@@ -415,6 +487,30 @@ impl ArgoView {
             }));
         }
         g.armed = how.contains("armed");
+        // `-running` / `-done`: sent, and followed as Argo CD would say it (the first one
+        // failed when done).
+        let (running, done) = (how.contains("running"), how.contains("done"));
+        if running || done {
+            g.sent_with = Some(g.opts);
+            let now = jiff::Timestamp::now();
+            for (n, r) in g.rows.iter_mut().enumerate() {
+                let ns = r.target.name.trim_end_matches("-workload").to_string();
+                r.in_sync = true;
+                r.sent = Some(Ok("Sync started".into()));
+                let app = demo_operation(
+                    &ns,
+                    if done && n == 0 {
+                        "Failed"
+                    } else if done {
+                        "Succeeded"
+                    } else {
+                        "Running"
+                    },
+                    now,
+                );
+                r.progress = Some(Ok(grouped_sync::progress(&app, None)));
+            }
+        }
         cx.notify();
     }
 
@@ -1148,6 +1244,33 @@ impl ArgoView {
         }
         if let Some(note) = &r.note {
             out = out.child(line(note.clone(), muted));
+        }
+        // What it is doing: its resources, by wave, with their status, live.
+        if !progress.rows.is_empty() {
+            let open = g.ops_open(i);
+            let failed = progress.rows.iter().filter(|r| steps::tone(&r.step) == Tone::Bad).count();
+            let running = progress.rows.iter().filter(|r| steps::tone(&r.step) == Tone::Busy).count();
+            let mut what = vec![crate::plural::count(progress.rows.len(), "resource")];
+            if running > 0 {
+                what.push(format!("{running} running"));
+            }
+            if failed > 0 {
+                what.push(format!("{failed} failed"));
+            }
+            let label = format!("{} {}", if open { "▾" } else { "▸" }, what.join(" · "));
+            out = out.child(h_flex().child(link(("argo-sync-ops", i), &label, cx).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.update_sync(cx, |g| {
+                        if !g.ops_flipped.remove(&i) {
+                            g.ops_flipped.insert(i);
+                        }
+                    });
+                },
+            ))));
+            if open {
+                let rows: Vec<&SyncRow> = progress.rows.iter().collect();
+                out = out.child(div().pl_2().child(sync_table(&rows, OPS_ROWS, cx)));
+            }
         }
         out
     }

@@ -272,7 +272,8 @@ impl AppView {
         }
     }
 
-    /// Open where an Application deploys, from the Argo CD page (also after F5).
+    /// Open where an Application deploys, and ask the assistant about its problems, from the
+    /// Argo CD page (also after F5).
     pub(super) fn subscribe_argo(
         &mut self,
         page: &Entity<crate::ui::argo::ArgoView>,
@@ -282,6 +283,17 @@ impl AppView {
         // Released with the page.
         cx.subscribe_in(page, window, |this, page, ev: &crate::details::OpenOn, window, cx| {
             this.open_on(ev.context.clone(), ev.res.clone(), None, page.entity_id(), window, cx);
+        })
+        .detach();
+        // Beside the page when the assistant is there, else on its own page (as the Diagnosis
+        // card's Investigate).
+        cx.subscribe_in(page, window, |this, _, ev: &crate::ui::argo::AskAssistant, window, cx| {
+            if this.docked_assistant().is_none() {
+                this.open_assistant(window, cx);
+            }
+            if let Some(page) = this.assistant_page() {
+                page.update(cx, |a, cx| a.start_over(ev.question.clone(), cx));
+            }
         })
         .detach();
     }

@@ -19,10 +19,10 @@ use super::super::{ArgoView, Key, Offers};
 use super::{Dashboard, card, chip, link, with_tip};
 use crate::details::{ArgoAction, OpenOn};
 use crate::k8s;
-use crate::k8s::argo::dashboard::{Cards, Category, Node, SyncRow, health_tone};
+use crate::k8s::argo::dashboard::{Cards, Category, Node, SyncRow, health_tone, sections};
 use crate::k8s::argo::diagnosis::{Res, span_text};
-use crate::k8s::argo::short_revision;
 use crate::k8s::argo::windows::{NextSync, Planner};
+use crate::k8s::argo::{short_revision, steps};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
 
@@ -57,6 +57,11 @@ pub(in crate::ui::argo) struct ViewFilters {
     pub sync_health: Option<String>,
     pub sync_hook: Option<bool>,
 }
+
+/// The Resources view's columns: kind, pods, health.
+const KIND_W: f32 = 170.;
+const PODS_W: f32 = 120.;
+const HEALTH_W: f32 = 90.;
 
 /// A time as the page says it: the local date and hour, and how long ago.
 fn stamp(t: Timestamp) -> String {
@@ -105,7 +110,7 @@ impl ArgoView {
 
     /// Open `res`, an object the Application `k` deployed, on the context that reaches its
     /// cluster.
-    fn open_deployed(&mut self, k: &Key, res: Res, cx: &mut Context<Self>) {
+    pub(super) fn open_deployed(&mut self, k: &Key, res: Res, cx: &mut Context<Self>) {
         let Some(context) = self.find(k).and_then(|a| a.on.clone()) else { return };
         cx.emit(OpenOn { context, res });
     }
@@ -299,9 +304,11 @@ impl ArgoView {
 
     // MARK: Resources
 
-    /// The resources, a column per category, each with its health, kind, name and pods
-    /// ready; filtered by name or kind, by those in trouble, and by health. A click opens
-    /// one on its cluster.
+    /// The resources in one list, full width, by category: the categories with resources in
+    /// trouble first, each folded or unfolded by a click on its header (its count, and how many
+    /// are in trouble), the worst first in each; a row says its health, kind, name whole and
+    /// pods. Filtered by name or kind, by those in trouble, and by health. A click opens one on
+    /// its cluster.
     fn resources_view(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
@@ -314,8 +321,29 @@ impl ArgoView {
         healths.dedup();
         let k = d.current().cloned();
         let reaches = k.as_ref().and_then(|k| self.find(k)).and_then(|a| a.on.clone());
+        let sections = sections(&kept);
+        let fold_key = |cat: Category| format!("res-fold-{}", cat.title());
+        let all_folded = !sections.is_empty() && sections.iter().all(|s| d.is_open(&fold_key(s.category)));
+        let keys: Vec<String> = sections.iter().map(|s| fold_key(s.category)).collect();
+        let fold_all = (sections.len() > 1).then(|| {
+            link("argo-res-fold-all", if all_folded { "Unfold all" } else { "Fold all" }, cx).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    if let Some(d) = &mut this.dashboard {
+                        for key in &keys {
+                            if all_folded {
+                                d.open.remove(key);
+                            } else {
+                                d.open.insert(key.clone());
+                            }
+                        }
+                    }
+                    cx.notify();
+                },
+            ))
+        });
         let filters = h_flex()
             .flex_wrap()
+            .items_center()
             .gap_2()
             .child(div().w(px(260.)).child(Input::new(&self.res_search).small().cleanable(true)))
             .child(
@@ -344,7 +372,9 @@ impl ArgoView {
                         );
                     }))
             }))
-            .child(div().text_xs().text_color(muted).child(format!("{} shown of {}", kept.len(), c.nodes.len())));
+            .child(div().text_xs().text_color(muted).child(format!("{} shown of {}", kept.len(), c.nodes.len())))
+            .child(div().flex_1())
+            .children(fold_all);
         let source = if c.problems.from_tree {
             match &reaches {
                 Some(ctx) => format!("From Argo CD's resource tree. A click opens a resource on {ctx}."),
@@ -353,22 +383,52 @@ impl ArgoView {
         } else {
             "From the Application's status (its resource tree wasn't read): pods unknown.".to_string()
         };
-        let columns = Category::ALL.iter().filter_map(|&cat| {
-            let nodes: Vec<(usize, &Node)> =
-                kept.iter().enumerate().filter(|(_, n)| n.category == cat).map(|(i, n)| (i, *n)).collect();
-            if nodes.is_empty() {
-                return None;
-            }
-            let bad = nodes.iter().filter(|(_, n)| n.in_trouble()).count();
-            let tone = (bad > 0).then_some(Tone::Bad);
-            Some(
-                card(&format!("{} · {}", cat.title(), nodes.len()), tone, cx)
-                    .flex_1()
-                    .flex_basis(px(280.))
-                    .min_w(px(240.))
-                    .children(nodes.into_iter().map(|(i, n)| self.node_row(i, n, k.as_ref(), reaches.is_some(), cx))),
-            )
-        });
+        let mut at = 0usize;
+        let blocks: Vec<Div> = sections
+            .iter()
+            .enumerate()
+            .map(|(si, s)| {
+                let key = fold_key(s.category);
+                let folded = d.is_open(&key);
+                let header = h_flex()
+                    .id(("argo-res-section", si))
+                    .gap_2()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .rounded_md()
+                    .hover(|h| h.bg(theme.secondary))
+                    .child(div().flex_none().w(px(12.)).text_xs().text_color(muted).child(if folded {
+                        "▸"
+                    } else {
+                        "▾"
+                    }))
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(s.category.title()))
+                    .child(div().text_xs().text_color(muted).child(s.nodes.len().to_string()))
+                    .when(s.troubled > 0, |h| h.child(chip(&format!("{} in trouble", s.troubled), Tone::Bad, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_part(key.clone(), cx)));
+                let rows: Vec<Stateful<Div>> = if folded {
+                    Vec::new()
+                } else {
+                    s.nodes
+                        .iter()
+                        .map(|n| {
+                            at += 1;
+                            self.node_row(at, n, k.as_ref(), reaches.is_some(), cx)
+                        })
+                        .collect()
+                };
+                v_flex()
+                    .w_full()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(if s.troubled > 0 { theme.danger.opacity(0.4) } else { theme.border })
+                    .p_1()
+                    .child(header)
+                    .children(rows)
+            })
+            .collect();
         v_flex()
             .gap_2()
             .pb_4()
@@ -381,13 +441,16 @@ impl ArgoView {
                     "No resource matches the filters."
                 }))
             })
-            .child(h_flex().flex_wrap().items_start().gap_3().children(columns))
+            .children(blocks)
             .into_any_element()
     }
 
-    /// One resource: its health's dot, its kind, its name and its pods ready.
+    /// One resource, in columns: its health's dot, its kind, its name whole (it wraps rather
+    /// than being cut), its pods and its health; what Argo CD says of it under it when it isn't
+    /// healthy.
     fn node_row(&self, i: usize, n: &Node, k: Option<&Key>, reaches: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
         let mut tip = vec![n.res.label()];
         tip.push(format!("Health: {}", n.health.as_deref().unwrap_or("none")));
         if let Some(m) = &n.message {
@@ -397,33 +460,45 @@ impl ArgoView {
         if reaches {
             tip.push("Click to open it on its cluster".into());
         }
-        let pods =
-            n.pods_summary().map(|(text, tone)| div().flex_none().text_xs().text_color(tone.color(cx)).child(text));
+        let pods = n.pods_summary().map(|(text, tone)| div().text_color(tone.color(cx)).child(text));
+        let message = n.message.clone().filter(|_| matches!(n.tone, Tone::Bad | Tone::Busy));
         let (k, res) = (k.cloned(), n.res.clone());
         with_tip(("argo-res", i), tip.join("\n"))
             .flex()
-            .flex_row()
-            .items_center()
-            .gap_1p5()
-            .min_w_0()
-            .px_1p5()
+            .flex_col()
+            .px_2()
             .py_0p5()
             .rounded_md()
-            .text_sm()
             .when(n.in_trouble(), |h| h.bg(theme.danger.opacity(0.08)))
-            .child(div().flex_none().size(px(8.)).rounded_full().bg(n.tone.color(cx)))
             .child(
-                div()
-                    .flex_none()
-                    .px_1()
-                    .rounded(px(4.))
-                    .bg(theme.muted)
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(n.res.kind.clone()),
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .text_sm()
+                    .child(div().flex_none().mt(px(5.)).size(px(8.)).rounded_full().bg(n.tone.color(cx)))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(KIND_W))
+                            .truncate()
+                            .text_xs()
+                            .mt(px(2.))
+                            .text_color(muted)
+                            .child(n.res.kind.clone()),
+                    )
+                    .child(div().flex_1().min_w_0().child(n.res.name.clone()))
+                    .child(div().flex_none().w(px(PODS_W)).text_xs().mt(px(2.)).children(pods))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(HEALTH_W))
+                            .text_xs()
+                            .mt(px(2.))
+                            .text_color(n.tone.color(cx))
+                            .child(n.health.clone().unwrap_or_default()),
+                    ),
             )
-            .child(div().flex_1().min_w_0().truncate().child(n.res.name.clone()))
-            .children(pods)
+            .when_some(message, |v, m| v.child(div().pl(px(8. + KIND_W + 16.)).text_xs().text_color(muted).child(m)))
             .when(reaches, |h| {
                 h.cursor_pointer().hover(|s| s.bg(theme.secondary)).on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(k) = &k {
@@ -539,46 +614,6 @@ impl ArgoView {
                     .child(hook(1, "Hooks", Some(true), cx))
                     .child(hook(2, "Not hooks", Some(false), cx)),
             );
-        let cell = |w: f32| div().w(px(w)).flex_none().min_w_0().truncate();
-        let head = h_flex()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .text_xs()
-            .text_color(muted)
-            .border_b_1()
-            .border_color(theme.border)
-            .child(cell(44.).child("Wave"))
-            .child(cell(140.).child("Kind"))
-            .child(cell(130.).child("Namespace"))
-            .child(div().flex_1().min_w(px(140.)).child("Name"))
-            .child(cell(100.).child("Status"))
-            .child(cell(96.).child("Health"))
-            .child(cell(80.).child("Hook"))
-            .child(div().flex_1().min_w(px(160.)).child("Message"));
-        let table = rows.iter().enumerate().map(|(i, r)| {
-            let st = &r.step;
-            let result = st.result().to_string();
-            let tone = crate::status::tone(&result).unwrap_or(Tone::Done);
-            let health = r.health.clone().unwrap_or_else(|| "None".into());
-            let hook = if r.hook { st.hook_type.clone() } else { String::new() };
-            h_flex()
-                .id(("argo-sync-row", i))
-                .gap_2()
-                .px_2()
-                .py_0p5()
-                .text_sm()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(cell(44.).text_color(muted).child(r.wave.to_string()))
-                .child(cell(140.).child(selectable(st.kind.clone())))
-                .child(cell(130.).text_color(muted).child(selectable(st.namespace.clone())))
-                .child(div().flex_1().min_w(px(140.)).truncate().child(selectable(st.name.clone())))
-                .child(cell(100.).child(chip(&result, tone, cx)))
-                .child(cell(96.).child(chip(&health, health_tone(r.health.as_deref()), cx)))
-                .child(cell(80.).text_xs().text_color(muted).child(hook))
-                .child(div().flex_1().min_w(px(160.)).text_xs().child(selectable(st.message.clone())))
-        });
         v_flex()
             .gap_2()
             .pb_4()
@@ -589,7 +624,7 @@ impl ArgoView {
                 rows.len(),
                 crate::plural::count(c.sync_rows.len(), "resource")
             )))
-            .child(v_flex().child(head).children(table))
+            .child(sync_table(&rows, ROWS_SHOWN, cx))
             .into_any_element()
     }
 
@@ -765,6 +800,70 @@ impl ArgoView {
             .into_any_element()
     }
 }
+
+/// The result per resource of a sync, one row each in the order given (at most `max`, then how
+/// many more): its wave, kind, namespace, name (whole), status, health, hook and message
+/// (whole). A step running is tinted, one that failed more: the Sync status view, and the sync
+/// page while it follows a sync.
+pub(in crate::ui::argo) fn sync_table(rows: &[&SyncRow], max: usize, cx: &App) -> Div {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let cell = |w: f32| div().w(px(w)).flex_none().min_w_0().truncate();
+    let head = h_flex()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .text_xs()
+        .text_color(muted)
+        .border_b_1()
+        .border_color(theme.border)
+        .child(cell(44.).child("Wave"))
+        .child(cell(140.).child("Kind"))
+        .child(cell(130.).child("Namespace"))
+        .child(div().flex_1().min_w(px(140.)).child("Name"))
+        .child(cell(100.).child("Status"))
+        .child(cell(96.).child("Health"))
+        .child(cell(80.).child("Hook"))
+        .child(div().flex_1().min_w(px(160.)).child("Message"));
+    let more = rows.len().saturating_sub(max);
+    let table = rows.iter().take(max).map(|r| {
+        let st = &r.step;
+        let tone = steps::tone(st);
+        let health = r.health.clone().unwrap_or_else(|| "None".into());
+        let hook = if r.hook { st.hook_type.clone() } else { String::new() };
+        h_flex()
+            .gap_2()
+            .px_2()
+            .py_0p5()
+            .items_start()
+            .text_sm()
+            .border_b_1()
+            .border_color(theme.border)
+            .when(tone == Tone::Bad, |h| h.bg(theme.danger.opacity(0.08)))
+            .when(tone == Tone::Busy, |h| h.bg(theme.warning.opacity(0.08)))
+            .child(cell(44.).text_color(muted).child(r.wave.to_string()))
+            .child(cell(140.).child(selectable(st.kind.clone())))
+            .child(cell(130.).text_color(muted).child(selectable(st.namespace.clone())))
+            .child(div().flex_1().min_w(px(140.)).child(selectable(st.name.clone())))
+            .child(cell(100.).child(chip(steps::result_text(st), tone, cx)))
+            .child(cell(96.).child(chip(&health, health_tone(r.health.as_deref()), cx)))
+            .child(cell(80.).text_xs().text_color(muted).child(hook))
+            .child(div().flex_1().min_w(px(160.)).text_xs().child(selectable(st.message.clone())))
+    });
+    v_flex().child(head).children(table).when(more > 0, |v| {
+        v.child(
+            div()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(muted)
+                .child(format!("… {}", crate::plural::count(more, "more resource"))),
+        )
+    })
+}
+
+/// Resources listed in a sync's table, at most.
+const ROWS_SHOWN: usize = 500;
 
 /// A box full width.
 fn frame_full(cx: &App) -> Div {

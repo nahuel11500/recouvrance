@@ -284,6 +284,9 @@ pub struct Progress {
     pub total: usize,
     pub ended: bool,
     pub succeeded: bool,
+    /// Its result per resource so far, as the Sync status view lists them: in Argo CD's order
+    /// while it runs, those that failed first once it ended.
+    pub rows: Vec<super::dashboard::SyncRow>,
 }
 
 /// The progress of the sync sent to the Application `app` (as read now), whose operation
@@ -301,9 +304,12 @@ pub fn progress(app: &Value, before: Option<&str>) -> Progress {
         };
     };
     let ended = !running && !last.running;
+    let mut rows = super::dashboard::sync_rows(app, &last.steps, None, None);
+    super::dashboard::failed_first(&mut rows, ended);
     Progress {
         succeeded: ended && last.phase == "Succeeded",
         ended,
+        rows,
         phase: last.phase,
         message: last.message,
         done: last.done,
