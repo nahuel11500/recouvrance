@@ -357,7 +357,8 @@
   commit sha cut to 7: `main-77b324b`), the product's first (the images whose tag differs between
   the project's environments, or whose path names the project: `shop/api`, `team/shop-web`; a
   database or exporter every environment runs alike comes after,
-  all of them on hover), when its last sync ended, and where its workload deploys (Argo CD's
+  and on hover the product's by component with their short tags, no registry or digest, the
+  others counted and named: `+4 other images (redis, postgres, …)`), when its last sync ended, and where its workload deploys (Argo CD's
   name of the cluster, from the Application or Argo CD's cluster list, and the namespace, of its
   Applications that made no other: not the app of apps'; on several clusters, the main one and
   `+N`, the others named on hover) when that differs
@@ -386,9 +387,10 @@
   runs) or *Roll back to the previous deployment* (auto-sync off) (see *Argo CD by its API*). An
   Argo CD server that can't be read is named above the list; the others are shown. An
   environment's project is its workload's (an app of apps often sits in a project of its own),
-  and the project filter keeps it for any of its Applications' projects. A project or type
-  picked shows on its button, highlighted (*Project: shop*, *Type: acc*; a long name ends in
-  "…" and its tooltip says it whole), the funnel button (*Clear filters*) turns every filter and
+  and the project filter keeps it for any of its Applications' projects. The project and type
+  pickers are searchable: typing narrows their choices. A project or type
+  picked shows on its picker, highlighted (*Project: shop*, *Type: acc*; a long name ends in
+  "…" and its tooltip says it whole; its cross clears it), the funnel button (*Clear filters*) turns every filter and
   the search off, and the count says *filtered*. The toolbar stays on one line at the default
   window width with filters on: the search gets narrower first.
 - **Argo CD by its API**: Applications are read from Argo CD's own API, with the argocd CLI's
@@ -420,34 +422,44 @@
   when two share a name or several Argo CDs are read); a click shows its cards, the workload's
   first. *Updated at* and *Refresh*, and cards. *State*: the sync in big (*Synced*, *OutOfSync*, *Sync Failed* or
   *Syncing*), the health, the resources Degraded (`worker Degraded +1`) and *Why?* (the diagnosis
-  below), the card tinted green, amber or red. *Versions*: a chip per component's image (the
-  repository's last part and its tag), the product's first and the others folded under *+24
-  others*; under them, for each of the product's images whose tag holds a commit sha
-  (`main-<sha>`, `26-8-4-<sha>`), that commit's title, author and age, a link to it on its git
-  host. The commit is read from GitLab or GitHub with a token the user already has: the `glab`
+  below), the card tinted green, amber or red. *Problems*, always right under the tiles (see
+  below). *Versions*: one line per repository of the product's images (its component, its tag
+  made short, `+1` when it runs at several tags at once, the whole references on hover and
+  copied by a click) and, for a tag that holds a commit sha (`main-<sha>`, `26-8-4-<sha>`),
+  that commit's title, author and age beside it, a link to it on its git host; the other
+  (third-party) images folded under *24 other images* (when none is known as the product's, the
+  first 8 listed and the rest folded). The commit is read from GitLab or GitHub with a token the user already has: the `glab`
   CLI's `config.yml` (each host's token, `https` only, its registry domains telling which
   GitLab an image is from) and the `gh` CLI's `hosts.yml`, or `GITLAB_TOKEN`, `GH_TOKEN` /
   `GITHUB_TOKEN`; only read, never written, and never in an error. A token kept in the system
   keyring isn't read: with none, nothing is shown. The image's path is its project
   (`registry.example.com/shop/api` → `shop/api` on GitLab, else `shop`; `ghcr.io/owner/repo`
-  on GitHub). Each answer is kept for the session; the page never waits for it. Chips red
-  with `1.4.1 → 1.5.0` when it changed since the deployment before (from the images seen running under it, else those its sources pinned:
+  on GitHub). Each answer is kept for the session; the page never waits for it. A tag
+  tinted with `1.4.1 → 1.5.0` when it changed since the deployment before (from the images seen running under it, else those its sources pinned:
   kustomize images, Helm `*repository`/`*tag` parameters), who released it and when (`autosync`
   for auto-sync), what ran before, and *Roll back* to the deployment before (auto-sync off, as
-  Argo CD requires; confirmed, write mode applies). *In cluster*: the revision of each source
-  deployed with its commit's message, author and time (a chart's version has none). After a
+  Argo CD requires; confirmed, write mode applies) at its foot. *Deployed from*: the revision of
+  each source deployed with its commit's message, author and time (a chart's version has none),
+  the first 3 then *show all*. After a
   selective sync (some resources only: Argo CD doesn't add it to its history) newer than the
   newest deployment, a line says it (`Then 9 of 31 resources at ebf7503 (selective sync, 5d ago
   by jdoe); the rest at e599d6d`), *Last sync* says `selective: 9 of 31 resources`, the *Why?*
   reasons from it, and *Roll back* (the window's and the agents') says it takes those resources
-  back too. *Problems*:
+  back too. *Problems*, a panel always shown under the tiles when there are some:
   from the resource tree, one row per workload whose pods are in trouble (`CrashLoopBackOff`,
   `Pending`, `ContainerCreating`, *Not ready*...), with how many of its pods, since when and *why*
   (Argo CD's health message), then other objects Degraded (an autoscaler with no metric), then,
   with auto-sync on, what should be live and isn't (*Missing*, from the Application's status:
-  the tree holds only live objects); the pod count and *all pods* (the destination namespace on
-  its context, else the tree's pods). *Nothing wrong.* is said only from the tree or of a Healthy
-  Application; from a status without health per resource (Argo CD 3) it says *No detail* and why.
+  the tree holds only live objects); each row its status, its name whole (a click opens it on the
+  context that reaches its cluster), its kind, its pods in trouble, for how long, and its *why*
+  under it; the first 8, then *show all*. Its header counts the pods in trouble and links *N
+  pods* (the destination namespace on its context, else the tree's pods). *Ask the assistant*
+  (the header's, for them all, or a row's, for one) opens the assistant on a question naming the
+  environment, the Application, its destination cluster and namespace, the context that reaches
+  it and each problem with its why, asking for the cause, the evidence and the fix without
+  changing anything; with no assistant set up the button is off and says so. One line *No
+  problems* is said only from the tree or of a Healthy Application; from a status without
+  health per resource (Argo CD 3) it says *Problems unknown* and why.
   *Last sync*: phase, message, duration, who, when and its steps (each resource's result and a
   hook's phase), progress live while it runs. *Sync diff*: how many resources a sync would change
   (`~ changed, + added, – pruned`, with names), what changes (images first, a field alike on
@@ -470,13 +482,16 @@
   through Argo CD's API with the row menu's checks: a server set read-only is refused first,
   write mode applies when it is sent. The reload of the page itself is the small icon by
   *Updated at*. The views, one at a time: *Overview* (the cards), *Resources* (every object of
-  the resource tree in columns: Workloads, Jobs & CronJobs, Config & Secrets, Networking,
-  Storage, Operators and others; each with its health's dot, its kind, its name and its pods
-  ready; a search by name or kind, *Only problems* and the healths to pick, *N shown of M*; a
+  the resource tree in one list by category: Workloads, Jobs & CronJobs, Config & Secrets,
+  Networking, Storage, Operators and others; those with objects in trouble first, each folded or
+  unfolded by a click on its header, which counts them and those in trouble (*Fold all*); in a
+  category the worst first, then by kind and name; a row its health's dot, its kind, its name
+  whole, its pods and its health, and what Argo CD says of it under it when it isn't healthy; a
+  search by name or kind, *Only problems* and the healths to pick, *N shown of M*; a
   click opens the object on the context that reaches its cluster), *Sync status* (the last
   operation: what, its phase, its whole message, when it started and ended, how long, its
-  revision and who started it; then each resource of its result with its sync wave, from the
-  `argocd.argoproj.io/sync-wave` annotation of its manifest, 0 without, kind, namespace, name,
+  revision and who started it; then each resource of its result with its sync wave (the Application's status says it, the
+  `argocd.argoproj.io/sync-wave` annotation of its manifest over it, 0 without), kind, namespace, name,
   status, health now, hook and message, in the order Argo CD runs them: phase, wave, hooks first;
   filtered by status, health and hook; the last sync card's *steps* opens it), *History and
   rollback* (the history's list unfolded, its comparisons, and the Versions card), *Details*
@@ -491,7 +506,12 @@
   (with up to 5 Applications, each resource can be left out: a selective sync), prune, dry run,
   force, server-side apply and replace. An option the Applications' own spec already has shows
   on (or `already on for 1 of 3`), and ticking one keeps the spec's other sync options, as Argo
-  CD's own sync panel does.
+  CD's own sync panel does. Once sent, each Application says its phase and how many of its
+  resources are done, and lists them live as Argo CD reports them (read every 2 s): wave, kind,
+  namespace, name, status, health, hook and message, a step running tinted amber and one that
+  failed red, in Argo CD's order while it runs and those that failed first once it ended. The
+  list is unfolded with up to 3 Applications, or for one whose sync failed; a click folds or
+  unfolds it.
 - **What changed between two syncs**: in the History card's list, *diff* on a deployment compares
   it with the one before, and *pick* on two deployments compares them; the comparison opens under
   the cards. *Sources*: what each deployment asked for, from Argo CD's history (the revision

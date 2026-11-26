@@ -290,6 +290,57 @@ pub fn versions(app: &Value, seen: Option<&[String]>) -> Versions {
     }
 }
 
+/// One repository of the images running, as the Versions card lists it: its component, its tags
+/// (sorted; several when it runs at several at once), and the tag it had before when it changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageLine {
+    pub component: String,
+    pub repo: String,
+    pub tags: Vec<String>,
+    /// Its tag at the deployment before, when one of its tags is new.
+    pub from: Option<String>,
+}
+
+impl ImageLine {
+    /// The tag shown: the last one (the newest for tags that sort by date or version).
+    pub fn tag(&self) -> &str {
+        self.tags.last().map_or("", String::as_str)
+    }
+
+    /// Its whole references, one a line: what its tooltip says and a click copies.
+    pub fn whole(&self) -> String {
+        self.tags.iter().map(|t| format!("{}:{t}", self.repo)).collect::<Vec<_>>().join("\n")
+    }
+}
+
+/// The product's images first, one line per repository (`own`: whether a repository is the
+/// product's), and the others (third-party) apart. Nothing known as the product's: every
+/// image is listed as its own.
+pub fn image_lines(images: &[Image], own: impl Fn(&str) -> bool) -> (Vec<ImageLine>, Vec<ImageLine>) {
+    let mut lines: Vec<ImageLine> = Vec::new();
+    for i in images {
+        match lines.iter_mut().find(|l| l.repo == i.repo) {
+            Some(l) => {
+                if !l.tags.contains(&i.tag) {
+                    l.tags.push(i.tag.clone());
+                }
+                l.from = l.from.take().or_else(|| i.from.clone());
+            }
+            None => lines.push(ImageLine {
+                component: i.component.clone(),
+                repo: i.repo.clone(),
+                tags: vec![i.tag.clone()],
+                from: i.from.clone(),
+            }),
+        }
+    }
+    for l in &mut lines {
+        l.tags.sort();
+    }
+    let (mine, others): (Vec<ImageLine>, Vec<ImageLine>) = lines.into_iter().partition(|l| own(&l.repo));
+    if mine.is_empty() { (others, Vec::new()) } else { (mine, others) }
+}
+
 /// The images running, as Argo CD sums them up.
 pub fn current_images(app: &Value) -> Vec<String> {
     arr(app, "/status/summary/images").iter().filter_map(Value::as_str).map(String::from).collect()
@@ -909,6 +960,92 @@ pub fn history(app: &Value, n: usize) -> History {
     }
 }
 
+/// The result per resource of the last operation of `app` (its `steps`), in Argo CD's order,
+/// each with its wave (its status', or its manifest's in `managed`) and its health now (the
+/// tree's, else the status'): the Sync status view, and the sync page while it follows a sync.
+pub fn sync_rows(
+    app: &Value,
+    steps: &[super::journal::Step],
+    managed: Option<&Value>,
+    tree: Option<&Value>,
+) -> Vec<SyncRow> {
+    let healths = views::healths(app, tree);
+    let waves = views::all_waves(app, managed);
+    views::sync_rows(steps, &waves, |st| {
+        healths.get(&(st.kind.clone(), st.namespace.clone(), st.name.clone())).cloned()
+    })
+}
+
+// MARK: Ask the assistant
+
+/// Where the problems asked about are: the environment, its Application, where it deploys,
+/// and the context of the kubeconfig that reaches it, when one does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AskScope {
+    pub environment: String,
+    pub application: String,
+    /// Argo CD's name of the destination cluster, else its server's URL.
+    pub cluster: String,
+    pub namespace: String,
+    pub context: Option<String>,
+}
+
+/// A problem in one line for the assistant: `CrashLoopBackOff Deployment shop/api (2 of 3 pods
+/// in trouble, for 2h): why`.
+pub fn problem_line(p: &Problem, now: Timestamp) -> String {
+    let mut facts = Vec::new();
+    if let Some((bad, all)) = p.pods {
+        facts.push(format!("{bad} of {} in trouble", crate::plural::count(all, "pod")));
+    }
+    if let Some(since) = p.since {
+        facts.push(format!("for {}", super::diagnosis::span_text(now.as_second() - since.as_second())));
+    }
+    let mut line = format!("{} {}", p.status, p.res.label());
+    if !facts.is_empty() {
+        line.push_str(&format!(" ({})", facts.join(", ")));
+    }
+    if let Some(why) = p.why.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
+        // One line each: a long message cut, its whole in the cluster.
+        let why: String = why.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(600).collect();
+        line.push_str(&format!(": {why}"));
+    }
+    line
+}
+
+/// The question "Ask the assistant" asks about `problems` (all of an environment's, or one):
+/// where they are, each in a line, and how to answer (read-only, from the evidence).
+pub fn problems_question(scope: &AskScope, problems: &[&Problem], now: Timestamp) -> String {
+    let mut target = format!("the Argo CD Application {}", scope.application);
+    if scope.environment != scope.application {
+        target.push_str(&format!(" (environment {})", scope.environment));
+    }
+    let mut dest = Vec::new();
+    if !scope.cluster.is_empty() {
+        dest.push(format!("cluster {}", scope.cluster));
+    }
+    if !scope.namespace.is_empty() {
+        dest.push(format!("namespace {}", scope.namespace));
+    }
+    if !dest.is_empty() {
+        target.push_str(&format!(", deployed to {}", dest.join(", ")));
+    }
+    let context = match &scope.context {
+        Some(c) => format!("The kubeconfig context {c} reaches that cluster: use it."),
+        None => "No kubeconfig context is known to reach that cluster: say so if it can't be read.".to_string(),
+    };
+    let what = if problems.len() == 1 { "this problem" } else { "these problems" };
+    let lines: Vec<String> = problems.iter().map(|p| format!("- {}", problem_line(p, now))).collect();
+    format!(
+        "Investigate {what} of {target}. {context} Recouvrance found, from Argo CD's resource tree:\n{}\n\n\
+         Find the root cause from the evidence: describe_resource on each object and the workload that owns it, \
+         get_events, get_logs (with previous=true after a restart or OOMKilled), its usage_history against requests \
+         and limits, and what changed recently (the Application's last sync and history, image tags). Use the team's \
+         notes and code where they apply. Change nothing. Answer with: the cause of each (or the one they share), the \
+         evidence (quote the lines), and the fix (the command, manifest or values change).",
+        lines.join("\n")
+    )
+}
+
 // MARK: Cards
 
 /// What was read for one Application's dashboard.
@@ -1005,13 +1142,8 @@ impl Cards {
         let mut state = state(app, tree);
         state.with_tree(&problems);
         let last_sync = last_sync(app);
-        let healths = views::healths(app, tree);
-        let sync_rows = last_sync.as_ref().map_or_else(Vec::new, |l| {
-            let waves = views::waves(read.managed.as_ref());
-            views::sync_rows(&l.steps, &waves, |st| {
-                healths.get(&(st.kind.clone(), st.namespace.clone(), st.name.clone())).cloned()
-            })
-        });
+        let sync_rows =
+            last_sync.as_ref().map_or_else(Vec::new, |l| sync_rows(app, &l.steps, read.managed.as_ref(), tree));
         Self {
             summary: Summary::of(app),
             state,
@@ -1040,7 +1172,7 @@ impl Cards {
 mod read;
 pub(in crate::k8s::argo) use read::extras;
 mod views;
-pub use views::{Category, Details, Node, Operation, SyncRow, health_tone};
+pub use views::{Category, Details, Node, Operation, SyncRow, failed_first, health_tone, sections};
 
 /// A made-up example, for the developer tools' snapshots and the tests.
 #[cfg(any(test, feature = "dev"))]

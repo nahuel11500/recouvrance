@@ -20,6 +20,8 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::searchable_list::SearchableVec;
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -351,8 +353,16 @@ pub struct ArgoView {
     /// Reads the commits of the overview's tags from their git host, and which it reads.
     commits_load: crate::latest::Latest,
     commits_asked: Vec<(String, String)>,
+    /// The project and type filters, searchable: their choices as last set (see
+    /// `sync_pickers`).
+    project_select: Picker,
+    type_select: Picker,
+    picker_items: (Vec<String>, Vec<String>),
     _subs: Vec<Subscription>,
 }
+
+/// A filter's searchable picker.
+type Picker = Entity<SelectState<SearchableVec<SharedString>>>;
 
 /// Ask the app to open the Argo CD page on an Application's dashboard: by its Argo CD
 /// (`Endpoint::instance`), namespace and name.
@@ -364,6 +374,15 @@ pub struct OpenArgoApp {
 }
 
 impl EventEmitter<OpenOn> for ArgoView {}
+
+/// Ask the assistant `question` (the problems of an environment, from its page), from a new
+/// chat.
+#[derive(Clone, Debug)]
+pub struct AskAssistant {
+    pub question: String,
+}
+
+impl EventEmitter<AskAssistant> for ArgoView {}
 
 impl ArgoView {
     pub fn new(
@@ -383,7 +402,38 @@ impl ArgoView {
         let journal_search = cx.new(|cx| InputState::new(window, cx).placeholder("Application…"));
         let steps_search = cx.new(|cx| InputState::new(window, cx).placeholder("Steps: status, kind, name…"));
         let res_search = cx.new(|cx| InputState::new(window, cx).placeholder("Resources: kind, name…"));
+        let new_picker = |window: &mut Window, cx: &mut Context<Self>| -> Picker {
+            cx.new(|cx| SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true))
+        };
+        let project_select = new_picker(window, cx);
+        let type_select = new_picker(window, cx);
         let subs = vec![
+            cx.subscribe(&project_select, |this, _, ev: &SelectEvent<SearchableVec<SharedString>>, cx| match ev {
+                SelectEvent::Confirm(v) => {
+                    let project = v.as_ref().map(ToString::to_string);
+                    if this.filter.project != project {
+                        this.change_filter(|f| f.project = project, cx);
+                    }
+                }
+            }),
+            cx.subscribe(&type_select, |this, _, ev: &SelectEvent<SearchableVec<SharedString>>, cx| match ev {
+                SelectEvent::Confirm(v) => {
+                    let (kind, on_tag) = match v.as_deref() {
+                        Some(ON_TAG) => (None, true),
+                        Some(t) => (Some(t.to_string()), false),
+                        None => (None, false),
+                    };
+                    if (this.filter.kind.clone(), this.filter.on_tag) != (kind.clone(), on_tag) {
+                        this.change_filter(
+                            |f| {
+                                f.kind = kind;
+                                f.on_tag = on_tag;
+                            },
+                            cx,
+                        );
+                    }
+                }
+            }),
             cx.subscribe(&res_search, |this, state, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     this.res_query = state.read(cx).value().to_lowercase();
@@ -507,8 +557,50 @@ impl ArgoView {
             overview: None,
             commits_load: Default::default(),
             commits_asked: Vec::new(),
+            project_select,
+            type_select,
+            picker_items: (Vec::new(), Vec::new()),
             _subs: subs,
         }
+    }
+
+    /// Keep the project and type pickers as the rows and the filter are: their choices (the
+    /// value filtered by among them, even when no Application has it now) and the one picked.
+    fn sync_pickers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rows) = &self.rows else { return };
+        let mut projects = rows.projects.clone();
+        let mut types: Vec<String> = std::iter::once(ON_TAG.to_string())
+            .chain(rows.kinds.iter().map(|&k| rows.types.name(k).to_string()))
+            .collect();
+        let f = &self.filter;
+        let picked_type = if f.on_tag && f.kind.is_none() { Some(ON_TAG.to_string()) } else { f.kind.clone() };
+        let picked = [(f.project.clone(), &mut projects), (picked_type.clone(), &mut types)];
+        for (value, list) in picked {
+            if let Some(v) = value
+                && !list.contains(&v)
+            {
+                list.push(v);
+            }
+        }
+        let wanted =
+            [(&self.project_select, projects, f.project.clone(), 0), (&self.type_select, types, picked_type, 1)];
+        let mut items = std::mem::take(&mut self.picker_items);
+        for (select, list, value, at) in wanted {
+            let held = if at == 0 { &mut items.0 } else { &mut items.1 };
+            if *held != list {
+                let shown: Vec<SharedString> = list.iter().cloned().map(Into::into).collect();
+                select.update(cx, |s, cx| s.set_items(SearchableVec::new(shown), window, cx));
+                *held = list;
+            }
+            let now = select.read(cx).selected_value().map(ToString::to_string);
+            if now != value {
+                select.update(cx, |s, cx| match &value {
+                    Some(v) => s.set_selected_value(&SharedString::from(v.clone()), window, cx),
+                    None => s.set_selected_index(None, window, cx),
+                });
+            }
+        }
+        self.picker_items = items;
     }
 
     /// Open the dashboard of the Application `app` (from the Problems page), over what the
@@ -1203,11 +1295,6 @@ impl ArgoView {
                 .label(format!("{label} ({n})"))
                 .on_click(cx.listener(move |this, _, _, cx| this.change_filter(flip, cx)))
         };
-        let projects = self.rows.as_ref().map_or_else(Vec::new, |r| r.projects.clone());
-        let types: Vec<String> = self
-            .rows
-            .as_ref()
-            .map_or_else(Vec::new, |r| r.kinds.iter().map(|&k| r.types.name(k).to_string()).collect());
         let view = cx.entity().downgrade();
         let fold_label = if self.folded.is_empty() && self.expanded.is_empty() { "Fold all" } else { "Unfold all" };
         let f = &self.filter;
@@ -1232,18 +1319,24 @@ impl ArgoView {
             .child(toggle("argo-favorites", "Favorites", self.starred_count, f.favorites, |f| {
                 f.favorites = !f.favorites;
             }))
-            .child(picker(
+            .child(search_picker(
                 "argo-project",
-                "Project",
+                &self.project_select,
                 "All projects",
+                "Project: ",
+                "Search projects…",
                 f.project.clone(),
-                projects,
-                view.clone(),
-                |f, v| {
-                    f.project = v;
-                },
+                cx,
             ))
-            .child(type_picker(f.kind.clone(), f.on_tag, types, view.clone()))
+            .child(search_picker(
+                "argo-type",
+                &self.type_select,
+                "All types",
+                "Type: ",
+                "Search types…",
+                if f.on_tag && f.kind.is_none() { Some(ON_TAG.to_string()) } else { f.kind.clone() },
+                cx,
+            ))
             .when(*f != Filter::default(), |h| {
                 // An icon, so a filter turned on doesn't make the toolbar wrap (#1146).
                 h.child(
@@ -1271,6 +1364,10 @@ impl ArgoView {
 /// The widest a filter picker gets: a long project or type name ends in "…", and its tooltip
 /// (and screen readers) say it whole.
 const PICKER_MAX: f32 = 190.;
+/// A picker's menu, wider than it: names are seen whole there.
+const PICKER_MENU: f32 = 320.;
+/// A picker that is off: room for "All projects" and its caret, so the toolbar keeps one line.
+const PICKER_OFF: f32 = 128.;
 
 /// The room the state badges take on a row.
 const BADGES: f32 = 200.;
@@ -1307,7 +1404,8 @@ fn state_badges(s: envs::State, cx: &App) -> Vec<Div> {
 }
 
 /// An environment's images on its row: the product's first, at most `IMAGES_SHOWN` (component,
-/// short tag; the newest when it runs several), how many more, and every one on hover.
+/// short tag; the newest when it runs several), how many more, and what the tooltip says
+/// (`envs::image_tip`).
 fn image_summary(env: &Env) -> (Vec<(String, String)>, usize, String) {
     let product = env.images.iter().filter(|(own, _)| *own).count();
     let pool = if product > 0 { product } else { env.images.len() };
@@ -1322,108 +1420,48 @@ fn image_summary(env: &Env) -> (Vec<(String, String)>, usize, String) {
         })
         .collect();
     let more = env.images.len() - shown.len();
-    let tip = env
-        .images
-        .iter()
-        .map(|(own, i)| format!("{}{}:{}", if *own { "" } else { "· " }, i.repo, i.tags.join(", ")))
-        .collect::<Vec<_>>()
-        .join("\n");
-    (shown, more, tip)
+    (shown, more, envs::image_tip(&env.images))
 }
 
-/// A button picking one value of a filter (or all of them) from a menu.
-fn picker(
+/// A filter's picker, searchable: type to narrow its choices. On, it says so: highlighted, and
+/// what it keeps named (`Project: shop`, whole on hover); its cross clears it.
+fn search_picker(
     id: &'static str,
-    name: &'static str,
+    state: &Picker,
     all: &'static str,
+    prefix: &'static str,
+    search: &'static str,
     current: Option<String>,
-    values: Vec<String>,
-    view: WeakEntity<ArgoView>,
-    set: fn(&mut Filter, Option<String>),
-) -> impl IntoElement {
-    // On, it says so: highlighted, and what it keeps named (`Project: shop`).
-    let label = current.as_ref().map_or_else(|| all.to_string(), |v| format!("{name}: {v}"));
-    Button::new(id)
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    let on = current.is_some();
+    // As wide as what it says (about 7 px a character, the cross and the padding), within
+    // bounds: a filter on doesn't make the toolbar wrap.
+    let width = current.as_ref().map_or(PICKER_OFF, |v| {
+        (44. + 7. * (prefix.chars().count() + v.chars().count()) as f32).clamp(PICKER_OFF, PICKER_MAX)
+    });
+    let select = Select::new(state)
         .small()
-        .max_w(px(PICKER_MAX))
-        .when(current.is_some(), ButtonVariants::primary)
-        .when(current.is_none(), Button::outline)
-        .when(current.is_some(), |b| b.tooltip(label.clone()))
-        .label(label)
-        .dropdown_menu(move |menu, _, _| {
-            let pick = |value: Option<String>| {
-                let view = view.clone();
-                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                    let value = value.clone();
-                    let _ = view.update(cx, |this, cx| this.change_filter(|f| set(f, value), cx));
-                }
-            };
-            let menu = menu
-                .scrollable(true)
-                .max_h(px(420.))
-                .item(PopupMenuItem::new(all).checked(current.is_none()).on_click(pick(None)));
-            values.iter().fold(menu, |menu, v| {
-                menu.item(
-                    PopupMenuItem::new(v.clone()).checked(current.as_ref() == Some(v)).on_click(pick(Some(v.clone()))),
-                )
-            })
-        })
+        .placeholder(all)
+        .title_prefix(prefix)
+        .search_placeholder(search)
+        .cleanable(true)
+        .menu_width(px(PICKER_MENU))
+        .menu_max_h(px(420.))
+        .accessibility_label(prefix.trim_end_matches([':', ' ']).to_string())
+        .when(on, |s| s.border_color(theme.primary).bg(theme.primary.opacity(0.14)).font_weight(FontWeight::MEDIUM));
+    let tip = current.map(|v| SharedString::from(format!("{prefix}{v}")));
+    div()
+        .id(id)
+        .flex_none()
+        .w(px(width))
+        .child(select)
+        .when_some(tip, |d, tip| d.tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx)))
 }
 
 /// The label of the type filter's "on a version tag" choice.
 const ON_TAG: &str = "On a version tag";
-
-/// The environment type to keep: one of `types`, or those whose product runs on version tags.
-fn type_picker(
-    current: Option<String>,
-    on_tag: bool,
-    types: Vec<String>,
-    view: WeakEntity<ArgoView>,
-) -> impl IntoElement {
-    let label = match (&current, on_tag) {
-        (Some(t), _) => format!("Type: {t}"),
-        (None, true) => format!("Type: {}", ON_TAG.to_lowercase()),
-        (None, false) => "All types".to_string(),
-    };
-    let on = current.is_some() || on_tag;
-    Button::new("argo-type")
-        .small()
-        .max_w(px(PICKER_MAX))
-        .when(on, ButtonVariants::primary)
-        .when(!on, Button::outline)
-        .when(on, |b| b.tooltip(label.clone()))
-        .label(label)
-        .dropdown_menu(move |menu, _, _| {
-            let pick = |kind: Option<String>, tag: bool| {
-                let view = view.clone();
-                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                    let kind = kind.clone();
-                    let _ = view.update(cx, |this, cx| {
-                        this.change_filter(
-                            |f| {
-                                f.kind = kind;
-                                f.on_tag = tag;
-                            },
-                            cx,
-                        );
-                    });
-                }
-            };
-            let menu = menu
-                .scrollable(true)
-                .max_h(px(420.))
-                .item(PopupMenuItem::new("All types").checked(current.is_none() && !on_tag).on_click(pick(None, false)))
-                .item(PopupMenuItem::new(ON_TAG).checked(current.is_none() && on_tag).on_click(pick(None, true)))
-                .separator();
-            types.iter().fold(menu, |menu, t| {
-                menu.item(
-                    PopupMenuItem::new(t.clone())
-                        .checked(current.as_ref() == Some(t))
-                        .on_click(pick(Some(t.clone()), false)),
-                )
-            })
-        })
-}
 
 /// How the list is grouped: by project then type, by project, or not.
 fn group_picker(current: GroupBy, view: WeakEntity<ArgoView>) -> impl IntoElement {
@@ -1544,7 +1582,7 @@ fn row_menu(
 }
 
 impl Render for ArgoView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.journal.is_some() {
             return v_flex().size_full().p_2().child(self.journal_view(cx));
         }
@@ -1557,6 +1595,7 @@ impl Render for ArgoView {
         if self.dashboard.is_some() {
             return v_flex().size_full().p_2().child(self.dashboard_view(cx));
         }
+        self.sync_pickers(window, cx);
         let theme = cx.theme().clone();
         let body: AnyElement = match &self.rows {
             None => div().p_4().text_color(theme.muted_foreground).child("Reading Argo CD…").into_any_element(),

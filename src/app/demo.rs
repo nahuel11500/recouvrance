@@ -190,6 +190,14 @@ impl AppView {
                     page.update(cx, crate::ui::argo::ArgoView::demo_dashboard);
                 }
             }
+            // The example's dashboard on one of its views: `argo-example-view:resources` (or
+            // `sync`, `history`, `details`, `diff`), `:all` with every part unfolded.
+            other if other.starts_with("argo-example-view:") => {
+                if let Route::Argo(page) = self.route().clone() {
+                    let view = other["argo-example-view:".len()..].to_string();
+                    page.update(cx, |p, cx| p.demo_dashboard_view(&view, cx));
+                }
+            }
             // The same after a selective sync of the workload, newer than its newest deployment.
             "argo-example-selective" => {
                 if let Route::Argo(page) = self.route().clone() {

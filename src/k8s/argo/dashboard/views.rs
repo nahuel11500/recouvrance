@@ -289,6 +289,45 @@ fn sort_nodes(nodes: &mut [Node]) {
     nodes.sort_by(|a, b| (a.category, &a.res.kind, &a.res.name).cmp(&(b.category, &b.res.kind, &b.res.name)));
 }
 
+/// A category of the Resources view with the resources it shows, and how many of them are in
+/// trouble.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Section<'a> {
+    pub category: Category,
+    pub nodes: Vec<&'a Node>,
+    pub troubled: usize,
+}
+
+/// How bad a resource is, to list the worst first: in trouble, then busy, then the rest.
+fn badness(n: &Node) -> u8 {
+    match n.tone {
+        Tone::Bad => 0,
+        Tone::Busy => 1,
+        _ => 2,
+    }
+}
+
+/// The resources kept, by category for the Resources view: the categories with resources in
+/// trouble first (then in their usual order), and in each the worst first, then by kind and
+/// name. Empty categories are left out.
+pub fn sections<'a>(kept: &[&'a Node]) -> Vec<Section<'a>> {
+    let mut out: Vec<Section<'a>> = Category::ALL
+        .iter()
+        .filter_map(|&category| {
+            let mut nodes: Vec<&Node> = kept.iter().copied().filter(|n| n.category == category).collect();
+            if nodes.is_empty() {
+                return None;
+            }
+            nodes.sort_by(|a, b| (badness(a), &a.res.kind, &a.res.name).cmp(&(badness(b), &b.res.kind, &b.res.name)));
+            let troubled = nodes.iter().filter(|n| n.in_trouble()).count();
+            Some(Section { category, nodes, troubled })
+        })
+        .collect();
+    // Stable: the usual order among those with trouble, and among those without.
+    out.sort_by_key(|s| s.troubled == 0);
+    out
+}
+
 // MARK: Sync status
 
 /// One resource of the last sync's result.
@@ -374,6 +413,32 @@ pub fn waves(managed: Option<&Value>) -> HashMap<(String, String, String), i64> 
         }
     }
     out
+}
+
+/// The sync wave each resource of `app` has, as its status says it (`status.resources[].syncWave`,
+/// kept by Argo CD for the resources it manages), with those its manifests say (`managed`, see
+/// [`waves`]) over them: by kind, namespace and name.
+pub fn all_waves(app: &Value, managed: Option<&Value>) -> HashMap<(String, String, String), i64> {
+    let key = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+    let mut out: HashMap<(String, String, String), i64> = arr(app, "/status/resources")
+        .iter()
+        .filter_map(|r| Some(((key(r, "kind"), key(r, "namespace"), key(r, "name")), r.get("syncWave")?.as_i64()?)))
+        .collect();
+    out.extend(waves(managed));
+    out
+}
+
+/// Whether a step of a sync failed.
+fn failed(row: &SyncRow) -> bool {
+    super::super::steps::tone(&row.step) == Tone::Bad
+}
+
+/// The rows of a sync followed live: in Argo CD's order while it runs; once it ended, those
+/// that failed first (the rest keep Argo CD's order).
+pub fn failed_first(rows: &mut [SyncRow], ended: bool) {
+    if ended {
+        rows.sort_by_key(|r| !failed(r));
+    }
 }
 
 /// Where a sync phase comes, Argo CD's order.
@@ -624,6 +689,45 @@ mod tests {
         assert!(nodes[2].in_trouble());
         assert!(nodes[2].keeps("job night", true, None) && !nodes[0].keeps("", true, None));
         assert!(nodes[0].keeps("", false, Some("Healthy")) && !nodes[2].keeps("", false, Some("Healthy")));
+    }
+
+    /// The Resources view lists the categories with trouble first, and in each the worst
+    /// first, then by kind and name; an empty category is left out.
+    #[test]
+    fn the_resources_are_listed_problems_first() {
+        let node = |group: &str, kind: &str, name: &str, health: &str| {
+            let res = Res { group: group.into(), kind: kind.into(), name: name.into(), ..Default::default() };
+            Node {
+                category: Category::of(group, kind),
+                tone: health_tone(Some(health)),
+                health: Some(health.into()),
+                message: None,
+                pods: None,
+                res,
+            }
+        };
+        let nodes = [
+            node("apps", "Deployment", "api", "Healthy"),
+            node("apps", "Deployment", "web", "Progressing"),
+            node("", "ConfigMap", "a", "Healthy"),
+            node("", "Secret", "b", "Missing"),
+            node("", "ConfigMap", "z", "Degraded"),
+            node("", "Service", "api", "Healthy"),
+        ];
+        let kept: Vec<&Node> = nodes.iter().collect();
+        let got: Vec<(Category, Vec<&str>, usize)> = sections(&kept)
+            .into_iter()
+            .map(|s| (s.category, s.nodes.iter().map(|n| n.res.name.as_str()).collect(), s.troubled))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Category::Config, vec!["z", "b", "a"], 2),
+                (Category::Workloads, vec!["web", "api"], 0),
+                (Category::Networking, vec!["api"], 0),
+            ]
+        );
+        assert!(sections(&[]).is_empty());
     }
 
     /// A pod run to completion is never ready, and isn't meant to be: a CronJob and its Jobs

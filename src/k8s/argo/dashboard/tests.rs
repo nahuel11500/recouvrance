@@ -4,9 +4,9 @@ use serde_json::{Value, json};
 
 use super::example::{self, ENVIRONMENTS};
 use super::{
-    Cards, DiffSummary, Image, Read, deployed, diff_from_git, diff_from_status, history, image_changes, last_sync,
-    managed_path, problems_from_status, problems_from_tree, remember, revision_path, source_images, split_image, state,
-    tree_path, versions, who,
+    AskScope, Cards, DiffSummary, Image, Problem, Read, deployed, diff_from_git, diff_from_status, history,
+    image_changes, image_lines, last_sync, managed_path, problems_from_status, problems_from_tree, problems_question,
+    remember, revision_path, source_images, split_image, state, tree_path, versions, who,
 };
 use crate::k8s::argo::server::Login;
 use crate::status::Tone;
@@ -591,4 +591,112 @@ fn a_degraded_object_below_makes_a_healthy_state_bad() {
     let cards = Cards::of(read(json!({"nodes": []})), None, now());
     assert_ne!(cards.state.tone, Tone::Bad);
     assert!(cards.state.below.is_none());
+}
+
+/// One line per repository, its tags gathered; the product's first, the third-party apart;
+/// nothing known as the product's lists every image as its own.
+#[test]
+fn images_are_listed_one_line_per_repository() {
+    let current: Vec<String> = [
+        "registry.example.com/shop/api:main-1",
+        "registry.example.com/shop/api:main-2",
+        "registry.example.com/shop/web:1.4.0",
+        "docker.io/library/redis:7.2",
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    let before = ["registry.example.com/shop/web:1.3.0".to_string()];
+    let images = image_changes(&current, Some(&before));
+    let (mine, others) = image_lines(&images, |r| r.contains("/shop/"));
+    let said: Vec<(&str, &[String], Option<&str>)> =
+        mine.iter().map(|l| (l.component.as_str(), &l.tags[..], l.from.as_deref())).collect();
+    assert_eq!(
+        said,
+        [
+            ("api", &["main-1".to_string(), "main-2".to_string()][..], None),
+            ("web", &["1.4.0".to_string()][..], Some("1.3.0")),
+        ]
+    );
+    assert_eq!(mine[0].tag(), "main-2");
+    assert_eq!(mine[0].whole(), "registry.example.com/shop/api:main-1\nregistry.example.com/shop/api:main-2");
+    assert_eq!(others.iter().map(|l| l.component.as_str()).collect::<Vec<_>>(), ["redis"]);
+    let (all, none) = image_lines(&images, |_| false);
+    assert_eq!((all.len(), none.len()), (3, 0));
+}
+
+/// The question names where the problems are and each one in a line, and asks for a read-only
+/// answer; one problem asks of it alone.
+#[test]
+fn the_assistant_is_asked_about_the_problems_and_where_they_are() {
+    let res = |kind: &str, name: &str| crate::k8s::argo::diagnosis::Res {
+        group: "apps".into(),
+        kind: kind.into(),
+        namespace: "shop".into(),
+        name: name.into(),
+        version: String::new(),
+    };
+    let crash = Problem {
+        status: "CrashLoopBackOff".into(),
+        tone: Tone::Bad,
+        res: res("Deployment", "api"),
+        pods: Some((2, 3)),
+        since: Timestamp::from_second(now().as_second() - 7200).ok(),
+        why: Some("back-off restarting\n  failed container".into()),
+    };
+    let pending = Problem {
+        status: "Pending".into(),
+        tone: Tone::Busy,
+        res: res("StatefulSet", "db"),
+        pods: None,
+        since: None,
+        why: None,
+    };
+    let scope = AskScope {
+        environment: "shop-prod".into(),
+        application: "shop-prod-workload".into(),
+        cluster: "prod-eu".into(),
+        namespace: "shop".into(),
+        context: Some("prod-eu-admin".into()),
+    };
+    let q = problems_question(&scope, &[&crash, &pending], now());
+    assert!(q.starts_with(
+        "Investigate these problems of the Argo CD Application shop-prod-workload (environment shop-prod), \
+         deployed to cluster prod-eu, namespace shop. The kubeconfig context prod-eu-admin reaches that cluster"
+    ));
+    assert!(q.contains(
+        "- CrashLoopBackOff Deployment shop/api (2 of 3 pods in trouble, for 2 h): back-off restarting failed container\n"
+    ));
+    assert!(q.contains("- Pending StatefulSet shop/db\n"));
+    assert!(q.contains("Change nothing."));
+    let one = problems_question(&AskScope { context: None, ..scope }, &[&pending], now());
+    assert!(one.starts_with("Investigate this problem of") && one.contains("No kubeconfig context is known"));
+    assert!(!one.contains("CrashLoopBackOff"));
+}
+
+/// The sync's rows take the wave its status says, under the one its manifest says; once the
+/// sync ended, those that failed come first.
+#[test]
+fn a_sync_followed_lists_its_resources_by_wave_failed_first_once_ended() {
+    let app = json!({"status": {
+        "resources": [
+            {"kind": "ConfigMap", "namespace": "shop", "name": "config", "syncWave": -1},
+            {"kind": "Deployment", "namespace": "shop", "name": "worker", "syncWave": 2},
+        ],
+        "operationState": {"phase": "Failed", "syncResult": {"resources": [
+            {"kind": "Deployment", "namespace": "shop", "name": "worker", "status": "Synced", "syncPhase": "Sync"},
+            {"kind": "Deployment", "namespace": "shop", "name": "api", "status": "SyncFailed", "syncPhase": "Sync",
+             "message": "admission webhook denied"},
+            {"kind": "ConfigMap", "namespace": "shop", "name": "config", "status": "Synced", "syncPhase": "Sync"},
+        ]}},
+    }});
+    let steps = last_sync(&app).unwrap().steps;
+    let mut rows = super::sync_rows(&app, &steps, None, None);
+    let order = |rows: &[super::SyncRow]| rows.iter().map(|r| (r.step.name.clone(), r.wave)).collect::<Vec<_>>();
+    let at = |n: &str, w: i64| (n.to_string(), w);
+    assert_eq!(order(&rows), [at("config", -1), at("api", 0), at("worker", 2)]);
+    super::failed_first(&mut rows, false);
+    assert_eq!(order(&rows), [at("config", -1), at("api", 0), at("worker", 2)], "running: Argo CD's order");
+    super::failed_first(&mut rows, true);
+    assert_eq!(order(&rows), [at("api", 0), at("config", -1), at("worker", 2)]);
 }

@@ -134,6 +134,57 @@ pub fn short_tag(tag: &str) -> String {
     argo::short_revision(tag)
 }
 
+/// The product's images named in the list's tooltip, at most; the others counted.
+const TIP_IMAGES: usize = 12;
+/// Third-party images named in it, at most.
+const TIP_OTHERS: usize = 6;
+
+/// A tag as the tooltip says it: short, and a digest (no tag) as such, not its hex.
+fn tip_tag(tag: &str) -> String {
+    if tag.starts_with('@') { "by digest".to_string() } else { short_tag(tag) }
+}
+
+/// What the images cell's tooltip says (`images`: the environment's, the product's first): the
+/// product's, each by its component with its short tags; then the third-party ones, counted
+/// and named without their tags. No registry, no digest. Nothing known as the product's: the
+/// first few images, as the product's.
+pub fn image_tip(images: &[(bool, EnvImage)]) -> String {
+    let own = images.iter().filter(|(own, _)| *own).count();
+    let (mine, others): (Vec<&EnvImage>, Vec<&EnvImage>) = if own > 0 {
+        (
+            images.iter().filter(|(o, _)| *o).map(|(_, i)| i).collect(),
+            images.iter().filter(|(o, _)| !o).map(|(_, i)| i).collect(),
+        )
+    } else {
+        let n = images.len().min(TIP_IMAGES);
+        (images[..n].iter().map(|(_, i)| i).collect(), images[n..].iter().map(|(_, i)| i).collect())
+    };
+    let mut lines: Vec<String> = mine
+        .iter()
+        .take(TIP_IMAGES)
+        .map(|i| {
+            let mut tags: Vec<String> = i.tags.iter().map(|t| tip_tag(t)).collect();
+            tags.dedup();
+            format!("{}: {}", i.component, tags.join(", "))
+        })
+        .collect();
+    // Past the few named, the product's left are counted with the others.
+    let left = mine.len().saturating_sub(TIP_IMAGES);
+    if left > 0 {
+        lines.push(format!("+{left} more"));
+    }
+    if !others.is_empty() {
+        let mut names: Vec<&str> = others.iter().map(|i| i.component.as_str()).collect();
+        names.dedup();
+        let mut named = names.iter().take(TIP_OTHERS).copied().collect::<Vec<_>>().join(", ");
+        if names.len() > TIP_OTHERS {
+            named.push_str(", …");
+        }
+        lines.push(format!("+{} ({named})", crate::plural::count(others.len(), "other image")));
+    }
+    lines.join("\n")
+}
+
 /// The environments of `apps`, from the parents found (`parents`) and a tree order of them
 /// (`order`), typed by `types`.
 pub fn environments(
@@ -523,6 +574,36 @@ pub fn member_label<'a>(env: &str, app: &'a str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn img(repo: &str, tags: &[&str]) -> EnvImage {
+        EnvImage {
+            repo: repo.into(),
+            component: repo.rsplit('/').next().unwrap_or(repo).into(),
+            tags: tags.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// The tooltip names the product's images by component with short tags, no registry or
+    /// digest; the third-party ones are counted and named without tags.
+    #[test]
+    fn the_images_tooltip_is_short() {
+        let sha = "eab9300daf858b46f4c0e5a983b5474428e9096c";
+        let images = vec![
+            (true, img("registry.example.com/shop/api", &[&format!("main-{sha}"), "1.2.0"])),
+            (true, img("registry.example.com/shop/web", &["@0a1b2c3d4e5f"])),
+            (false, img("docker.io/library/redis", &["7.2"])),
+            (false, img("quay.io/acme/proxy", &[&format!("v1@sha256:{sha}")])),
+        ];
+        let tip = image_tip(&images);
+        assert_eq!(tip, "api: main-eab9300, 1.2.0\nweb: by digest\n+2 other images (redis, proxy)");
+        assert!(!tip.contains("registry.example.com") && !tip.contains(sha));
+        // Nothing known as the product's: the first few, as the product's.
+        let theirs: Vec<(bool, EnvImage)> = (0..14).map(|n| (false, img(&format!("r/c{n:02}"), &["1"]))).collect();
+        let tip = image_tip(&theirs);
+        assert!(tip.starts_with("c00: 1\nc01: 1"));
+        assert!(tip.ends_with("+2 other images (c12, c13)"), "{tip}");
+        assert_eq!(image_tip(&[]), "");
+    }
 
     fn env(name: &str, project: &str, kind: usize, state: State) -> Env {
         Env {
