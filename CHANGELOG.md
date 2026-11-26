@@ -5,6 +5,16 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/nahuel11500/recouvrance/compare/v0.14.0...v0.15.0) - 2026-11-26
+
+### Added
+
+- *(argo)* Problems always on screen with the assistant, readable resources and versions, a live sync (#1151)
+
+### Fixed
+
+- *(argo)* The State column lines up with its header and never cuts a badge (#1154)
+
 ## [0.14.0](https://github.com/nahuel11500/recouvrance/compare/v0.13.0...v0.14.0) - 2026-11-26
 
 ### Added
