@@ -5,6 +5,18 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/nahuel11500/recouvrance/compare/v0.13.0...v0.14.0) - 2026-11-26
+
+### Added
+
+- *(argo)* The environment page acts like Argo CD's, and says what is wrong (#1142)
+
+### Fixed
+
+- *(argo)* The Resources view says a CronJob's and a Job's runs, not their completed pods as unready (#1149)
+- *(argo)* Ticking Server-side apply or Replace keeps the Application's own sync options (#1148)
+- *(argo)* The Argo CD toolbar keeps one line with a filter on (#1147)
+
 ## [0.13.0](https://github.com/nahuel11500/recouvrance/compare/v0.12.0...v0.13.0) - 2026-11-25
 
 ### Added
