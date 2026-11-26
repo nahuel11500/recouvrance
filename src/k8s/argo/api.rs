@@ -1732,8 +1732,14 @@ pub enum Action {
 }
 
 /// The request argocd-server's routes take for `action` on the Application `namespace/name`:
-/// method, path and query, body.
-pub(super) fn request(action: &Action, namespace: &str, name: &str) -> (http::Method, String, Option<Value>) {
+/// method, path and query, body. `read` is the Application as read right before it is sent (a
+/// sync carries its own sync options with those ticked); Null for an action that reads none.
+pub(super) fn request(
+    action: &Action,
+    namespace: &str,
+    name: &str,
+    read: &Value,
+) -> (http::Method, String, Option<Value>) {
     let app = format!("/api/v1/applications/{}", encode(name));
     let ns = encode(namespace);
     let body = json!({"name": name, "appNamespace": namespace});
@@ -1742,7 +1748,7 @@ pub(super) fn request(action: &Action, namespace: &str, name: &str) -> (http::Me
             let mode = if *hard { "hard" } else { "normal" };
             (http::Method::GET, format!("{app}?appNamespace={ns}&refresh={mode}"), None)
         }
-        Action::Sync(req) => (http::Method::POST, format!("{app}/sync"), Some(sync_body(body, req))),
+        Action::Sync(req) => (http::Method::POST, format!("{app}/sync"), Some(sync_body(body, req, read))),
         Action::Terminate => (http::Method::DELETE, format!("{app}/operation?appNamespace={ns}"), None),
         Action::Delete { cascade } => {
             (http::Method::DELETE, format!("{app}?appNamespace={ns}&cascade={cascade}"), None)
@@ -1760,7 +1766,9 @@ pub(super) fn request(action: &Action, namespace: &str, name: &str) -> (http::Me
 
 /// The body of a sync request (argocd-server's `ApplicationSyncRequest`): the Application, its
 /// strategy (hook, or apply: without hooks), and prune, dry run and resources when asked.
-fn sync_body(mut body: Value, req: &super::ops::SyncRequest) -> Value {
+/// With an option ticked, the sync options of `app`'s spec are sent with it: argocd-server
+/// uses the request's instead of the spec's (see `ops::sync_options`).
+fn sync_body(mut body: Value, req: &super::ops::SyncRequest, app: &Value) -> Value {
     body["strategy"] = super::ops::strategy(req);
     // Always said, false too: Argo CD fills what isn't from the Application's own defaults
     // (`syncPolicy.manualDefaults`), which could prune or dry-run what wasn't asked.
@@ -1772,8 +1780,7 @@ fn sync_body(mut body: Value, req: &super::ops::SyncRequest) -> Value {
     if !req.resources.is_empty() {
         body["resources"] = Value::Array(req.resources.iter().map(super::ops::resource_entry).collect());
     }
-    let options = super::ops::sync_options(req);
-    if !options.is_empty() {
+    if let Some(options) = super::ops::sync_options(req, app) {
         body["syncOptions"] = json!({"items": options});
     }
     body
@@ -1829,7 +1836,8 @@ pub async fn act_read(
         {
             return Ok(Err(why));
         }
-        let (method, path, body) = request(&action, &namespace, &name);
+        let read_app = read.as_ref().map_or(&Value::Null, |(app, _)| app);
+        let (method, path, body) = request(&action, &namespace, &name, read_app);
         let sent = conn.call(method, &path, body.as_ref()).await;
         let before = read.as_ref().and_then(|(app, _)| super::grouped_sync::started_at(app));
         Ok(sent
@@ -1921,7 +1929,7 @@ pub async fn act_for_agent(
         if let Some(why) = agent_refusal(&endpoint).or_else(&stop) {
             return Ok(Err(why));
         }
-        let (method, at, body) = request(&sent, &namespace, &name);
+        let (method, at, body) = request(&sent, &namespace, &name, app.as_ref().unwrap_or(&Value::Null));
         if let Err(f) = conn.call(method, &at, body.as_ref()).await {
             return Ok(Err(f.text));
         }
@@ -2095,7 +2103,7 @@ users:
     #[test]
     fn each_action_is_the_request_argo_cd_routes() {
         let req = |a: Action| {
-            let (m, path, body) = request(&a, "team a", "web");
+            let (m, path, body) = request(&a, "team a", "web", &Value::Null);
             (m.to_string(), path, body)
         };
         let get = |path: &str| ("GET".to_string(), path.to_string(), None);
@@ -2130,7 +2138,11 @@ users:
     /// prune, dry run and the resources picked; none is sent when not asked.
     #[test]
     fn a_sync_request_carries_each_option() {
-        let body = |r: SyncRequest| request(&Action::Sync(r), "argocd", "web").2.unwrap();
+        // An Application with sync options of its own: argocd-server uses a request's instead
+        // of them, so a request with one ticked carries them too.
+        let app =
+            json!({"spec": {"syncPolicy": {"syncOptions": ["ServerSideApply=true", "RespectIgnoreDifferences=true"]}}});
+        let body = |r: SyncRequest| request(&Action::Sync(r), "argocd", "web", &app).2.unwrap();
         let plain = body(SyncRequest::default());
         // Prune and dry run are said even when off: Argo CD would fill them from the
         // Application's manual sync defaults otherwise.
@@ -2160,7 +2172,13 @@ users:
             replace: false,
         });
         assert_eq!(all["strategy"], json!({"hook": {"force": true}}));
-        assert_eq!(all["syncOptions"], json!({"items": ["ServerSideApply=true"]}));
+        assert_eq!(all["syncOptions"], json!({"items": ["ServerSideApply=true", "RespectIgnoreDifferences=true"]}));
+        let replace = body(SyncRequest { replace: true, ..Default::default() });
+        assert_eq!(
+            replace["syncOptions"],
+            json!({"items": ["ServerSideApply=true", "RespectIgnoreDifferences=true", "Replace=true"]})
+        );
+        // Nothing ticked: none sent, Argo CD uses the spec's.
         assert!(plain.get("syncOptions").is_none());
         assert_eq!((all["prune"].clone(), all["dryRun"].clone()), (json!(true), json!(true)));
         assert_eq!(

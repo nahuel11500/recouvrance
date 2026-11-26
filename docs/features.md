@@ -487,7 +487,9 @@
   that tree the environment's row on the list is *Degraded* too (and counts in *Needs a look*).
   The sync page's options: full with hooks or the resources out of sync only without hooks
   (with up to 5 Applications, each resource can be left out: a selective sync), prune, dry run,
-  force, server-side apply and replace.
+  force, server-side apply and replace. An option the Applications' own spec already has shows
+  on (or `already on for 1 of 3`), and ticking one keeps the spec's other sync options, as Argo
+  CD's own sync panel does.
 - **What changed between two syncs**: in the History card's list, *diff* on a deployment compares
   it with the one before, and *pick* on two deployments compares them; the comparison opens under
   the cards. *Sources*: what each deployment asked for, from Argo CD's history (the revision

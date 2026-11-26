@@ -33,7 +33,7 @@ use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::grouped_diff::MAX_APPS;
 use crate::k8s::argo::grouped_sync::{self, Checked, Options, PARALLEL, Progress, Target};
 use crate::k8s::argo::operation_tone;
-use crate::k8s::argo::ops::{Op, SyncRequest};
+use crate::k8s::argo::ops::{self, Op, SyncRequest};
 use crate::k8s::argo::windows::{NextSync, Planner};
 use crate::k8s::argo::{FleetApp, short_revision};
 use crate::status::Tone;
@@ -118,6 +118,24 @@ impl Row {
             Some(Err(_)) => true,
             None => false,
         }
+    }
+}
+
+/// Whether every Application to sync has a sync option on in its own spec (`(on, of)` from
+/// `grouped_sync::already_on`): its checkbox then shows on, and can't be unticked (the sync
+/// keeps the spec's options).
+fn all_on((on, of): (usize, usize)) -> bool {
+    of > 0 && on == of
+}
+
+/// A sync option's checkbox label, saying how many of the Applications to sync have it on in
+/// their own spec already: `Server-side apply (already on for 1 of 3)`.
+fn own_label(name: &str, (on, of): (usize, usize)) -> String {
+    match on {
+        0 => name.to_string(),
+        _ if on == of && of == 1 => format!("{name} (already on in the Application's spec)"),
+        _ if on == of => format!("{name} (already on in every Application's spec)"),
+        _ => format!("{name} (already on for {on} of {of})"),
     }
 }
 
@@ -836,6 +854,10 @@ impl ArgoView {
             });
         let view = cx.entity().downgrade();
         let options = (!sent).then(|| {
+            // What the Applications to sync already have on in their own spec: kept by the sync
+            // whatever is ticked (see `ops::sync_options`).
+            let own = |option: &str| grouped_sync::already_on(g.rows.iter().filter_map(Row::ready), option);
+            let (server_side_on, replace_on) = (own(ops::SERVER_SIDE), own(ops::REPLACE));
             let set = |f: fn(&mut Options, bool)| {
                 let view = view.clone();
                 move |v: &bool, _: &mut Window, cx: &mut App| {
@@ -910,14 +932,16 @@ impl ArgoView {
                         )
                         .child(
                             Checkbox::new("argo-sync-server-side")
-                                .label("Server-side apply")
-                                .checked(opts.server_side)
+                                .label(own_label("Server-side apply", server_side_on))
+                                .checked(opts.server_side || all_on(server_side_on))
+                                .disabled(all_on(server_side_on))
                                 .on_click(set(|o, v| o.server_side = v)),
                         )
                         .child(
                             Checkbox::new("argo-sync-replace")
-                                .label("Replace")
-                                .checked(opts.replace)
+                                .label(own_label("Replace", replace_on))
+                                .checked(opts.replace || all_on(replace_on))
+                                .disabled(all_on(replace_on))
                                 .on_click(set(|o, v| o.replace = v)),
                         )
                         .child(div().text_xs().text_color(if opts.force || opts.replace { theme.warning } else { muted }).child(
@@ -1131,7 +1155,16 @@ impl ArgoView {
 
 #[cfg(test)]
 mod tests {
-    use super::{Checked, Options, Res, checked_lines};
+    use super::{Checked, Options, Res, all_on, checked_lines, own_label};
+
+    /// An option on in every Application's spec shows on; one on in some says how many.
+    #[test]
+    fn options_already_on_say_so() {
+        assert_eq!(own_label("Replace", (0, 3)), "Replace");
+        assert_eq!(own_label("Server-side apply", (1, 3)), "Server-side apply (already on for 1 of 3)");
+        assert_eq!(own_label("Server-side apply", (1, 1)), "Server-side apply (already on in the Application's spec)");
+        assert!(all_on((2, 2)) && !all_on((1, 2)) && !all_on((0, 0)));
+    }
 
     /// An Application left as it is says so in one line: no hook is skipped and nothing is
     /// pruned on it. One synced says what is applied and the hooks it skips or runs.

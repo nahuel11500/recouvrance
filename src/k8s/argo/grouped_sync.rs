@@ -137,6 +137,15 @@ pub struct Checked {
     pub before: Option<String>,
     /// The revision Argo CD compared, which the sync is pinned to (one source, auto-sync off).
     pub revision: Option<String>,
+    /// The sync options of its own spec (`ServerSideApply=true`): what the page shows as
+    /// already on. The sync sends them again with those ticked (`ops::sync_options`).
+    pub sync_options: Vec<String>,
+}
+
+/// Of the Applications `checked`, how many have `option` in their own spec, and how many
+/// there are: Server-side apply "already on for 1 of 3".
+pub fn already_on<'a>(checked: impl IntoIterator<Item = &'a Checked>, option: &str) -> (usize, usize) {
+    checked.into_iter().fold((0, 0), |(on, n), c| (on + usize::from(c.sync_options.iter().any(|o| o == option)), n + 1))
 }
 
 /// When the last operation of `app` started.
@@ -172,6 +181,7 @@ pub fn check(app: &Value, window: &NextSync, now: jiff::Timestamp) -> Checked {
         auto_sync: super::auto_sync(app),
         before: started_at(app),
         revision: ops::shown_revision(app),
+        sync_options: ops::spec_options(app),
     }
 }
 
@@ -372,8 +382,20 @@ mod tests {
         let all = Options { force: true, server_side: true, replace: true, ..Default::default() };
         let r = all.request(&pinned).unwrap();
         assert!(r.force && r.server_side && r.replace);
-        assert_eq!(ops::sync_options(&r), ["ServerSideApply=true", "Replace=true"]);
+        assert_eq!(ops::ticked_options(&r), ["ServerSideApply=true", "Replace=true"]);
         assert_eq!(all.text(), "full, with hooks, force, server-side apply, replace");
+    }
+
+    /// Each Application's own sync options are read with it, and counted for the page.
+    #[test]
+    fn own_sync_options_are_read_and_counted() {
+        let app = json!({"spec": {"syncPolicy": {"syncOptions": ["ServerSideApply=true", "CreateNamespace=true"]}}});
+        let a = check(&app, &NextSync::NoWindow, now());
+        assert_eq!(a.sync_options, ["ServerSideApply=true", "CreateNamespace=true"]);
+        let b = check(&json!({}), &NextSync::NoWindow, now());
+        assert!(b.sync_options.is_empty());
+        assert_eq!(already_on([&a, &b], ops::SERVER_SIDE), (1, 2));
+        assert_eq!(already_on([&a, &b], ops::REPLACE), (0, 2));
     }
 
     /// Resources unpicked are left out of a sync of the resources out of sync, and of what

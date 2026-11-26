@@ -109,16 +109,62 @@ pub fn strategy(req: &SyncRequest) -> Value {
     if req.apply { json!({"apply": how}) } else { json!({"hook": how}) }
 }
 
-/// The sync options `req` asks for, as Argo CD writes them (`ServerSideApply=true`).
-pub fn sync_options(req: &SyncRequest) -> Vec<&'static str> {
+/// The sync options `req` ticks, as Argo CD writes them (`ServerSideApply=true`).
+pub fn ticked_options(req: &SyncRequest) -> Vec<&'static str> {
     let mut out = Vec::new();
     if req.server_side {
-        out.push("ServerSideApply=true");
+        out.push(SERVER_SIDE);
     }
     if req.replace {
-        out.push("Replace=true");
+        out.push(REPLACE);
     }
     out
+}
+
+/// The sync option Server-side apply ticks.
+pub const SERVER_SIDE: &str = "ServerSideApply=true";
+/// The sync option Replace ticks.
+pub const REPLACE: &str = "Replace=true";
+
+/// The sync options of `app`'s own spec (`spec.syncPolicy.syncOptions`).
+pub fn spec_options(app: &Value) -> Vec<String> {
+    app.pointer("/spec/syncPolicy/syncOptions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect()
+}
+
+/// An option's key: `ServerSideApply` of `ServerSideApply=true`.
+fn option_key(option: &str) -> &str {
+    option.split_once('=').map_or(option, |(k, _)| k).trim()
+}
+
+/// The sync options a sync of `app` sends for `req`, None when it sends none. argocd-server
+/// uses a request's `syncOptions` instead of the Application's own (it does not merge them),
+/// so when an option is ticked the request carries the spec's options with the ticked ones
+/// added (one per key, the ticked value replacing the spec's), as Argo CD's UI sends them.
+/// With none ticked, none is sent and Argo CD uses the spec's.
+pub fn sync_options(req: &SyncRequest, app: &Value) -> Option<Vec<String>> {
+    let ticked = ticked_options(req);
+    if ticked.is_empty() {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for o in spec_options(app) {
+        if !out.iter().any(|x| option_key(x) == option_key(&o)) {
+            out.push(o);
+        }
+    }
+    for t in ticked {
+        match out.iter_mut().find(|x| option_key(x) == option_key(t)) {
+            Some(x) => *x = t.to_string(),
+            None => out.push(t.to_string()),
+        }
+    }
+    Some(out)
 }
 
 /// A resource as `operation.sync.resources` names it (group and namespace left out when empty).
@@ -473,6 +519,65 @@ mod tests {
         // A real sync's result is not a dry run's.
         a["status"]["operationState"]["operation"]["sync"]["dryRun"] = json!(false);
         assert_eq!(dry_run_result(&a), None);
+    }
+
+    /// Ticking an option keeps the Application's own: argocd-server would sync without them
+    /// otherwise. Nothing ticked sends none.
+    #[test]
+    fn ticked_options_keep_the_applications_own() {
+        let a = json!({"spec": {"syncPolicy": {"syncOptions": ["ServerSideApply=false", "RespectIgnoreDifferences=true"]}}});
+        assert_eq!(sync_options(&SyncRequest::default(), &a), None);
+        let req = SyncRequest { server_side: true, replace: true, ..Default::default() };
+        assert_eq!(
+            sync_options(&req, &a).unwrap(),
+            ["ServerSideApply=true", "RespectIgnoreDifferences=true", "Replace=true"]
+        );
+        assert_eq!(sync_options(&req, &json!({})).unwrap(), ["ServerSideApply=true", "Replace=true"]);
+        assert_eq!(spec_options(&app()), ["CreateNamespace=true"]);
+    }
+
+    proptest! {
+        /// For every spec and choice of options ticked: every option of the spec is kept
+        /// (unless a ticked one has its key), every ticked one is sent, one per key; nothing
+        /// is sent when nothing is ticked.
+        #[test]
+        fn every_spec_option_is_kept_plus_the_ticked(
+            spec in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    "ServerSideApply=true", "ServerSideApply=false", "Replace=true", "Replace=false",
+                    "CreateNamespace=true", "PruneLast=true", "ApplyOutOfSyncOnly=true",
+                    "RespectIgnoreDifferences=true", "Validate=false",
+                ]),
+                0..8,
+            ),
+            server_side in any::<bool>(),
+            replace in any::<bool>(),
+        ) {
+            let a = json!({"spec": {"syncPolicy": {"syncOptions": spec}}});
+            let req = SyncRequest { server_side, replace, ..Default::default() };
+            let ticked = ticked_options(&req);
+            let Some(sent) = sync_options(&req, &a) else {
+                prop_assert!(ticked.is_empty());
+                return Ok(());
+            };
+            prop_assert!(!ticked.is_empty());
+            for t in &ticked {
+                prop_assert!(sent.iter().any(|s| s == t), "{} not sent: {:?}", t, sent);
+            }
+            for o in &spec {
+                let overridden = ticked.iter().any(|t| option_key(t) == option_key(o));
+                let first = spec.iter().find(|x| option_key(x) == option_key(o)) == Some(o);
+                if !overridden && first {
+                    prop_assert!(sent.iter().any(|s| s == o), "{} dropped: {:?}", o, sent);
+                }
+            }
+            let mut keys: Vec<&str> = sent.iter().map(|s| option_key(s.as_str())).collect();
+            keys.sort_unstable();
+            let n = keys.len();
+            keys.dedup();
+            prop_assert_eq!(keys.len(), n, "one per key: {:?}", sent);
+            prop_assert!(sent.iter().all(|s| spec.contains(&s.as_str()) || ticked.contains(&s.as_str())));
+        }
     }
 
     proptest! {
