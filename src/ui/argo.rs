@@ -1410,7 +1410,7 @@ const PICKER_MENU: f32 = 320.;
 const PICKER_OFF: f32 = 128.;
 
 /// The room the state badges take on a row: the two widest shown together ("Sync failed" and
-/// "OutOfSync", about 95 px each at the small text size) and the "+N" chip, with their gaps.
+/// `OutOfSync`, about 95 px each at the small text size) and the "+N" chip, with their gaps.
 const BADGES: f32 = 240.;
 /// Badges shown on a row, at most; the others are counted in a "+N" chip that names them all.
 const BADGES_SHOWN: usize = 2;
