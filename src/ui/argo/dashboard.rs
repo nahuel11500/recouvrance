@@ -732,7 +732,12 @@ impl ArgoView {
                 .iter()
                 .map(|k| {
                     let found = self.find(k);
-                    let tone = found.map_or(Tone::Done, |a| argo::attention(&a.app));
+                    // An object in trouble below it (its tree, as read) makes it red too.
+                    let tone = match found {
+                        _ if self.tree_bad.contains(k) => Tone::Bad,
+                        Some(a) => argo::attention(&a.app),
+                        None => Tone::Done,
+                    };
                     // Named under the environment (`workload`); its root (named as it) as such.
                     let root = k.2 == d.title && d.members.len() > 1;
                     let label = if root {
