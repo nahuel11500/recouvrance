@@ -10,7 +10,10 @@
 
 /// Whether these arguments run a command line that prints (and exits, or serves), not the app.
 pub fn is_cli(args: &[String]) -> bool {
-    matches!(args.get(1).map(String::as_str), Some("serve" | "agent-create" | "--version" | "-V" | "--help" | "-h"))
+    matches!(
+        args.get(1).map(String::as_str),
+        Some("serve" | "agent-create" | "--install-desktop-entry" | "--version" | "-V" | "--help" | "-h")
+    )
 }
 
 /// Attach to the parent's console (the terminal the command was typed in) when neither stdout nor
@@ -155,7 +158,15 @@ mod tests {
 
     #[test]
     fn commands_attach_and_the_app_does_not() {
-        for cli in [&["serve"][..], &["agent-create", "ci", "kind-x"], &["--version"], &["-V"], &["--help"], &["-h"]] {
+        for cli in [
+            &["serve"][..],
+            &["agent-create", "ci", "kind-x"],
+            &["--install-desktop-entry"],
+            &["--version"],
+            &["-V"],
+            &["--help"],
+            &["-h"],
+        ] {
             assert!(is_cli(&args(cli)), "{cli:?}");
         }
         for app in [&[][..], &["--snapshot", "a.png"], &["unknown"]] {
