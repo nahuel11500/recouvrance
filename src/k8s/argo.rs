@@ -33,6 +33,7 @@ mod revision;
 pub mod server;
 pub mod steps;
 pub mod sync_diff;
+pub mod sync_phases;
 pub mod windows;
 
 /// The annotation Argo CD puts on what it deploys.

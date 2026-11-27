@@ -1041,6 +1041,8 @@ pub struct Cards {
     /// Why the resource tree couldn't be read (the problems then come from the status).
     pub tree_error: Option<String>,
     pub last_sync: Option<LastSync>,
+    /// The last sync by phase, for the Sync dialog.
+    pub sync_phases: Option<super::sync_phases::SyncPhases>,
     pub diff: DiffSummary,
     /// Argo CD's diff, to show whole; or why it couldn't be read.
     pub git_diff: Option<Result<GitDiff, String>>,
@@ -1094,6 +1096,7 @@ impl Cards {
         let last_sync = last_sync(app);
         let sync_rows =
             last_sync.as_ref().map_or_else(Vec::new, |l| sync_rows(app, &l.steps, read.managed.as_ref(), tree));
+        let sync_phases = last_sync.as_ref().and_then(|l| super::sync_phases::of(app, &l.steps, tree));
         Self {
             summary: Summary::of(app),
             state,
@@ -1107,6 +1110,7 @@ impl Cards {
             details: views::details(app),
             tree_error: read.tree.and_then(Result::err),
             last_sync,
+            sync_phases,
             diff,
             git_diff: read.diff,
             // Worked out here, off the UI thread, with every line.

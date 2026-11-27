@@ -32,6 +32,7 @@ use env_page::{DetailsTab, View, ViewFilters};
 pub(super) use versions::changes_table;
 
 mod env_page;
+mod sync_dialog;
 mod versions;
 
 /// A status tile's width, before it grows to share its row: four side by side on a wide
@@ -889,7 +890,7 @@ impl ArgoView {
             .children(why.map(|w| h_flex().child(w)))
     }
 
-    fn last_sync_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
+    fn last_sync_card(&self, _d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let Some(s) = &c.last_sync else {
@@ -930,17 +931,14 @@ impl ArgoView {
         });
         // Argo CD says the same of every sync that went well: only another message is shown.
         let message = s.message.clone().filter(|_| s.tone != Tone::Good);
-        let steps = (!s.steps.is_empty()).then(|| {
-            link("argo-dash-steps", "steps", cx)
-                .on_click(cx.listener(|this, _, _, cx| this.set_view(View::SyncStatus, cx)))
-        });
-        let journal = self.journal_link("argo-dash-journal-sync", d, cx);
+        // One entry to the sync: its phases, what it waits for, the table and the journal.
+        let open = self.sync_dialog_button(s.running, cx);
         tile("Last sync", Some(s.tone), cx)
             .child(figure(s.phase.clone(), s.tone.color(cx)))
             .child(div().text_xs().text_color(muted).child(selectable(facts.join(" · "))))
             .when_some(message, |v, m| v.child(div().text_xs().line_clamp(3).child(selectable(m))))
             .children(progress)
-            .child(h_flex().gap_2().children(steps).children(journal))
+            .child(h_flex().child(open))
     }
 
     fn diff_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {

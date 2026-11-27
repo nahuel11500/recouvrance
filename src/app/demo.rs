@@ -198,6 +198,13 @@ impl AppView {
                     page.update(cx, |p, cx| p.demo_dashboard_view(&view, cx));
                 }
             }
+            // Its Sync dialog: `argo-example-sync:running` (or `failed`, `done`).
+            other if other.starts_with("argo-example-sync:") => {
+                if let Route::Argo(page) = self.route().clone() {
+                    let which = other["argo-example-sync:".len()..].to_string();
+                    page.update(cx, |p, cx| p.demo_sync_dialog(&which, window, cx));
+                }
+            }
             // The same after a selective sync of the workload, newer than its newest deployment.
             "argo-example-selective" => {
                 if let Route::Argo(page) = self.route().clone() {
