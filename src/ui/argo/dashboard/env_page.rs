@@ -99,7 +99,12 @@ impl ArgoView {
         let Some(d) = &self.dashboard else { return };
         let keys: Vec<Key> = if all { d.members.clone() } else { d.current().cloned().into_iter().collect() };
         let apps = keys.iter().filter_map(|k| self.find(k).cloned()).collect();
+        // Its confirmation says the versions before and after (the Application shown).
+        let versions = self.sync_versions();
         self.sync_apps(apps, 0, window, cx);
+        if let Some(g) = &mut self.sync {
+            g.set_versions(versions);
+        }
     }
 
     /// Confirm, then delete the Application `k` by Argo CD's API (see `confirm_api_delete`).
@@ -133,8 +138,6 @@ impl ArgoView {
         let offers = found.map(|a| Offers::of(&a.app));
         let running = offers.is_some_and(|o| o.terminate)
             || c.is_some_and(|c| c.summary.in_progress || c.last_sync.as_ref().is_some_and(|s| s.running));
-        let roll_back = c.map_or(offers.is_some_and(|o| o.roll_back), |c| c.versions.rollback_to.is_some());
-        let auto_sync = c.is_some_and(|c| c.versions.auto_sync);
         let several = d.members.len() > 1;
         let act = |id: &'static str, label: &'static str, icon: Lucide, action: ArgoAction, cx: &mut Context<Self>| {
             let k = k.clone();
@@ -235,21 +238,7 @@ impl ArgoView {
             .when(running, |h| {
                 h.child(act("argo-dash-terminate", "Terminate…", Lucide::CircleStop, ArgoAction::Terminate, cx))
             })
-            .when(roll_back, |h| {
-                h.child(act("argo-dash-roll-back", "Roll back…", Lucide::Undo2, ArgoAction::Rollback(None), cx))
-            })
-            .when(!roll_back && auto_sync, |h| {
-                h.child(
-                    with_tip("argo-dash-no-roll-back", "Auto-sync is on: Argo CD allows no rollback.".into()).child(
-                        Button::new("argo-dash-roll-back-off")
-                            .small()
-                            .outline()
-                            .icon(Lucide::Undo2)
-                            .label("Roll back…")
-                            .disabled(true),
-                    ),
-                )
-            })
+            // Roll back is the Versions card's: to the previous release, saying what changes.
             .child(more)
             .child(div().flex_1())
             .children(open);

@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 use super::example::{self, ENVIRONMENTS};
 use super::{
     AskScope, Cards, DiffSummary, Image, Problem, Read, deployed, diff_from_git, diff_from_status, history,
-    image_changes, image_lines, last_sync, managed_path, problems_from_status, problems_from_tree, problems_question,
-    remember, revision_path, source_images, split_image, state, tree_path, versions, who,
+    image_changes, last_sync, managed_path, problems_from_status, problems_from_tree, problems_question, remember,
+    revision_path, source_images, split_image, state, tree_path, versions, who,
 };
 use crate::k8s::argo::server::Login;
 use crate::status::Tone;
@@ -591,38 +591,6 @@ fn a_degraded_object_below_makes_a_healthy_state_bad() {
     let cards = Cards::of(read(json!({"nodes": []})), None, now());
     assert_ne!(cards.state.tone, Tone::Bad);
     assert!(cards.state.below.is_none());
-}
-
-/// One line per repository, its tags gathered; the product's first, the third-party apart;
-/// nothing known as the product's lists every image as its own.
-#[test]
-fn images_are_listed_one_line_per_repository() {
-    let current: Vec<String> = [
-        "registry.example.com/shop/api:main-1",
-        "registry.example.com/shop/api:main-2",
-        "registry.example.com/shop/web:1.4.0",
-        "docker.io/library/redis:7.2",
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect();
-    let before = ["registry.example.com/shop/web:1.3.0".to_string()];
-    let images = image_changes(&current, Some(&before));
-    let (mine, others) = image_lines(&images, |r| r.contains("/shop/"));
-    let said: Vec<(&str, &[String], Option<&str>)> =
-        mine.iter().map(|l| (l.component.as_str(), &l.tags[..], l.from.as_deref())).collect();
-    assert_eq!(
-        said,
-        [
-            ("api", &["main-1".to_string(), "main-2".to_string()][..], None),
-            ("web", &["1.4.0".to_string()][..], Some("1.3.0")),
-        ]
-    );
-    assert_eq!(mine[0].tag(), "main-2");
-    assert_eq!(mine[0].whole(), "registry.example.com/shop/api:main-1\nregistry.example.com/shop/api:main-2");
-    assert_eq!(others.iter().map(|l| l.component.as_str()).collect::<Vec<_>>(), ["redis"]);
-    let (all, none) = image_lines(&images, |_| false);
-    assert_eq!((all.len(), none.len()), (3, 0));
 }
 
 /// The question names where the problems are and each one in a line, and asks for a read-only

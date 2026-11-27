@@ -295,7 +295,7 @@ pub struct Target {
 
 /// The manifests of `target` at `revision`, read with `get` (a GET of a path of Argo CD's API)
 /// unless kept.
-async fn manifests<F, Fut>(target: &Target, revision: &Revision, get: &F) -> Result<Arc<Objects>, String>
+pub(super) async fn manifests<F, Fut>(target: &Target, revision: &Revision, get: &F) -> Result<Arc<Objects>, String>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<Value, String>>,

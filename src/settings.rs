@@ -458,6 +458,14 @@ pub struct Settings {
     /// `k8s::argo::environments`). Empty: the defaults.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub argocd_env_types: Vec<String>,
+    /// The short names of the product's images on the Argo CD page's Versions card: `image
+    /// pattern = short name` lines (see `k8s::argo::release::Names`). Empty: the page's guess.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub argocd_image_names: Vec<String>,
+    /// The environment types whose Versions card checks the registry for a newer tag. Empty:
+    /// the production ones (`environments::is_production`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub argocd_tag_check_types: Vec<String>,
     /// How the Argo CD page was last left: its filters, search, grouping and folds.
     #[serde(skip_serializing_if = "ArgoPage::is_default")]
     pub argocd_page: ArgoPage,
@@ -699,6 +707,8 @@ impl Default for Settings {
             argocd_api_servers: Vec::new(),
             argocd_api_off: Vec::new(),
             argocd_env_types: Vec::new(),
+            argocd_image_names: Vec::new(),
+            argocd_tag_check_types: Vec::new(),
             argocd_page: ArgoPage::default(),
             context_files: Default::default(),
             open_browser_on_forward: true,

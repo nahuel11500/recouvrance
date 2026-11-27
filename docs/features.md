@@ -423,29 +423,35 @@
   first. *Updated at* and *Refresh*, and cards. *State*: the sync in big (*Synced*, *OutOfSync*, *Sync Failed* or
   *Syncing*), the health, the resources Degraded (`worker Degraded +1`) and *Why?* (the diagnosis
   below), the card tinted green, amber or red. *Problems*, always right under the tiles (see
-  below). *Versions*: one line per repository of the product's images (its component, its tag
-  made short, `+1` when it runs at several tags at once, the whole references on hover and
-  copied by a click) and, for a tag that holds a commit sha (`main-<sha>`, `26-8-4-<sha>`),
-  that commit's title, author and age beside it, a link to it on its git host; the other
-  (third-party) images folded under *24 other images* (when none is known as the product's, the
-  first 8 listed and the rest folded). The commit is read from GitLab or GitHub with a token the user already has: the `glab`
-  CLI's `config.yml` (each host's token, `https` only, its registry domains telling which
-  GitLab an image is from) and the `gh` CLI's `hosts.yml`, or `GITLAB_TOKEN`, `GH_TOKEN` /
-  `GITHUB_TOKEN`; only read, never written, and never in an error. A token kept in the system
-  keyring isn't read: with none, nothing is shown. The image's path is its project
-  (`registry.example.com/shop/api` → `shop/api` on GitLab, else `shop`; `ghcr.io/owner/repo`
-  on GitHub). Each answer is kept for the session; the page never waits for it. A tag
-  tinted with `1.4.1 → 1.5.0` when it changed since the deployment before (from the images seen running under it, else those its sources pinned:
-  kustomize images, Helm `*repository`/`*tag` parameters), who released it and when (`autosync`
-  for auto-sync), what ran before, and *Roll back* to the deployment before (auto-sync off, as
-  Argo CD requires; confirmed, write mode applies) at its foot. *Deployed from*: the revision of
-  each source deployed with its commit's message, author and time (a chart's version has none),
-  the first 3 then *show all*. After a
-  selective sync (some resources only: Argo CD doesn't add it to its history) newer than the
-  newest deployment, a line says it (`Then 9 of 31 resources at ebf7503 (selective sync, 5d ago
-  by jdoe); the rest at e599d6d`), *Last sync* says `selective: 9 of 31 resources`, the *Why?*
-  reasons from it, and *Roll back* (the window's and the agents') says it takes those resources
-  back too. *Problems*, a panel always shown under the tiles when there are some:
+  below). *Versions*: the product's images only, one chip per component with its release
+  version (`api v26.11.31`): the images of its running workloads (Deployments, StatefulSets,
+  DaemonSets, CronJobs, not finished Jobs), those Settings → Argo CD names (`image pattern =
+  short name` lines, several patterns may give one name), else the page's guess (those named
+  after the project, else those whose tags differ between its environments). A repository's
+  variants built from the same commit (`app`, `app-chrome`) are one chip, its name without
+  what it shares with its project. The version is the tag's date-or-semver-looking prefix
+  (`v26-11-31-<sha>-chrome` reads `v26.11.31`), else a branch's build and its commit
+  (`master-<sha>` reads `master-1a2b3c4d`); the whole references on hover, copied by a click.
+  On the environment types Settings → Argo CD says (the production ones by default), each
+  image's tags are read from its registry (`/v2/<repository>/tags/list`, with the credentials
+  of the Docker config, `~/.docker/config.json` and its credential helpers, and the registry's
+  token flow; no credentials, no check), compared as numbers (`v26.11.9` < `v26.11.32`): when
+  a newer release tag exists the chip turns red, `api v26.11.22 → v26.11.23`, its tooltip
+  saying when it was published. Each answer is kept 5 minutes; when the registry can't be
+  read, the last answer stays and the tooltip says so. One line under the chips: who released
+  it and when, and the previous release (`previous: api v26.11.21`): the last deployment of
+  the history whose product versions differ, read from the images its sources pin, else from
+  the manifests Argo CD renders at its revision (a sync of unrelated git changes, with the same
+  tags, isn't one). *Roll back to the previous release…* (auto-sync off, as Argo CD requires;
+  disabled with why when the history has none) opens a dialog: the deployment it redeploys
+  (`#14: git 1a2b3c4, deployed 3 d ago`), *What changes* (`api v26.11.23 → v26.11.22`, the
+  others `unchanged`), and *Before you click* (temporary with auto-sync off, the next sync
+  brings git's tags back, nothing is pruned, hooks don't run so a migration isn't undone); in
+  production the environment's name is typed to confirm, write mode applies. After a selective
+  sync (some resources only: Argo CD doesn't add it to its history) newer than the newest
+  deployment, *Last sync* says `selective: 9 of 31 resources`, the *Why?* reasons from it, and
+  *Roll back* (the window's and the agents') says it takes those resources back too.
+  *Problems*, a panel always shown under the tiles when there are some:
   from the resource tree, one row per workload whose pods are in trouble (`CrashLoopBackOff`,
   `Pending`, `ContainerCreating`, *Not ready*...), with how many of its pods, since when and *why*
   (Argo CD's health message), then other objects Degraded (an autoscaler with no metric), then,
@@ -477,7 +483,7 @@
   Application whose entry is shown, as Argo CD's own page has them: *Sync…* (the sync page
   below, for that Application; *Sync environment…* for all of them), with when a sync by hand
   can start under its sync windows beside it, *Refresh*, *Hard refresh*, *Terminate…* while an
-  operation runs, *Roll back…* (auto-sync off), and in *…* *Delete with what it deployed…* or
+  operation runs (*Roll back* is the Versions card's), and in *…* *Delete with what it deployed…* or
   *Delete, keeping what it deployed…* (its name typed to confirm), *Open in Argo CD*. They go
   through Argo CD's API with the row menu's checks: a server set read-only is refused first,
   write mode applies when it is sent. The reload of the page itself is the small icon by
@@ -601,7 +607,9 @@
   what a sync of each would change* shows the grouped diff, whose summary then shows above.
   With Applications of production environments among them (the types `prod`, `preprod`, `acc
   on a tag`, `platform`, or one named with `prod`), they are named above the list and *Sync…*
-  asks a second click (*Confirm: 3 production Applications…*) before the confirmation.
+  asks a second click (*Confirm: 3 production Applications…*) before the confirmation. Opened
+  from an environment's page, the confirmation shows the product's versions running → after the
+  sync (what git renders), each chip's, those unchanged said so.
   The page opens in read-only mode too, saying so: everything above shows, and *Read what a sync
   of each would change* reads the diff, without turning writes on. Only *Sync…* (or *Terminate*)
   asks to, with a prompt of its own: what turning writes on allows here (*sync 17 Applications

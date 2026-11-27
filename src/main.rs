@@ -44,6 +44,7 @@ mod prom;
 mod quantity;
 mod rbac;
 mod reachability;
+mod registry;
 mod schema;
 mod settings;
 mod smartdiff;

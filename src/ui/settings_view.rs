@@ -92,6 +92,10 @@ pub struct SettingsView {
     argo_api_error: Option<SharedString>,
     /// The environment types of the Argo CD page, a `type = pattern` per line.
     argo_env_types: Entity<TextareaState>,
+    /// The short names of the product's images, a `pattern = name` per line, and the
+    /// environment types that check the registry for a newer tag.
+    argo_image_names: Entity<TextareaState>,
+    argo_tag_check: Entity<InputState>,
     /// A kind to give its own delete confirmation (Enter adds it).
     delete_kind: Entity<InputState>,
     /// The connected clusters' kinds, to check a kind typed in `delete_kind`.
@@ -152,6 +156,8 @@ impl SettingsView {
         let argo_api_token =
             cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("token (argocd account generate-token)"));
         let argo_env_types = textarea(env_types_text(&s.argocd_env_types), "prod = -prod(-|$)", window, cx);
+        let argo_image_names = textarea(s.argocd_image_names.join("\n"), "*/shop-api* = api", window, cx);
+        let argo_tag_check = field(s.argocd_tag_check_types.join(", "), "production types", window, cx);
 
         let mut subs = Vec::new();
         let number = |input: &Entity<InputState>, apply: fn(&mut settings::Settings, u64), cx: &mut Context<Self>| {
@@ -182,6 +188,12 @@ impl SettingsView {
         subs.push(Self::save_typed(&notes, textarea_text, cx, |v| settings::update(|s| s.assistant_notes = v)));
         subs.push(Self::save_typed(&argo_env_types, textarea_text, cx, |v| {
             settings::update(|s| s.argocd_env_types = env_type_lines(&v));
+        }));
+        subs.push(Self::save_typed(&argo_image_names, textarea_text, cx, |v| {
+            settings::update(|s| s.argocd_image_names = repo_lines(&v));
+        }));
+        subs.push(Self::save_typed(&argo_tag_check, input_text, cx, |v| {
+            settings::update(|s| s.argocd_tag_check_types = type_list(&v));
         }));
         subs.push(cx.subscribe_in(&argo_api_token, window, |this, _, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = ev {
@@ -253,6 +265,8 @@ impl SettingsView {
             argo_api_token,
             argo_api_error: None,
             argo_env_types,
+            argo_image_names,
+            argo_tag_check,
             delete_kind,
             kinds: Vec::new(),
             hub,
@@ -510,6 +524,7 @@ impl SettingsView {
             (self.timeline_mb.clone(), s.timeline.max_mb().to_string()),
             (self.timeline_days.clone(), s.timeline.days().to_string()),
             (self.mcp_port.clone(), self.hub.port().to_string()),
+            (self.argo_tag_check.clone(), s.argocd_tag_check_types.join(", ")),
         ];
         for (ctx, input) in &self.prometheus {
             fields.push((input.clone(), s.prometheus.get(ctx).cloned().unwrap_or_default()));
@@ -534,11 +549,14 @@ impl SettingsView {
             (self.notes.clone(), s.assistant_notes.clone()),
             (self.repos.clone(), s.assistant_repos.join("\n")),
             (self.argo_env_types.clone(), env_types_text(&s.argocd_env_types)),
+            (self.argo_image_names.clone(), s.argocd_image_names.join("\n")),
         ] {
             let state = input.read(cx);
             let current = state.value().to_string();
             let same = if input == self.repos {
                 repo_lines(&current) == s.assistant_repos
+            } else if input == self.argo_image_names {
+                repo_lines(&current) == s.argocd_image_names
             } else if input == self.argo_env_types {
                 env_type_lines(&current) == s.argocd_env_types
             } else {
@@ -1014,6 +1032,8 @@ impl SettingsView {
         let muted = theme.muted_foreground;
         let env_type_errors =
             settings::with(|s| crate::k8s::argo::environments::EnvTypes::parse(&s.argocd_env_types).errors);
+        let image_name_errors =
+            settings::with(|s| crate::k8s::argo::release::Names::parse(&s.argocd_image_names).errors);
         let label = |t: &str| div().w(px(170.)).flex_shrink_0().text_sm().text_color(muted).child(t.to_string());
         let rows: Vec<AnyElement> =
             self.argo_api
@@ -1175,6 +1195,29 @@ impl SettingsView {
                     .gap_1()
                     .child(Textarea::new(&self.argo_env_types).small())
                     .children(env_type_errors.into_iter().map(|e| div().text_xs().text_color(theme.warning).child(e))),
+                cx,
+            ))
+            .child(Self::row(
+                "Product images",
+                "The Versions card of an environment shows the product's images only, one chip per component with \
+                 its release version. Name them here: one `image pattern = short name` per line. A pattern with `*` \
+                 matches the whole repository (`*/shop-api*` takes its variants too); one without matches the \
+                 repository or its last part. Several patterns may give one name. None set, or none matching: the \
+                 images whose tags differ between the project's environments, or named after it.",
+                v_flex()
+                    .w(px(420.))
+                    .gap_1()
+                    .child(Textarea::new(&self.argo_image_names).small())
+                    .children(image_name_errors.into_iter().map(|e| div().text_xs().text_color(theme.warning).child(e))),
+                cx,
+            ))
+            .child(Self::row(
+                "Check for newer tags",
+                "On environments of these types (`,`-separated), the Versions card reads each product image's tags \
+                 from its registry, with the credentials of your Docker config (~/.docker/config.json and its \
+                 credential helpers), and turns red when a newer release tag exists. Answers are kept 5 minutes. \
+                 Empty: the production types.",
+                div().w(px(420.)).child(Input::new(&self.argo_tag_check).small()),
                 cx,
             ))
             .into_any_element()
@@ -1759,6 +1802,11 @@ impl Render for SettingsView {
 /// Kinds typed in a list: `configmaps, secrets deployments.apps`.
 fn kind_list(text: &str) -> Vec<String> {
     text.split([',', ' ', '\n']).map(str::trim).filter(|k| !k.is_empty()).map(String::from).collect()
+}
+
+/// Environment types typed, `,`-separated (a type's name may hold spaces).
+fn type_list(text: &str) -> Vec<String> {
+    text.split([',', '\n']).map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect()
 }
 
 fn input_text(state: &InputState) -> String {

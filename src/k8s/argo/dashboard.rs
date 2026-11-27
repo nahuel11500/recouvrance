@@ -290,57 +290,6 @@ pub fn versions(app: &Value, seen: Option<&[String]>) -> Versions {
     }
 }
 
-/// One repository of the images running, as the Versions card lists it: its component, its tags
-/// (sorted; several when it runs at several at once), and the tag it had before when it changed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImageLine {
-    pub component: String,
-    pub repo: String,
-    pub tags: Vec<String>,
-    /// Its tag at the deployment before, when one of its tags is new.
-    pub from: Option<String>,
-}
-
-impl ImageLine {
-    /// The tag shown: the last one (the newest for tags that sort by date or version).
-    pub fn tag(&self) -> &str {
-        self.tags.last().map_or("", String::as_str)
-    }
-
-    /// Its whole references, one a line: what its tooltip says and a click copies.
-    pub fn whole(&self) -> String {
-        self.tags.iter().map(|t| format!("{}:{t}", self.repo)).collect::<Vec<_>>().join("\n")
-    }
-}
-
-/// The product's images first, one line per repository (`own`: whether a repository is the
-/// product's), and the others (third-party) apart. Nothing known as the product's: every
-/// image is listed as its own.
-pub fn image_lines(images: &[Image], own: impl Fn(&str) -> bool) -> (Vec<ImageLine>, Vec<ImageLine>) {
-    let mut lines: Vec<ImageLine> = Vec::new();
-    for i in images {
-        match lines.iter_mut().find(|l| l.repo == i.repo) {
-            Some(l) => {
-                if !l.tags.contains(&i.tag) {
-                    l.tags.push(i.tag.clone());
-                }
-                l.from = l.from.take().or_else(|| i.from.clone());
-            }
-            None => lines.push(ImageLine {
-                component: i.component.clone(),
-                repo: i.repo.clone(),
-                tags: vec![i.tag.clone()],
-                from: i.from.clone(),
-            }),
-        }
-    }
-    for l in &mut lines {
-        l.tags.sort();
-    }
-    let (mine, others): (Vec<ImageLine>, Vec<ImageLine>) = lines.into_iter().partition(|l| own(&l.repo));
-    if mine.is_empty() { (others, Vec::new()) } else { (mine, others) }
-}
-
 /// The images running, as Argo CD sums them up.
 pub fn current_images(app: &Value) -> Vec<String> {
     arr(app, "/status/summary/images").iter().filter_map(Value::as_str).map(String::from).collect()
@@ -1102,10 +1051,11 @@ pub struct Cards {
     /// (a field added on 36 Deployments is one), the fields of one resource in one line
     /// (`grouped_diff::by_resource`): images first.
     pub changes: Vec<super::grouped_diff::Cross>,
+    /// The images of its workloads, as they run and as git renders them (see
+    /// `release::managed_images`); None when the managed resources weren't read.
+    pub workloads: Option<(Vec<String>, Vec<String>)>,
     pub history: History,
     pub note: Option<String>,
-    /// A selective sync newer than the newest deployment.
-    pub partial: Option<Partial>,
     /// Its resources with their health, by category (the Resources view): from the tree,
     /// else from the Application's status.
     pub nodes: Vec<Node>,
@@ -1162,9 +1112,9 @@ impl Cards {
             // Worked out here, off the UI thread, with every line.
             smart,
             changes,
+            workloads: read.managed.as_ref().map(super::release::managed_images),
             history: history(app, HISTORY_DOTS),
             note: read.note,
-            partial: partial(app),
         }
     }
 }

@@ -26,7 +26,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
-use super::dashboard::{chip, link, sync_table};
+use super::dashboard::{changes_table, chip, link, sync_table};
 use super::grouped::{labels, some};
 use super::{ArgoView, Key, key};
 use crate::details::{ConfirmButtons as _, Guard, confirm_extras, guard_ok};
@@ -274,12 +274,22 @@ pub(super) struct GroupedSync {
     follow: Option<Task<()>>,
     /// The rows whose resources' list was folded or unfolded by hand (see `ops_open`).
     ops_flipped: HashSet<usize>,
+    /// The product's versions running and after the sync, when opened from an environment's
+    /// page: its confirmation shows them.
+    versions: Vec<crate::k8s::argo::release::Change>,
 }
 
 /// An Application followed: its row, where it is read, and when the operation before the one sent started.
 type Follow = (usize, Target, Option<String>);
 
 impl GroupedSync {
+    /// The versions its confirmation shows (before it is sent).
+    pub(super) fn set_versions(&mut self, versions: Vec<crate::k8s::argo::release::Change>) {
+        if self.sent_with.is_none() {
+            self.versions = versions;
+        }
+    }
+
     /// Whether the list of resources synced of row `i` is unfolded: by default when a few
     /// Applications are synced, or when its sync failed; a click flips it.
     fn ops_open(&self, i: usize) -> bool {
@@ -442,6 +452,7 @@ impl ArgoView {
             sends: None,
             follow: None,
             ops_flipped: HashSet::new(),
+            versions: Vec::new(),
         });
         self.check_grouped(cx);
         cx.notify();
@@ -669,6 +680,7 @@ impl ArgoView {
             }
         );
         let ok = if opts.dry_run { "Dry run" } else { "Sync" };
+        let versions = g.versions.clone();
         window.open_alert_dialog(cx, move |alert, _, cx| {
             let (guard, view, jobs) = (guard.clone(), view.clone(), jobs.clone());
             let skipped = skipped.clone();
@@ -689,6 +701,17 @@ impl ArgoView {
                         .text_sm()
                         .child(selectable(names.clone()))
                         .child(div().text_xs().text_color(muted).child(format!("On {}", sources.join(", "))))
+                        .when(!versions.is_empty(), |v| {
+                            v.child(
+                                div()
+                                    .pt_1()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(muted)
+                                    .child("VERSIONS: RUNNING → AFTER THE SYNC"),
+                            )
+                            .child(changes_table(&versions, cx))
+                        })
                         .when(left > 0, |v| {
                             v.child(div().text_xs().text_color(muted).child(format!(
                                 "{} left out (see why on the page).",
