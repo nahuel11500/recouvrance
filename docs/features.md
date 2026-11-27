@@ -420,10 +420,17 @@
   apps, whose cards list its children) last, each named under the environment (`workload`,
   `managed-namespace`) with a dot in its color, its sync and health (with its Argo CD's name too
   when two share a name or several Argo CDs are read); a click shows its cards, the workload's
-  first. *Updated at* and *Refresh*, and cards. *State*: the sync in big (*Synced*, *OutOfSync*, *Sync Failed* or
-  *Syncing*), the health, the resources Degraded (`worker Degraded +1`) and *Why?* (the diagnosis
-  below), the card tinted green, amber or red. *Problems*, always right under the tiles (see
-  below). *Versions*: the product's images only, one chip per component with its release
+  first. *Updated at* and *Refresh*, and cards. Each card says little (a short title, one big word
+  or number, one line); its details open in a dialog over the page from a bordered button
+  (`Why? ↗`, `show ↗`, `open ↗`), titled, closed by *Close* or Escape, the page left as it was.
+  *State*: the sync in big (*Synced*, *OutOfSync*, *Sync Failed* or *Syncing*), one line of
+  cause (the resources Degraded, `worker Degraded +1`, or the health; `Healthy · Nothing
+  wrong.` when calm; the health message on hover) and *Why? ↗*: the diagnosis, one line per
+  finding (its status colored, a few words, at most one action: *Sync diff ↗*, or open the
+  object; Argo CD's message, the objects and what to do on hover), what is out of sync by Argo
+  CD state under it (*OutOfSync*: differs from git; *Missing*: in git, not in the cluster;
+  *Prune*: in the cluster, no longer in git); the card tinted green, amber or red. *Problems*,
+  always right under the tiles (see below). *Versions*: the product's images only, one chip per component with its release
   version (`api v26.11.31`): the images of its running workloads (Deployments, StatefulSets,
   DaemonSets, CronJobs, not finished Jobs), those Settings → Argo CD names (`image pattern =
   short name` lines, several patterns may give one name), else the page's guess (those named
@@ -457,34 +464,55 @@
   (Argo CD's health message), then other objects Degraded (an autoscaler with no metric), then,
   with auto-sync on, what should be live and isn't (*Missing*, from the Application's status:
   the tree holds only live objects); each row its status, its name whole (a click opens it on the
-  context that reaches its cluster), its kind, its pods in trouble, for how long, and its *why*
-  under it; the first 8, then *show all*. Its header counts the pods in trouble and links *N
-  pods* (the destination namespace on its context, else the tree's pods). *Ask the assistant*
+  context that reaches its cluster), its kind, its pods in trouble and for how long on one line,
+  its *why* on hover; the first 6, then *+N more ↗* (every one in a dialog). Its foot counts the
+  pods and those in trouble, and *all pods ↗* lists them in a dialog (the worst first, with *Open
+  the namespace* on the context that reaches it). *Ask the assistant*
   (the header's, for them all, or a row's, for one) opens the assistant on a question naming the
   environment, the Application, its destination cluster and namespace, the context that reaches
   it and each problem with its why, asking for the cause, the evidence and the fix without
-  changing anything; with no assistant set up the button is off and says so. One line *No
-  problems* is said only from the tree or of a Healthy Application; from a status without
+  changing anything; with no assistant set up the button is off and says so. One line *Nothing
+  wrong.* is said only from the tree or of a Healthy Application; from a status without
   health per resource (Argo CD 3) it says *Problems unknown* and why.
   *Last sync*: phase, message, duration, who, when and its steps (each resource's result and a
-  hook's phase), progress live while it runs. *Sync diff*: how many resources a sync would change
-  (`~ changed, + added, – pruned`, with names), what changes (images first, a field alike on
-  several resources one line on their kind, a resource's other fields one line for it:
-  `PrometheusRule alerts: spec.groups[app].rules[13, 14] changed: annotations, expr (8 fields)`,
-  each field in its row's diff) and *show* for Argo CD's diff, or *Nothing to sync*.
-  *History*: the last deployments as dots, a sync that failed after them red, counts and the
-  list. Only the tab shown is read, by Argo CD's API (the Application, `resource-tree`,
+  hook's phase), progress live while it runs. *Sync diff*: how many changes a sync would make,
+  one per component, then their list on one line (`~ api · + search · – old-worker`; what
+  changes, each change once with where, on hover), the prune verdict, and *show ↗*, or `Nothing
+  to sync: the cluster matches git.` A component groups a resource with those named after it: a
+  StatefulSet, its Service, its ConfigMap and its claims `data-<name>-0..2` (an ordinal suffix
+  and a `data-` or `pgdata-` prefix taken off the name). The prune verdict is a filled banner:
+  grey *Prune: not needed* (a sync deletes nothing), green *Prune: recommended* (it would delete
+  only resources removed from git that hold no data, named), red *Prune: data would be deleted*,
+  with what each component would lose (`search: StatefulSet, 3 volumes`; a PersistentVolumeClaim,
+  a PersistentVolume, a StatefulSet, a Namespace, or a database an operator runs: Zalando's
+  `postgresql`, CloudNativePG's `Cluster`, and the like, each matched with its API group). It is
+  advice only: Prune stays unticked until ticked, and the sync page shows the same verdict
+  under its *Prune* box. *show ↗*: the verdict, then one line per component, changed first, then
+  added, then removed, each with its icon and color: an image bump once per image and versions
+  with the workloads that run it (`api 1.4.1 → 1.5.0 · web, worker`), a setting
+  (`replicas 5 → 3`), with `changed in the cluster, not in git` when git hasn't moved since the
+  last sync, `new · Deployment, HPA`, `no longer in git · Deployment, ConfigMap` and *requires
+  pruning*; *details* unfolds its resources, what changes in each and its YAML diff in two
+  columns (the cluster and after a sync). Noise (config checksums, chart and version labels,
+  generated hashes, the Deployment revision) is left out of the lines and summed up in one
+  sentence. *History*: the last deployments as dots, a sync that failed after them red, counts
+  and *open ↗*: the list in a dialog, each compared with the one before (*diff*) or two picked,
+  side by side. Only the tab shown is read, by Argo CD's API (the Application, `resource-tree`,
   `managed-resources` and `revisions/<rev>/metadata`, a commit kept once read). It is read again
   when its row changes (the stream; a change during a read is read once that read ends), 3 s after a read that found a sync running (when
   the page is hidden, once it shows again), and on *Refresh*. Leaving the tab or the page stops
   the read running; the page shown again reads the tab anew. The cards are worked out off the UI
   thread.
 - **Argo CD environment page: actions and views**: under the title, the actions on the
-  Application whose entry is shown, as Argo CD's own page has them: *Sync…* (the sync page
-  below, for that Application; *Sync environment…* for all of them), with when a sync by hand
-  can start under its sync windows beside it, *Refresh*, *Hard refresh*, *Terminate…* while an
-  operation runs (*Roll back* is the Versions card's), and in *…* *Delete with what it deployed…* or
-  *Delete, keeping what it deployed…* (its name typed to confirm), *Open in Argo CD*. They go
+  Application whose entry is shown, in a box of their own and of normal size, each saying on
+  hover what it does and whether it deploys anything: *Sync…* (the sync page below, for this
+  Application; *Sync environment…* for every Application of the environment, the app of apps
+  included), *Terminate…* while an operation runs (*Roll back* is the Versions card's), then *Refresh*
+  and *Hard refresh* (deploy nothing), and in *…* *Open destination namespace*, *Delete with
+  what it deployed…* or *Delete, keeping what it deployed…* (its name typed to confirm); the
+  sync windows' state as a status, not a button (`Sync window open`, `No sync window`, `Sync
+  window closed: opens in 2 h`), naming the AppProject's windows that apply on hover; *Open in
+  Argo CD*. They go
   through Argo CD's API with the row menu's checks: a server set read-only is refused first,
   write mode applies when it is sent. The reload of the page itself is the small icon by
   *Updated at*. The views, one at a time: *Overview* (the cards), *Resources* (every object of
@@ -499,14 +527,14 @@
   revision and who started it; then each resource of its result with its sync wave (the Application's status says it, the
   `argocd.argoproj.io/sync-wave` annotation of its manifest over it, 0 without), kind, namespace, name,
   status, health now, hook and message, in the order Argo CD runs them: phase, wave, hooks first;
-  filtered by status, health and hook; the last sync card's *steps* opens it), *History and
-  rollback* (the history's list unfolded, its comparisons, and the Versions card), *Details*
+  filtered by status, health and hook; the last sync card's *steps* opens it), *History* (the
+  history's list, its comparisons, and the Versions card), *Details*
   (*Summary*: project, labels, annotations folded, cluster and its server, namespace copied by a
   click, created, auto-sync, sync options, retry, status and revision, health, links and images;
-  *Sources*, one per line; *Manifest*, the Application's YAML without its status) and *Diff*
-  (what a sync would change). The State card takes the worst of Argo CD's health and the tree:
+  *Sources*, one per line; *Manifest*, the Application's YAML without its status), as tabs under
+  the actions. The State card takes the worst of Argo CD's health and the tree:
   Argo CD counts only the resources it manages, so a Job a CronJob made that fails leaves it
-  *Healthy*; the card then says `Healthy · 1 Degraded below` in red, and once the page has read
+  *Healthy*; the card then says `1 Degraded below` in red, and once the page has read
   that tree the environment's row on the list is *Degraded* too (and counts in *Needs a look*).
   The sync page's options: full with hooks or the resources out of sync only without hooks
   (with up to 5 Applications, each resource can be left out: a selective sync), prune, dry run,

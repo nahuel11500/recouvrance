@@ -770,7 +770,11 @@ impl ArgoView {
                                         v_flex()
                                             .gap_0p5()
                                             .child(div().text_xs().text_color(muted).child(r.key.label()))
-                                            .child(lines_block(r.lines(g.noise), cx)),
+                                            .child(lines_block(
+                                                r.lines(g.noise),
+                                                ("In the cluster", "After a sync"),
+                                                cx,
+                                            )),
                                     );
                                 }
                             }
