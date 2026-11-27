@@ -76,6 +76,12 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nahuel11500/recouvrance
 recouvrance-update      # later: installs the latest release
 ```
 
+On Linux, this installer (like a tarball or `cargo install`) only copies the binary: the first time
+Recouvrance starts, it adds itself to your app menu (a desktop entry and icons under
+`~/.local/share`, or `$XDG_DATA_HOME`), unless an entry is already there. After moving the binary,
+or if you removed the entry, run `recouvrance --install-desktop-entry`. `scripts/uninstall.sh`
+removes them.
+
 Windows (x86_64) is experimental: it is built and tested in CI, but nobody has used it on a real
 Windows machine yet. If you do, please say what works and what doesn't in
 [#1021](https://github.com/nahuel11500/recouvrance/issues/1021). The link below works from the first

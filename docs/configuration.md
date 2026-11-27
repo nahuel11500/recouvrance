@@ -43,6 +43,7 @@ kubeconfig's login command such as `kubelogin` or `aws eks get-token`) open no c
 | `~/.config/recouvrance/argocd-api-refresh.json` | The refresh tokens of the SSO sign-ins made by *Connect to Argo CD…*, by server address (mode 0600) |
 | `~/.config/recouvrance/main-agent` | The built-in assistant's agent id and token (mode 0600) |
 | `~/.local/share/recouvrance/audit.jsonl` | Agent activity log |
+| `~/.local/share/recouvrance/desktop-entry` | Linux: says the first start added the app menu entry, so it isn't added again once removed |
 | `~/.local/share/recouvrance/timeline/<context>-<hash>.jsonl` | Changes recorded per context (mode 0600, see [Timeline](#timeline)) |
 
 Any of these files can be a symlink (into a dotfiles repo, with stow or home-manager): the app

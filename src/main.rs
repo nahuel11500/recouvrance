@@ -12,6 +12,7 @@ mod cert_manager;
 mod certs;
 mod console;
 mod cron;
+mod desktop_entry;
 mod details;
 #[cfg(feature = "dev")]
 mod dev;
@@ -71,6 +72,8 @@ Usage:
   recouvrance                              Open the app
   recouvrance serve                        Run the MCP server without a window
   recouvrance agent-create NAME [CONTEXT…] Create an agent and print its token once
+  recouvrance --install-desktop-entry      Add the app to the Linux app menu (the first
+                                           start does it when no entry exists)
   recouvrance --version                    Print the version
   recouvrance --help                       Print this help
 
@@ -93,6 +96,7 @@ fn main() {
         Some("serve") => return serve(),
         // `Recouvrance agent-create <name> [context...]` prints the agent's token once.
         Some("agent-create") => return agent_create(&args[2..]),
+        Some("--install-desktop-entry") => std::process::exit(desktop_entry::install_command()),
         Some("--version" | "-V") => return println!("recouvrance {}", env!("CARGO_PKG_VERSION")),
         Some("--help" | "-h") => return print!("{}", HELP.replace("{config}", &paths::tilde(&paths::config_dir()))),
         _ => {}
@@ -107,6 +111,8 @@ fn main() {
             return;
         }
     }
+    // Linux: an install that added no app menu entry (the shell installer, a tarball) gets one.
+    desktop_entry::on_start();
     // Windows: before anything is started, so that no login command opens a console window.
     console::hidden_for_gui();
     let application = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
