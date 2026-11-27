@@ -131,7 +131,7 @@ fn install_in(data: &Path, exe: &Path, replace_own: bool) -> io::Result<Outcome>
 /// Tell the desktop about the new files, as `scripts/install.sh` does; either tool may be absent.
 fn refresh_caches(data: &Path) {
     let quiet = |program: &str, args: &[&Path]| {
-        let _ = std::process::Command::new(program)
+        let _ = crate::process::command(program)
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
