@@ -1056,6 +1056,10 @@ pub struct Cards {
     /// The images of its workloads, as they run and as git renders them (see
     /// `release::managed_images`); None when the managed resources weren't read.
     pub workloads: Option<(Vec<String>, Vec<String>)>,
+    /// What it changes, one line per component in plain words (see `components`).
+    pub components: Vec<super::components::Line>,
+    /// Whether a sync with prune is needed, recommended, or would delete data.
+    pub prune: super::prune::Verdict,
     pub history: History,
     pub note: Option<String>,
     /// Its resources with their health, by category (the Resources view): from the tree,
@@ -1091,6 +1095,11 @@ impl Cards {
         // Worked out here, off the UI thread, with every line.
         let smart = read.managed.as_ref().map(|m| Arc::new(super::grouped_diff::AppDiff::of(m)));
         let changes = smart.as_ref().map_or_else(Vec::new, |s| super::grouped_diff::by_resource(&s.diff));
+        let summary = Summary::of(app);
+        let smart_diff = smart.as_deref().map(|s| &s.diff);
+        let unchanged = super::components::git_unchanged(&summary);
+        let components = super::components::lines(&diff, smart_diff, unchanged);
+        let prune = super::prune::verdict(&super::components::pruned(&diff, smart_diff));
         let mut state = state(app, tree);
         state.with_tree(&problems);
         let last_sync = last_sync(app);
@@ -1098,7 +1107,7 @@ impl Cards {
             last_sync.as_ref().map_or_else(Vec::new, |l| sync_rows(app, &l.steps, read.managed.as_ref(), tree));
         let sync_phases = last_sync.as_ref().and_then(|l| super::sync_phases::of(app, &l.steps, tree));
         Self {
-            summary: Summary::of(app),
+            summary,
             state,
             findings: Diagnosis::of(app, now).findings,
             versions: versions(app, seen),
@@ -1117,6 +1126,8 @@ impl Cards {
             smart,
             changes,
             workloads: read.managed.as_ref().map(super::release::managed_images),
+            components,
+            prune,
             history: history(app, HISTORY_DOTS),
             note: read.note,
         }

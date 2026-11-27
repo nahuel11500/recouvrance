@@ -26,7 +26,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
-use super::dashboard::{changes_table, chip, link, sync_table};
+use super::dashboard::{changes_table, chip, link, prune_banner, sync_table};
 use super::grouped::{labels, some};
 use super::{ArgoView, Key, key};
 use crate::details::{ConfirmButtons as _, Guard, confirm_extras, guard_ok};
@@ -35,6 +35,7 @@ use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::grouped_diff::MAX_APPS;
 use crate::k8s::argo::grouped_sync::{self, Checked, Options, PARALLEL, Progress, Target};
 use crate::k8s::argo::ops::{self, Op, SyncRequest};
+use crate::k8s::argo::prune;
 use crate::k8s::argo::windows::{NextSync, Planner};
 use crate::k8s::argo::{FleetApp, short_revision};
 use crate::k8s::argo::{operation_tone, steps};
@@ -977,6 +978,13 @@ impl ArgoView {
             // whatever is ticked (see `ops::sync_options`).
             let own = |option: &str| grouped_sync::already_on(g.rows.iter().filter_map(Row::ready), option);
             let (server_side_on, replace_on) = (own(ops::SERVER_SIDE), own(ops::REPLACE));
+            // The prune verdict on what prune would delete, next to the box, once an Application
+            // is read: advice only, the box stays as it is.
+            let read: Vec<&Checked> = g.rows.iter().filter_map(Row::ready).collect();
+            let verdict = (!read.is_empty()).then(|| {
+                let pruned: Vec<Res> = read.iter().flat_map(|c| c.pruned.iter().cloned()).collect();
+                prune_banner("argo-sync-prune-verdict", &prune::verdict(&pruned), false, cx)
+            });
             let set = |f: fn(&mut Options, bool)| {
                 let view = view.clone();
                 move |v: &bool, _: &mut Window, cx: &mut App| {
@@ -1023,6 +1031,7 @@ impl ArgoView {
                                 .child("Deletes what is no longer in git: listed under each Application."),
                         ),
                 )
+                .children(verdict)
                 .child(
                     h_flex()
                         .gap_2()

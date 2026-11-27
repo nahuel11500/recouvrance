@@ -19,6 +19,7 @@ use super::{ContextTarget, Kind};
 use crate::status::Tone;
 
 pub mod api;
+pub mod components;
 pub mod connect;
 pub mod dashboard;
 pub mod diagnosis;
@@ -28,6 +29,7 @@ pub mod grouped_sync;
 pub mod grouping;
 pub mod journal;
 pub mod ops;
+pub mod prune;
 pub mod release;
 mod revision;
 pub mod server;
@@ -1171,18 +1173,24 @@ impl Fleet {
 
     /// When a sync of `a` asked by hand (`manual`), or one auto-sync starts, can start next.
     pub fn sync_window(&self, a: &FleetApp, plan: &mut windows::Planner, manual: bool) -> windows::NextSync {
+        match self.windows_of(a) {
+            Ok(applying) => plan.next_sync(&applying, manual),
+            Err(why) => windows::NextSync::Unknown(why),
+        }
+    }
+
+    /// The sync windows of `a`'s project that apply to it; why they aren't known.
+    pub fn windows_of(&self, a: &FleetApp) -> Result<Vec<&windows::SyncWindow>, String> {
         let all = match self.projects.get(&a.instance) {
-            None => return windows::NextSync::Unknown("its project's sync windows are not read yet".into()),
-            Some(Err(e)) => return windows::NextSync::Unknown(e.clone()),
+            None => return Err("its project's sync windows are not read yet".into()),
+            Some(Err(e)) => return Err(e.clone()),
             Some(Ok(projects)) => match projects.get(&a.app.project) {
                 Some(w) => w,
-                None => return windows::NextSync::Unknown(format!("project {} can't be read", a.app.project)),
+                None => return Err(format!("project {} can't be read", a.app.project)),
             },
         };
         let s = &a.app;
-        let applying: Vec<&windows::SyncWindow> =
-            all.iter().filter(|w| w.applies(&s.name, &s.dest_namespace, &s.dest_server, &s.dest_name)).collect();
-        plan.next_sync(&applying, manual)
+        Ok(all.iter().filter(|w| w.applies(&s.name, &s.dest_namespace, &s.dest_server, &s.dest_name)).collect())
     }
 }
 

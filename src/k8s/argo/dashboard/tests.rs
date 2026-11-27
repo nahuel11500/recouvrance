@@ -563,6 +563,30 @@ fn the_sync_diff_groups_a_field_by_kind() {
     );
 }
 
+/// The Sync diff reads by component in plain words: the image bump once with its workloads,
+/// what is new, what a prune deletes; and the prune verdict says pruning removes no data.
+#[test]
+fn the_sync_diff_reads_by_component() {
+    use crate::k8s::argo::components::Change;
+    use crate::k8s::argo::prune::Verdict;
+    let cards = Cards::of(example::read("example-prod", now()), None, now());
+    let lines = &cards.components;
+    let image =
+        lines.iter().find(|l| l.change == Change::Image && l.name == "api").unwrap_or_else(|| panic!("{lines:?}"));
+    assert_eq!(image.what.as_deref(), Some("1.4.1 → 1.5.0"));
+    let added = lines.iter().find(|l| l.change == Change::Added).unwrap_or_else(|| panic!("{lines:?}"));
+    assert_eq!(added.name, "metrics");
+    let removed = lines.iter().find(|l| l.change == Change::Removed).unwrap_or_else(|| panic!("{lines:?}"));
+    assert_eq!(removed.name, "legacy-flags");
+    let order: Vec<Change> = lines.iter().map(|l| l.change).collect();
+    let rank = |c: &Change| u8::from(matches!(c, Change::Added)) + 2 * u8::from(matches!(c, Change::Removed));
+    assert!(order.windows(2).all(|w| rank(&w[0]) <= rank(&w[1])), "changed, added, removed: {order:?}");
+    assert_eq!(cards.prune, Verdict::Recommended(vec!["legacy-flags".into()]));
+    let staging = Cards::of(example::read("example-staging", now()), None, now());
+    assert!(staging.components.is_empty());
+    assert_eq!(staging.prune, Verdict::NotNeeded);
+}
+
 /// Argo CD says Healthy, counting only the resources it manages; a Job a CronJob made is
 /// Degraded in the tree: the State takes the worst, says how many below, and the tile is Bad.
 #[test]

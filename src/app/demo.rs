@@ -191,7 +191,7 @@ impl AppView {
                 }
             }
             // The example's dashboard on one of its views: `argo-example-view:resources` (or
-            // `sync`, `history`, `details`, `diff`), `:all` with every part unfolded.
+            // `sync`, `history`, `details`), `:all` with every part unfolded.
             other if other.starts_with("argo-example-view:") => {
                 if let Route::Argo(page) = self.route().clone() {
                     let view = other["argo-example-view:".len()..].to_string();
@@ -203,6 +203,14 @@ impl AppView {
                 if let Route::Argo(page) = self.route().clone() {
                     let which = other["argo-example-sync:".len()..].to_string();
                     page.update(cx, |p, cx| p.demo_sync_dialog(&which, window, cx));
+                }
+            }
+            // The example's dashboard with a detail open in its dialog: `argo-example-dialog:why`
+            // (or `diff`, `problems`, `pods`, `history`).
+            other if other.starts_with("argo-example-dialog:") => {
+                if let Route::Argo(page) = self.route().clone() {
+                    let which = other["argo-example-dialog:".len()..].to_string();
+                    page.update(cx, |p, cx| p.demo_dashboard_dialog(&which, window, cx));
                 }
             }
             // The same after a selective sync of the workload, newer than its newest deployment.

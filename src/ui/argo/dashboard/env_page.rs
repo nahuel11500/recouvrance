@@ -1,16 +1,20 @@
 //! The environment page's action bar, under its title, and its full-width views: Resources by
-//! category, Sync status (the last sync per resource), History and rollback, Details, Diff
-//! (see `k8s::argo::dashboard::views`).
+//! category, Sync status (the last sync per resource), History, Details (see
+//! `k8s::argo::dashboard::views`). What a sync would change is the Sync diff card's dialog.
 //!
-//! The actions are the row menu's (`ArgoAction`, `confirm_api_action`) on the Application whose
-//! tab is shown, with the same checks: a read-only server refused first, write mode when sent,
-//! a rollback only with auto-sync off. Sync… opens the sync page (`sync`) with its options.
+//! The bar's actions are the row menu's (`ArgoAction`, `confirm_api_action`) on the Application
+//! whose tab is shown, with the same checks: a read-only server refused first, write mode when
+//! sent, a rollback only with auto-sync off. Sync… opens the sync page (`sync`) with its options.
+//! They sit in a box of their own, each saying on hover what it does and whether it deploys
+//! anything; the views under them are tabs, so that what acts and what only shows don't look
+//! alike.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use jiff::Timestamp;
@@ -21,7 +25,7 @@ use crate::details::{ArgoAction, OpenOn};
 use crate::k8s;
 use crate::k8s::argo::dashboard::{Cards, Category, Node, SyncRow, health_tone, sections};
 use crate::k8s::argo::diagnosis::{Res, span_text};
-use crate::k8s::argo::windows::{NextSync, Planner};
+use crate::k8s::argo::windows::{NextSync, Planner, SyncWindow};
 use crate::k8s::argo::{short_revision, steps};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
@@ -36,7 +40,6 @@ pub(in crate::ui::argo) enum View {
     SyncStatus,
     History,
     Details,
-    Diff,
 }
 
 /// The tabs of the Details view.
@@ -63,6 +66,58 @@ const KIND_W: f32 = 170.;
 const PODS_W: f32 = 120.;
 const HEALTH_W: f32 = 90.;
 
+/// A sync window as hovering the status names it: `allow 0 22 * * * for 1h (Europe/Paris),
+/// manual sync allowed`.
+fn window_text(w: &SyncWindow) -> String {
+    let mut out = format!("{} {} for {}", if w.allow { "allow" } else { "deny" }, w.schedule, w.duration);
+    if !w.time_zone.is_empty() {
+        out.push_str(&format!(" ({})", w.time_zone));
+    }
+    if w.manual_sync {
+        out.push_str(", manual sync allowed");
+    }
+    out
+}
+
+/// The sync windows' state as the bar says it: a status in words, its tone, and what hovering
+/// it says, the project's windows that apply named (`windows`, or why they aren't known).
+pub(super) fn window_status(
+    next: &NextSync,
+    project: &str,
+    windows: Result<&[&SyncWindow], &str>,
+    now: Timestamp,
+) -> (String, Tone, String) {
+    let (text, tone) = match next {
+        NextSync::NoWindow => ("No sync window".to_string(), Tone::Done),
+        NextSync::Now => ("Sync window open".to_string(), Tone::Good),
+        NextSync::At(_) => (format!("Sync window closed: opens {}", next.text(now)), Tone::Busy),
+        NextSync::NotSoon => (format!("Sync window closed, {}", next.text(now)), Tone::Bad),
+        NextSync::Unknown(_) => ("Sync windows unknown".to_string(), Tone::Done),
+    };
+    let mut tip = match next {
+        NextSync::NoWindow => {
+            format!("No sync window of project {project} applies to this Application: a sync can start any time.")
+        }
+        NextSync::Now => format!("The sync windows of project {project} let a sync by hand start now."),
+        NextSync::At(_) | NextSync::NotSoon => {
+            format!("A sync window of project {project} denies a sync by hand now: it can sync {}.", next.text(now))
+        }
+        NextSync::Unknown(why) => format!("The sync windows of project {project} aren't known: {why}."),
+    };
+    match windows {
+        Ok(list) if !list.is_empty() => {
+            tip.push_str("\n\nIts windows that apply:");
+            for w in list {
+                tip.push_str(&format!("\n{}", window_text(w)));
+            }
+        }
+        Err(why) if !matches!(next, NextSync::Unknown(_)) => tip.push_str(&format!("\n\n{why}")),
+        _ => {}
+    }
+    tip.push_str("\n\nA status, not a button: Sync… says the same before it sends.");
+    (text, tone, tip)
+}
+
 /// A time as the page says it: the local date and hour, and how long ago.
 fn stamp(t: Timestamp) -> String {
     let at = t.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S").to_string();
@@ -79,10 +134,6 @@ impl ArgoView {
     pub(super) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         if let Some(d) = &mut self.dashboard {
             d.view = view;
-            // History is its list, unfolded.
-            if view == View::History {
-                d.open.insert("history".to_string());
-            }
         }
         cx.notify();
     }
@@ -128,20 +179,22 @@ impl ArgoView {
         Some((rows.fleet.sync_window(a, &mut plan, true), rows.now))
     }
 
-    /// The buttons under the title: the actions on the Application shown (and Sync
-    /// environment… on all of them), then the views.
+    /// Under the title, two rows that don't look alike: the actions on the Application shown
+    /// (and Sync environment… on all of them), bordered buttons of normal size, each saying on
+    /// hover what it does and whether it deploys anything, with the sync windows' state as a
+    /// labelled status; then the views, as tabs.
     pub(super) fn action_bar(&self, d: &Dashboard, c: Option<&Cards>, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
-        let muted = theme.muted_foreground;
         let k = d.current().cloned().filter(|k| self.find(k).is_some());
         let found = k.as_ref().and_then(|k| self.find(k));
         let offers = found.map(|a| Offers::of(&a.app));
         let running = offers.is_some_and(|o| o.terminate)
             || c.is_some_and(|c| c.summary.in_progress || c.last_sync.as_ref().is_some_and(|s| s.running));
         let several = d.members.len() > 1;
+        let name = k.as_ref().map_or_else(|| d.title.clone(), |k| k.2.clone());
         let act = |id: &'static str, label: &'static str, icon: Lucide, action: ArgoAction, cx: &mut Context<Self>| {
             let k = k.clone();
-            Button::new(id).small().outline().icon(icon).label(label).disabled(k.is_none()).on_click(cx.listener(
+            Button::new(id).outline().icon(icon).label(label).disabled(k.is_none()).on_click(cx.listener(
                 move |this, _, window, cx| {
                     if let Some(k) = &k {
                         this.act(k, action, window, cx);
@@ -149,27 +202,28 @@ impl ArgoView {
                 },
             ))
         };
-        // When a sync by hand can start: said next to Sync, so it is seen before syncing.
-        let next = k.as_ref().and_then(|k| self.manual_sync(k)).map(|(next, now)| {
-            let (text, color) = match &next {
-                NextSync::Now | NextSync::NoWindow => ("Can sync now".to_string(), muted),
-                NextSync::At(_) => {
-                    (format!("A sync window denies a sync: it can sync {}", next.text(now)), theme.warning)
-                }
-                NextSync::NotSoon => (format!("A sync window denies a sync, {}", next.text(now)), theme.danger),
-                NextSync::Unknown(why) => (format!("Sync windows unknown: {why}"), muted),
-            };
-            div().text_xs().text_color(color).child(text)
+        let window = k.as_ref().and_then(|k| self.sync_window_status(k)).map(|(text, tone, tip)| {
+            with_tip("argo-dash-windows", tip)
+                .flex()
+                .flex_row()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .px_1()
+                .text_xs()
+                .text_color(if tone == Tone::Done { theme.muted_foreground } else { tone.color(cx) })
+                .child(Icon::new(Lucide::Timer).size_4())
+                .child(text)
         });
         let more = {
             let view = cx.entity().downgrade();
             let k = k.clone();
             let has_destination = found.is_some_and(|a| a.on.is_some() && !a.dest.namespace.is_empty());
             Button::new("argo-dash-more")
-                .small()
                 .ghost()
                 .icon(Lucide::Ellipsis)
                 .accessibility_label("More actions")
+                .tooltip("More: open the destination namespace, delete the Application")
                 .disabled(k.is_none())
                 .dropdown_menu(move |menu: PopupMenu, _, _| {
                     let Some(k) = k.clone() else { return menu };
@@ -204,54 +258,71 @@ impl ArgoView {
         };
         let open = k.clone().map(|k| {
             Button::new("argo-dash-open")
-                .small()
                 .ghost()
                 .icon(Lucide::ExternalLink)
                 .label("Open in Argo CD")
+                .tooltip("Open this Application in Argo CD's web UI, in your browser. Changes nothing.")
                 .on_click(cx.listener(move |this, _, _, cx| this.open(&k, cx)))
         });
         let actions = h_flex()
             .flex_wrap()
-            .gap_1p5()
+            .items_center()
+            .gap_2()
+            .p_1p5()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary.opacity(0.5))
             .child(
                 Button::new("argo-dash-sync")
-                    .small()
                     .primary()
                     .icon(Lucide::GitBranch)
                     .label("Sync…")
+                    .tooltip(format!(
+                        "Sync this Application ({name}) with git: opens the sync page to pick the options, then \
+                         deploys once you confirm."
+                    ))
                     .disabled(k.is_none())
                     .on_click(cx.listener(|this, _, window, cx| this.sync_from_page(false, window, cx))),
             )
             .when(several, |h| {
                 h.child(
                     Button::new("argo-dash-sync-env")
-                        .small()
                         .outline()
+                        .icon(Lucide::Layers)
                         .label("Sync environment…")
+                        .tooltip(format!(
+                            "Sync every Application of the environment ({}, the app of apps included): opens the \
+                             sync page to pick the options, then deploys once you confirm.",
+                            d.members.len()
+                        ))
                         .disabled(k.is_none())
                         .on_click(cx.listener(|this, _, window, cx| this.sync_from_page(true, window, cx))),
                 )
             })
-            .children(next)
-            .child(act("argo-dash-refresh-app", "Refresh", Lucide::RefreshCw, ArgoAction::Refresh, cx))
-            .child(act("argo-dash-hard-refresh", "Hard refresh", Lucide::RefreshCcwDot, ArgoAction::HardRefresh, cx))
-            .when(running, |h| {
-                h.child(act("argo-dash-terminate", "Terminate…", Lucide::CircleStop, ArgoAction::Terminate, cx))
-            })
             // Roll back is the Versions card's: to the previous release, saying what changes.
+            .when(running, |h| {
+                h.child(
+                    act("argo-dash-terminate", "Terminate…", Lucide::CircleStop, ArgoAction::Terminate, cx)
+                        .tooltip("Stop the sync running. What it applied so far stays as it is. Asks first."),
+                )
+            })
+            .child(div().w(px(1.)).h(px(20.)).bg(theme.border))
+            .child(
+                act("argo-dash-refresh-app", "Refresh", Lucide::RefreshCw, ArgoAction::Refresh, cx)
+                    .tooltip("Ask Argo CD to compare this Application with git again. Deploys nothing."),
+            )
+            .child(
+                act("argo-dash-hard-refresh", "Hard refresh", Lucide::RefreshCcwDot, ArgoAction::HardRefresh, cx)
+                    .tooltip(
+                        "Ask Argo CD to render the manifests again, without its cache, and compare them with the \
+                         cluster. Deploys nothing.",
+                    ),
+            )
             .child(more)
+            .children(window)
             .child(div().flex_1())
             .children(open);
-        let tab = |id: &'static str, label: String, icon: Lucide, view: View, cx: &mut Context<Self>| {
-            let on = d.view == view;
-            Button::new(id)
-                .small()
-                .icon(icon)
-                .when(on, ButtonVariants::primary)
-                .when(!on, ButtonVariants::ghost)
-                .label(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_view(view, cx)))
-        };
         let counted = |label: &str, n: Option<usize>| match n {
             Some(n) if n > 0 => format!("{label} ({n})"),
             _ => label.to_string(),
@@ -261,22 +332,35 @@ impl ArgoView {
             (Some(n), Some(bad)) if bad > 0 => format!("Resources ({n}, {bad} in trouble)"),
             (n, _) => counted("Resources", n),
         };
-        let views = h_flex()
-            .flex_wrap()
-            .gap_1()
-            .child(tab("argo-dash-view-overview", "Overview".into(), Lucide::LayoutDashboard, View::Overview, cx))
-            .child(tab("argo-dash-view-resources", resources, Lucide::Boxes, View::Resources, cx))
-            .child(tab("argo-dash-view-sync", "Sync status".into(), Lucide::ListChecks, View::SyncStatus, cx))
-            .child(tab("argo-dash-view-history", "History and rollback".into(), Lucide::ScrollText, View::History, cx))
-            .child(tab("argo-dash-view-details", "Details".into(), Lucide::Info, View::Details, cx))
-            .child(tab(
-                "argo-dash-view-diff",
-                counted("Diff", c.map(|c| c.diff.total())),
-                Lucide::GitCompare,
-                View::Diff,
-                cx,
-            ));
-        v_flex().gap_1p5().child(actions).child(views)
+        let views: [(String, Lucide, View); 5] = [
+            ("Overview".into(), Lucide::LayoutDashboard, View::Overview),
+            (resources, Lucide::Boxes, View::Resources),
+            ("Sync status".into(), Lucide::ListChecks, View::SyncStatus),
+            ("History".into(), Lucide::ScrollText, View::History),
+            ("Details".into(), Lucide::Info, View::Details),
+        ];
+        let selected = views.iter().position(|(_, _, v)| *v == d.view).unwrap_or(0);
+        let picked: Vec<View> = views.iter().map(|(_, _, v)| *v).collect();
+        let entity = cx.entity().downgrade();
+        let tabs = TabBar::new("argo-dash-views")
+            .underline()
+            .selected_index(selected)
+            .children(views.into_iter().map(|(label, icon, _)| Tab::new().icon(icon).label(label)))
+            .on_click(move |ix, _, cx| {
+                let Some(&view) = picked.get(*ix) else { return };
+                let _ = entity.update(cx, |this, cx| this.set_view(view, cx));
+            });
+        v_flex().gap_2().child(actions).child(tabs)
+    }
+
+    /// The state of the sync windows of the Application `k`'s project, as a status in words,
+    /// its tone, and what hovering it says (the windows that apply, named).
+    fn sync_window_status(&self, k: &Key) -> Option<(String, Tone, String)> {
+        let rows = self.rows.as_ref()?;
+        let a = rows.fleet.apps.iter().find(|a| super::super::key(a) == *k)?;
+        let (next, now) = self.manual_sync(k)?;
+        let windows = rows.fleet.windows_of(a);
+        Some(window_status(&next, &a.app.project, windows.as_deref().map_err(String::as_str), now))
     }
 
     /// The view picked, full width; the cards for the Overview.
@@ -287,7 +371,6 @@ impl ArgoView {
             View::SyncStatus => self.sync_status_view(d, c, cx),
             View::History => self.history_view(d, c, cx),
             View::Details => self.details_view(d, c, cx),
-            View::Diff => self.diff_view(d, c, cx),
         }
     }
 
@@ -630,22 +713,6 @@ impl ArgoView {
             .into_any_element()
     }
 
-    // MARK: Diff
-
-    /// What a sync would change, full width.
-    fn diff_view(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> AnyElement {
-        if c.diff.total() == 0 {
-            let muted = cx.theme().muted_foreground;
-            return div()
-                .p_2()
-                .text_sm()
-                .text_color(muted)
-                .child("In sync: the cluster matches git.")
-                .into_any_element();
-        }
-        frame_full(cx).child(self.diff_body(d, c, cx)).into_any_element()
-    }
-
     // MARK: Details
 
     /// The Application's details: Summary, Sources, Manifest.
@@ -857,4 +924,48 @@ const ROWS_SHOWN: usize = 500;
 /// A box full width.
 fn frame_full(cx: &App) -> Div {
     super::frame(cx).w_full()
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::Timestamp;
+
+    use super::window_status;
+    use crate::k8s::argo::windows::{NextSync, SyncWindow};
+    use crate::status::Tone;
+
+    fn window(allow: bool) -> SyncWindow {
+        SyncWindow {
+            allow,
+            schedule: "0 22 * * *".into(),
+            duration: "1h".into(),
+            applications: vec!["*".into()],
+            namespaces: Vec::new(),
+            clusters: Vec::new(),
+            manual_sync: false,
+            time_zone: "Europe/Paris".into(),
+            and_operator: false,
+        }
+    }
+
+    /// The status names the project's windows on hover, and never reads as a button's label.
+    #[test]
+    fn the_sync_windows_state_names_its_windows() {
+        let now = Timestamp::from_second(1_700_000_000).unwrap();
+        let w = window(true);
+        let (text, tone, tip) = window_status(&NextSync::Now, "shop", Ok(&[&w]), now);
+        assert_eq!((text.as_str(), tone), ("Sync window open", Tone::Good));
+        assert!(tip.contains("project shop"), "{tip}");
+        assert!(tip.contains("allow 0 22 * * * for 1h (Europe/Paris)"), "{tip}");
+        let (text, tone, tip) = window_status(&NextSync::NoWindow, "shop", Ok(&[]), now);
+        assert_eq!((text.as_str(), tone), ("No sync window", Tone::Done));
+        assert!(tip.contains("any time"), "{tip}");
+        let later = NextSync::At(Timestamp::from_second(1_700_003_600).unwrap());
+        let (text, tone, _) = window_status(&later, "shop", Ok(&[&window(false)]), now);
+        assert_eq!(tone, Tone::Busy);
+        assert!(text.starts_with("Sync window closed: opens in "), "{text}");
+        let (text, _, tip) = window_status(&NextSync::Unknown("not read yet".into()), "shop", Err("not read yet"), now);
+        assert_eq!(text, "Sync windows unknown");
+        assert!(tip.contains("not read yet"));
+    }
 }

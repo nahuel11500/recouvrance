@@ -42,9 +42,10 @@ Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, 
 `RECOUVRANCE_FILTER`, `RECOUVRANCE_ACT` (comma-separated hooks, see `src/app/demo.rs` and
 `src/details/demo.rs`; `timeline:all` shows every event on the Timeline, `page:argo,argo-example`
 shows the Argo CD dashboard on a made-up example, no real data (`argo-example-expired`: after its
-login expired; `argo-example-view:resources`, or `sync`, `history`, `details`, `diff`: one of its
+login expired; `argo-example-view:resources`, or `sync`, `history`, `details`: one of its
 views; `argo-example-view:all`: its Overview with every part unfolded; `argo-example-sync:running`, `:failed`
-or `:done`: its Sync dialog), `page:argo,argo-journal-example`
+or `:done`: its Sync dialog; `argo-example-dialog:why`, or `diff`, `problems`, `pods`, `history`: one of
+its details in its dialog), `page:argo,argo-journal-example`
 its sync journal, `page:argo,argo-example-list` its list of environments,
 `page:argo,argo-example-overview` its overview, `page:argo,argo-example-diff` a grouped diff, and
 `page:argo,argo-sync-example-oos` (or `-example`, `-example-oos-armed`) its grouped sync, and
