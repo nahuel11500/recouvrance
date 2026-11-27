@@ -5,6 +5,18 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/nahuel11500/recouvrance/compare/v0.15.0...v0.16.0) - 2026-11-27
+
+### Added
+
+- *(argo)* A basic overview whose details open in dialogs, a clear action bar, a prune verdict above the sync diff (#1162)
+- *(argo)* One Sync dialog follows a running sync and reads the last one (#1164)
+- *(argo)* Versions shows release versions and a newer tag; Roll back goes to the previous release (#1163)
+
+### Fixed
+
+- *(linux)* Add the app menu entry and icons when the installer didn't (#1161)
+
 ## [0.15.0](https://github.com/nahuel11500/recouvrance/compare/v0.14.0...v0.15.0) - 2026-11-26
 
 ### Added
