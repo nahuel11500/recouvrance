@@ -5,6 +5,7 @@
 //! as a Kubernetes object is not acted on from its page: it opens on the Argo CD page, found
 //! by its uid.
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -87,6 +88,33 @@ pub(crate) fn confirm_api_action(
     window: &mut Window,
     cx: &mut App,
 ) {
+    confirm_api_action_with(endpoint, ns, name, action, Extra::default(), window, cx);
+}
+
+/// What a page adds to an action's dialog: its title, its note, what it shows under them (the
+/// versions a rollback changes), and a name to type (a production environment's) in place of
+/// the server's protection.
+#[derive(Clone, Default)]
+pub(crate) struct Extra {
+    pub title: Option<String>,
+    pub note: Option<String>,
+    pub body: Option<Body>,
+    pub typed: Option<String>,
+}
+
+/// What a dialog shows under its note, drawn each time it is.
+pub(crate) type Body = Rc<dyn Fn(&App) -> AnyElement>;
+
+/// [`confirm_api_action`], its dialog with what `extra` adds.
+pub(crate) fn confirm_api_action_with(
+    endpoint: &Arc<api::Endpoint>,
+    ns: &str,
+    name: &str,
+    action: ArgoAction,
+    extra: Extra,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let protected = api::read_only(endpoint).unwrap_or_else(|| endpoint.name());
     let what = format!("{} {name}", action.label().to_lowercase());
     if !super::not_read_only(&protected, window, cx) || !super::ensure_argo_writes(&what, &endpoint.name(), window, cx)
@@ -95,7 +123,7 @@ pub(crate) fn confirm_api_action(
     }
     let (endpoint, ns, name) = (endpoint.clone(), ns.to_string(), name.to_string());
     if !action.reads_first() {
-        confirm_api(endpoint, ns, name, action, &Value::Null, window, cx);
+        confirm_api(endpoint, ns, name, action, &Value::Null, extra, window, cx);
         return;
     }
     let read = api::read_app(endpoint.clone(), ns.clone(), name.clone());
@@ -103,7 +131,7 @@ pub(crate) fn confirm_api_action(
         .spawn(cx, async move |cx| {
             let result = read.await;
             let _ = cx.update(|window, cx| match result {
-                Ok(app) => confirm_api(endpoint, ns, name, action, &app, window, cx),
+                Ok(app) => confirm_api(endpoint, ns, name, action, &app, extra, window, cx),
                 Err(e) => window.push_notification(
                     Notification::error(format!("{} failed: the Application could not be read: {e}", action.label())),
                     cx,
@@ -114,13 +142,15 @@ pub(crate) fn confirm_api_action(
 }
 
 /// The dialog of an action by the API, on the Application `app` as just read (null for a
-/// refresh, which reads nothing first).
+/// refresh, which reads nothing first), with what `extra` adds.
+#[allow(clippy::too_many_arguments)]
 fn confirm_api(
     endpoint: Arc<api::Endpoint>,
     ns: String,
     name: String,
     action: ArgoAction,
     app: &Value,
+    extra: Extra,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -142,6 +172,7 @@ fn confirm_api(
     };
     let label = action.label();
     let note = match action {
+        _ if extra.note.is_some() => extra.note.as_deref().unwrap_or_default(),
         ArgoAction::Refresh => REFRESH_NOTE,
         ArgoAction::HardRefresh => HARD_REFRESH_NOTE,
         ArgoAction::Sync => SYNC_NOTE,
@@ -151,9 +182,10 @@ fn confirm_api(
     // A selective sync after the newest deployment is undone too: say so.
     let note: SharedString = match (&call, rollback_undoes(app)) {
         (api::Action::Rollback { .. }, Some(undoes)) => format!("{note} {undoes}").into(),
-        _ => note.into(),
+        _ => note.to_string().into(),
     };
     let title = match &call {
+        _ if extra.title.is_some() => extra.title.clone().unwrap_or_default(),
         api::Action::Rollback { id, .. } => {
             let to = ops::rollback_target(app, Some(*id)).map_or_default(ops::deployment_label);
             format!("Roll back Application {name} to {to}?")
@@ -172,13 +204,20 @@ fn confirm_api(
         api::Action::Delete { cascade } => format!("delete {target} --cascade={cascade}"),
     };
     let cmd = format!("argocd app {args} --server {}", shell_word(&server_name));
-    let guard = Guard::protected(&server_name, window, cx);
+    // A production environment's name typed, else what the server's protection asks.
+    let guard = match &extra.typed {
+        Some(t) => Some(Guard::typed_text(t, format!("Type {t} to confirm:"), window, cx)),
+        None => Guard::protected(&server_name, window, cx),
+    };
+    let body = extra.body.clone();
     window.open_alert_dialog(cx, move |alert, _, cx| {
         let (endpoint, ns, name, call, guard) =
             (endpoint.clone(), ns.clone(), name.clone(), call.clone(), guard.clone());
+        let mut alert = alert.title(title.clone()).description(note.clone());
+        if let Some(body) = &body {
+            alert = alert.child(body(cx));
+        }
         alert
-            .title(title.clone())
-            .description(note.clone())
             .child(confirm_with(&cmd, guard.as_ref(), &RunAs::default(), cx))
             .confirm_buttons(label, false, guard.as_ref())
             .on_ok(move |_, window, cx| {

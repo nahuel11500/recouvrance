@@ -1689,6 +1689,33 @@ pub async fn manifests_diff(
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }
 
+/// The images of the workloads Argo CD renders for the Application `namespace/name` at
+/// `revision` (see `release::workload_images`), read by the API with the server's login as the
+/// config has it now (each revision's manifests kept once read). Read-only.
+pub async fn images_at(
+    endpoint: Arc<Endpoint>,
+    namespace: String,
+    name: String,
+    spec: u64,
+    revision: super::sync_diff::Revision,
+) -> Result<Vec<String>, String> {
+    use super::sync_diff::{RENDER_TIMEOUT, Target};
+    let read = crate::k8s::run_abortable(async move {
+        let conn = match current_renewed(&endpoint.server.base).await.and_then(|e| e.conn()) {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(e)),
+        };
+        let get = |path: String| {
+            let conn = conn.clone();
+            async move { conn.get_within(&path, RENDER_TIMEOUT).await.map_err(|f| f.text) }
+        };
+        let target = Target { server: conn.server.base.clone(), namespace, name, spec };
+        let objects = super::sync_diff::manifests(&target, &revision, &get).await;
+        Ok(objects.map(|o| super::release::workload_images(o.values())))
+    });
+    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
 /// What a sync of the Application `namespace/name` would change now (its managed resources,
 /// as a smart diff), read by the API with the server's login as the config has it now. The
 /// diff is worked out in the same task, off the UI thread. Read-only.

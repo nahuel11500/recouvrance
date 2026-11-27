@@ -28,6 +28,7 @@ pub mod grouped_sync;
 pub mod grouping;
 pub mod journal;
 pub mod ops;
+pub mod release;
 mod revision;
 pub mod server;
 pub mod steps;

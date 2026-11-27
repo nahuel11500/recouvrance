@@ -18,9 +18,8 @@ use gpui_kit::*;
 use jiff::Timestamp;
 
 use super::{ArgoView, Key, key};
-use crate::details::ArgoAction;
 use crate::k8s;
-use crate::k8s::argo::dashboard::{self, Cards, Commit, Problem};
+use crate::k8s::argo::dashboard::{self, Cards, Problem};
 use crate::k8s::argo::diagnosis::{Res, span_text};
 use crate::k8s::argo::grouped_diff::{AppDiff, Cross};
 use crate::k8s::argo::sync_diff::{self, Entry};
@@ -30,8 +29,10 @@ use crate::status::Tone;
 use crate::ui::selectable::selectable;
 pub(super) use env_page::sync_table;
 use env_page::{DetailsTab, View, ViewFilters};
+pub(super) use versions::changes_table;
 
 mod env_page;
+mod versions;
 
 /// A status tile's width, before it grows to share its row: four side by side on a wide
 /// window, two pairs on a narrow one.
@@ -47,10 +48,6 @@ const ENV_MAX: f32 = 360.;
 const RUNNING_EVERY: Duration = Duration::from_secs(3);
 /// Problems listed in the Problems panel before "show all".
 const PROBLEMS_SHOWN: usize = 8;
-/// Images listed one a line when none is known as the product's, before the others are folded.
-const IMAGES_LISTED: usize = 8;
-/// Sources deployed listed before "show all".
-const DEPLOYED_SHOWN: usize = 3;
 /// Names listed per kind of change in the Sync diff card.
 const NAMES_SHOWN: usize = 4;
 /// Changes listed in the Sync diff card.
@@ -138,8 +135,8 @@ pub(super) struct Dashboard {
     sources_load: crate::latest::Latest,
     /// Their manifests, read when the comparison opens.
     manifests_load: crate::latest::Latest,
-    /// Reads the commits of the product's images from their git host.
-    commits_load: crate::latest::Latest,
+    /// What the Versions card reads: earlier deployments' images, the registries' tags.
+    versions: versions::State,
     /// The view shown under the action bar, the Details' tab, and the views' filters.
     view: View,
     details_tab: DetailsTab,
@@ -172,7 +169,7 @@ impl Dashboard {
             compare: None,
             sources_load: Default::default(),
             manifests_load: Default::default(),
-            commits_load: Default::default(),
+            versions: Default::default(),
             view: View::default(),
             details_tab: DetailsTab::default(),
             filters: ViewFilters::default(),
@@ -400,7 +397,7 @@ impl ArgoView {
         let Some(d) = &mut self.dashboard else { return };
         let next = d.take_read(k, cards, Timestamp::now());
         cx.notify();
-        self.ask_image_commits(cx);
+        self.ask_versions(cx);
         let Some(d) = &mut self.dashboard else { return };
         match next {
             Next::Stale | Next::Rest => {}
@@ -554,23 +551,16 @@ impl ArgoView {
             .zip([example::ENVIRONMENTS[1], example::ENVIRONMENTS[0], example::ENVIRONMENTS[2]])
             .map(|(name, env)| (name.to_string(), Arc::new(Cards::of(example::read(env, now), None, now))))
             .collect();
-        // Made-up commits for the images whose tag holds one.
-        for (n, (repo, tag)) in example::commits().into_iter().enumerate() {
-            let Some(sha) = crate::git_host::sha_of(&tag) else { continue };
-            let titles =
-                ["feat(cart): pay in three times", "fix(search): a timeout on slow queries", "chore: bump deps"];
-            crate::git_host::pretend(
-                &repo,
-                &tag,
-                crate::git_host::Commit {
-                    sha: sha.to_string(),
-                    title: titles[n % titles.len()].to_string(),
-                    author: "Ann Example".into(),
-                    date: Timestamp::from_second(now.as_second() - 3600 * (2 + n as i64 * 7)).ok(),
-                    url: format!("https://git.example.com/shop/{n}/-/commit/{sha}"),
-                },
-            );
-        }
+        // A made-up newer release of `api` in its registry: its chip turns red.
+        crate::registry::pretend(
+            "registry.example.com/shop/api",
+            "1.4.1",
+            crate::registry::Status::Newer {
+                tag: "1.5.1".into(),
+                version: "1.5.1".into(),
+                published: Timestamp::from_second(now.as_second() - 45 * 60).ok(),
+            },
+        );
         let mut d = Dashboard::new("shop-prod-acme (example, no real data)".into(), Vec::new(), 0);
         d.kind = "prod".into();
         d.server = "argocd.example.com".into();
@@ -1353,160 +1343,6 @@ impl ArgoView {
             .collect()
     }
 
-    /// Read from their git host the commits the product's images of the tab shown were built
-    /// from (those not known yet); the page is drawn again once they are.
-    fn ask_image_commits(&mut self, cx: &mut Context<Self>) {
-        let Some(d) = &self.dashboard else { return };
-        let Some((k, Ok(cards))) = &d.cards else { return };
-        let own = self.own_images(k);
-        let mut wanted: Vec<(String, String)> = cards
-            .versions
-            .images
-            .iter()
-            .filter(|i| own.contains(&i.repo) && crate::git_host::sha_of(&i.tag).is_some())
-            .filter(|i| crate::git_host::known(&i.repo, &i.tag).is_none())
-            .map(|i| (i.repo.clone(), i.tag.clone()))
-            .collect();
-        wanted.dedup();
-        if wanted.is_empty() {
-            return;
-        }
-        let Some(d) = &mut self.dashboard else { return };
-        d.commits_load.spawn(cx, crate::git_host::read(wanted), |_, _, cx| cx.notify());
-    }
-
-    /// What runs, the product's first: one line per repository of the product's images (its
-    /// component, its tag made short, the commit it was built from), the other images folded
-    /// under how many there are; then the sources deployed and their commits (the first few),
-    /// a selective sync after them, and who released it, with the rollback.
-    fn versions_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
-        let v = &c.versions;
-        let theme = cx.theme().clone();
-        let muted = theme.muted_foreground;
-        // Not listed (the example): those named after the environment's product.
-        let own = d.current().map_or_else(
-            || {
-                let product = d.title.split('-').next().unwrap_or_default();
-                v.images
-                    .iter()
-                    .filter(|i| argo::environments::named_after(&i.repo, product))
-                    .map(|i| i.repo.clone())
-                    .collect()
-            },
-            |k| self.own_images(k),
-        );
-        let (mut mine, mut others) = dashboard::image_lines(&v.images, |r| own.contains(r));
-        // Nothing known as the product's and many images: the first few listed, the rest folded.
-        let product_known = !others.is_empty() || mine.iter().any(|l| own.contains(&l.repo));
-        if !product_known && mine.len() > IMAGES_LISTED {
-            others = mine.split_off(IMAGES_LISTED);
-        }
-        let heading = |text: &str| {
-            div().pt_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child(text.to_uppercase())
-        };
-        let image_rows: Vec<Div> = mine.iter().enumerate().map(|(i, l)| image_row(i, l, cx)).collect();
-        let others_open = d.is_open("images");
-        let others_part = (!others.is_empty()).then(|| {
-            let what = if product_known { "other image" } else { "more image" };
-            let label = format!("{} {}", if others_open { "▾" } else { "▸" }, crate::plural::count(others.len(), what));
-            let toggle = self.toggle_link("images", "images", &label, d, cx);
-            v_flex().gap_1().child(h_flex().child(toggle)).when(others_open, |v| {
-                v.child(
-                    h_flex()
-                        .flex_wrap()
-                        .gap_1p5()
-                        .children(others.iter().enumerate().map(|(i, l)| image_chip(mine.len() + i, l, cx))),
-                )
-            })
-        });
-        let deployed_open = d.is_open("deployed");
-        let deployed_shown = if deployed_open { c.deployed.len() } else { c.deployed.len().min(DEPLOYED_SHOWN) };
-        let deployed_more = (c.deployed.len() > DEPLOYED_SHOWN).then(|| {
-            let label =
-                if deployed_open { "show fewer".to_string() } else { format!("show all {} sources", c.deployed.len()) };
-            h_flex().child(self.toggle_link("deployed", "deployed", &label, d, cx))
-        });
-        let mut released = Vec::new();
-        if let Some(t) = v.released {
-            released.push(format!("Released {} ago", k8s::age(t)));
-        }
-        if let Some(by) = &v.by {
-            released.push(format!("by {by}"));
-        }
-        let mut footer = released.join(" ");
-        if let Some(p) = &v.previous {
-            if !footer.is_empty() {
-                footer.push_str(" · ");
-            }
-            footer.push_str(&format!("before: {}", short_revision(p)));
-        }
-        let rollback = match (v.auto_sync, v.rollback_to) {
-            (true, _) => Some(
-                hint("argo-dash-no-rollback", "no rollback", "Auto-sync is on: Argo CD allows no rollback.".into(), cx)
-                    .into_any_element(),
-            ),
-            (false, None) => None,
-            (false, Some(id)) => {
-                let k = d.current().cloned();
-                Some(
-                    Button::new("argo-dash-rollback")
-                        .small()
-                        .outline()
-                        .icon(Lucide::Undo2)
-                        .label(format!("Roll back to #{id}…"))
-                        .disabled(k.is_none())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if let Some(k) = &k {
-                                this.act(k, ArgoAction::Rollback(Some(id)), window, cx);
-                            }
-                        }))
-                        .into_any_element(),
-                )
-            }
-        };
-        card("Versions", None, cx)
-            .when(v.images.is_empty(), |c| c.child(div().text_sm().text_color(muted).child("Argo CD lists no image.")))
-            .when(!image_rows.is_empty(), |c| c.child(v_flex().gap_1().children(image_rows)))
-            .children(others_part)
-            .when(!c.deployed.is_empty(), |card| {
-                card.child(heading("Deployed from")).children(
-                    c.deployed
-                        .iter()
-                        .take(deployed_shown)
-                        .enumerate()
-                        .map(|(i, (dep, commit))| deployed_row(i, dep, commit.as_ref(), cx)),
-                )
-            })
-            .children(deployed_more)
-            // The newest deployment isn't all that runs: a selective sync came after it.
-            .when_some(c.partial.as_ref(), |card, p| {
-                let rest = c.deployed.first().map_or_default(|(d, _)| short_revision(&d.revision));
-                let mut text = format!("Then {}", p.text());
-                if !rest.is_empty() && rest != p.revision {
-                    text.push_str(&format!("; the rest at {rest}"));
-                }
-                card.child(
-                    with_tip("argo-dash-partial", format!("{text}.\n{}", p.names.join(", ")))
-                        .text_xs()
-                        .text_color(theme.warning)
-                        .child(selectable(text)),
-                )
-            })
-            .when(!footer.is_empty() || rollback.is_some(), |c| {
-                c.child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .mt_1()
-                        .pt_2()
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .child(div().flex_1().min_w_0().text_xs().text_color(muted).child(selectable(footer)))
-                        .children(rollback),
-                )
-            })
-    }
-
     fn history_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
@@ -1808,153 +1644,6 @@ pub(super) fn lines_block(lines: &[crate::history::DiffLine], cx: &App) -> Div {
         .when(more > 0, |v| {
             v.child(div().text_xs().text_color(muted).child(format!("… {} more", crate::plural::count(more, "line"))))
         })
-}
-
-/// A tag as the Versions card says it: short (`main-eab9300`), the old one before it when it
-/// changed.
-fn tag_text(l: &dashboard::ImageLine) -> String {
-    match (&l.from, l.tags.len()) {
-        (Some(from), 1) => format!("{} → {}", short_revision(from), short_revision(l.tag())),
-        _ => short_revision(l.tag()),
-    }
-}
-
-/// One of the product's images: its component, its tag made short (`+N` when it runs at
-/// several; the whole references on hover, copied by a click), and the commit it was built
-/// from when its git host said it.
-fn image_row(i: usize, l: &dashboard::ImageLine, cx: &App) -> Div {
-    let theme = cx.theme();
-    let muted = theme.muted_foreground;
-    let changed = l.from.is_some();
-    let whole = l.whole();
-    let copied = whole.clone();
-    let tag = with_tip(("argo-dash-image", i), format!("{whole}\nClick to copy"))
-        .flex_none()
-        .px_1p5()
-        .rounded_md()
-        .cursor_pointer()
-        .font_family(theme.mono_font_family.clone())
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(if changed { theme.warning } else { theme.foreground })
-        .bg(if changed { theme.warning.opacity(0.12) } else { theme.muted })
-        .child(tag_text(l))
-        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone())));
-    let several =
-        (l.tags.len() > 1).then(|| div().flex_none().text_color(muted).child(format!("+{}", l.tags.len() - 1)));
-    let commit = match crate::git_host::known(&l.repo, l.tag()) {
-        Some(crate::git_host::Lookup::Found(c)) => Some(c),
-        _ => None,
-    };
-    let commit = commit.map(|commit| {
-        let mut by = vec![commit.author.clone()];
-        if let Some(t) = commit.date {
-            by.push(format!("{} ago", k8s::age(t)));
-        }
-        let url = commit.url.clone();
-        h_flex()
-            .flex_1()
-            .min_w_0()
-            .gap_2()
-            .child(
-                with_tip(("argo-dash-image-commit", i), super::overview::commit_text(&commit))
-                    .min_w_0()
-                    .truncate()
-                    .text_color(if url.is_empty() { theme.foreground } else { theme.blue })
-                    .when(!url.is_empty(), |d| {
-                        d.cursor_pointer().hover(Styled::underline).on_click(move |_, _, cx| cx.open_url(&url))
-                    })
-                    .child(commit.title.clone()),
-            )
-            .child(div().flex_none().text_color(muted).child(by.join(", ")))
-    });
-    h_flex()
-        .gap_2()
-        .items_center()
-        .min_w_0()
-        .text_xs()
-        .child(div().flex_none().min_w(px(110.)).text_sm().font_weight(FontWeight::MEDIUM).child(l.component.clone()))
-        .child(tag)
-        .children(several)
-        .children(commit)
-}
-
-/// An image folded away (third-party, or past the first few): its component and its tag
-/// made short, the whole references on hover, copied by a click.
-fn image_chip(i: usize, l: &dashboard::ImageLine, cx: &App) -> Stateful<Div> {
-    let theme = cx.theme();
-    let whole = l.whole();
-    let copied = whole.clone();
-    let mut tag = tag_text(l);
-    if l.tags.len() > 1 {
-        tag.push_str(&format!(" +{}", l.tags.len() - 1));
-    }
-    with_tip(("argo-dash-image", i), format!("{whole}\nClick to copy"))
-        .flex()
-        .flex_row()
-        .items_center()
-        .max_w_full()
-        .min_w_0()
-        .gap_1()
-        .px_1p5()
-        .rounded_md()
-        .border_1()
-        .text_xs()
-        .cursor_pointer()
-        .border_color(theme.border)
-        .child(div().flex_none().text_color(theme.muted_foreground).child(l.component.clone()))
-        .child(div().min_w_0().truncate().font_family(theme.mono_font_family.clone()).child(tag))
-        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone())))
-}
-
-/// A source of the deployment running: its revision made short (the whole on hover, copied by
-/// a click), its repository, and its commit.
-fn deployed_row(i: usize, dep: &dashboard::Deployed, commit: Option<&Result<Commit, String>>, cx: &App) -> Div {
-    let theme = cx.theme();
-    let muted = theme.muted_foreground;
-    let repo = dep.repo.trim_end_matches(".git").rsplit('/').next().unwrap_or_default().to_string();
-    let (head, whole) = match &dep.chart {
-        Some(chart) => (format!("{chart} {}", dep.revision), format!("chart {chart} {}", dep.revision)),
-        None => (short_revision(&dep.revision), dep.revision.clone()),
-    };
-    let copied = whole.clone();
-    let revision = with_tip(("argo-dash-revision", i), format!("{whole}\nClick to copy"))
-        .flex_none()
-        .cursor_pointer()
-        .font_family(theme.mono_font_family.clone())
-        .child(head)
-        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone())));
-    let row = h_flex()
-        .gap_2()
-        .min_w_0()
-        .text_xs()
-        .child(revision)
-        .when(!repo.is_empty(), |h| h.child(div().flex_none().text_color(muted).child(selectable(repo))));
-    match commit {
-        Some(Ok(c)) => {
-            let mut by = Vec::new();
-            // The author's name, without the address.
-            if let Some(a) = &c.author {
-                by.push(a.split('<').next().unwrap_or(a).trim().to_string());
-            }
-            if let Some(t) = c.date {
-                by.push(format!("{} ago", k8s::age(t)));
-            }
-            if !c.tags.is_empty() {
-                by.push(c.tags.join(", "));
-            }
-            row.child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(selectable(c.message.lines().next().unwrap_or_default().to_string())),
-            )
-            .child(div().flex_none().text_color(muted).child(selectable(by.join(" · "))))
-        }
-        Some(Err(e)) => row.child(hint(("argo-dash-commit-error", i), "commit unread", e.clone(), cx)),
-        None => row,
-    }
 }
 
 /// Something with `tip` shown on hover.
